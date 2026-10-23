@@ -340,11 +340,11 @@ def test_opening_the_directory_browser_does_not_flash_a_header_tooltip(
     """Opening the browser leaves its header tooltips hidden; hovering an icon
     still shows one.
 
-    The picker's popover focuses its first tabbable child — the Up button — so
-    a tooltip that opens on any focus would cover the listing the click was
-    meant to reveal. Only a deliberate hover should surface the label, which is
-    a real-browser distinction (focus rings and hover delays), hence an e2e
-    test rather than a jsdom one.
+    The picker focuses its search field on open, so a header tooltip that
+    opened on that initial focus would cover the listing the click was meant to
+    reveal. Only a deliberate hover should surface the label, which is a
+    real-browser distinction (focus rings and hover delays), hence an e2e test
+    rather than a jsdom one.
     """
     base_url, session_id = seeded_session
 
@@ -368,12 +368,11 @@ def test_opening_the_directory_browser_does_not_flash_a_header_tooltip(
     # The focus that used to trigger the tooltip has landed, so a tooltip that
     # opens on focus would already be on screen. Matching on text (the button
     # carries the same string as its aria-label) finds only the tooltip.
-    up = picker.get_by_test_id("workspace-picker-up")
-    expect(up).to_be_focused()
+    expect(picker.get_by_test_id("workspace-picker-search-input")).to_be_focused()
     expect(page.get_by_text("Up one level", exact=True)).to_have_count(0)
 
     # A deliberate hover is still answered.
-    up.hover()
+    picker.get_by_test_id("workspace-picker-up").hover()
     expect(page.get_by_text("Up one level", exact=True)).to_be_visible(timeout=15_000)
 
 

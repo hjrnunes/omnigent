@@ -37,7 +37,7 @@ describe("useFileDropTarget", () => {
 
     fireEvent.drop(screen.getByTestId("inside"), { dataTransfer: fileDrag([file]) });
 
-    expect(onFiles).toHaveBeenCalledWith([file]);
+    expect(onFiles).toHaveBeenCalledWith([file], expect.any(Event));
   });
 
   // The shell around the chat is not an attachment surface.

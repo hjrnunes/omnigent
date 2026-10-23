@@ -4661,6 +4661,20 @@ function registerIpc() {
     localHostId: () => omnigentCli.localHostId(),
   });
 
+  // SPA → OS folder chooser for picking a workspace on this machine. Resolves
+  // the chosen path, or null on cancel.
+  ipcMain.handle("omnigent:choose-directory", async (event, defaultPath) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
+    const result = await dialog.showOpenDialog(win ?? undefined, {
+      properties: ["openDirectory", "createDirectory"],
+      defaultPath:
+        typeof defaultPath === "string" && path.isAbsolute(defaultPath) ? defaultPath : undefined,
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
   // come from local config (no `omnigent host status` subprocess), so this is
   // instant — it lets the new-session picker tag/connect "this machine" without

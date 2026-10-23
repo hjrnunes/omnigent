@@ -86,15 +86,19 @@ export function useRevealTarget(path: string | null): RevealTarget | null {
   return { hostId, path: joinPath(joinPath(root, base), path) };
 }
 
-/** "Show in Finder" for a file (selected in its folder), "Open in Finder" for a folder. */
-export function revealLabel(directory: boolean): string {
+/** This OS's file manager name: "Finder", "File Explorer", or "file manager". */
+export function fileManagerName(): string {
   const userAgent = navigator.userAgent;
-  const app = userAgent.includes("Macintosh")
+  return userAgent.includes("Macintosh")
     ? "Finder"
     : userAgent.includes("Windows")
       ? "File Explorer"
       : "file manager";
-  return `${directory ? "Open" : "Show"} in ${app}`;
+}
+
+/** "Show in Finder" for a file (selected in its folder), "Open in Finder" for a folder. */
+export function revealLabel(directory: boolean): string {
+  return `${directory ? "Open" : "Show"} in ${fileManagerName()}`;
 }
 
 export function revealInFileManager(target: RevealTarget): void {
