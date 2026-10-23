@@ -51,7 +51,12 @@ describe("local folder bridge", () => {
     const h = loadPreload();
     await h.desktop.chooseDirectory("/Users/me");
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:choose-directory", args: "/Users/me" });
-    assert.equal(h.desktop.getPathForFile({ path: "/Users/me/app" }), "/Users/me/app");
+    // main, not the preload, decides whether the page may see the path.
+    await h.desktop.getPathForFile({ path: "/Users/me/app" });
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:dropped-file-path",
+      args: "/Users/me/app",
+    });
   });
 });
 

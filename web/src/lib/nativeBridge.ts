@@ -192,8 +192,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   revealFile?: (hostId: string, path: string) => Promise<boolean>;
   /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
   chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
-  /** This machine's path for a File dropped from the OS file manager ("" if none). */
-  getPathForFile?: (file: File) => string;
+  /** This machine's path for a dropped File; "" if none or off the pinned server. */
+  getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -1243,7 +1243,8 @@ export function supportsDirectoryChooser(): boolean {
 export async function chooseDirectory(defaultPath?: string): Promise<string | null> {
   try {
     return (await electronApi()?.chooseDirectory?.(defaultPath)) ?? null;
-  } catch {
+  } catch (err) {
+    console.warn("[nativeBridge] electron chooseDirectory failed:", err);
     return null;
   }
 }
@@ -1254,9 +1255,9 @@ export function supportsDroppedFilePaths(): boolean {
 }
 
 /** This machine's path for a dropped ``file``, or null when the shell can't resolve one. */
-export function droppedFilePath(file: File): string | null {
+export async function droppedFilePath(file: File): Promise<string | null> {
   try {
-    return electronApi()?.getPathForFile?.(file) || null;
+    return (await electronApi()?.getPathForFile?.(file)) || null;
   } catch {
     return null;
   }

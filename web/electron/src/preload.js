@@ -122,8 +122,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
   /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
   chooseDirectory: (defaultPath) => ipcRenderer.invoke("omnigent:choose-directory", defaultPath),
-  /** This machine's path for a File dropped from the OS file manager ("" if none). */
-  getPathForFile: (file) => webUtils.getPathForFile(file),
+  /**
+   * This machine's path for a File dropped from the OS file manager. Resolves
+   * "" when it has none or the page isn't the pinned server.
+   */
+  getPathForFile: (file) =>
+    ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this

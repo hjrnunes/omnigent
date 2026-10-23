@@ -22,6 +22,7 @@ import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   chooseDirectory,
   droppedFilePath,
@@ -29,6 +30,11 @@ import {
   supportsDroppedFilePaths,
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
+import {
+  readWorkspacePickerSort,
+  writeWorkspacePickerSort,
+  type WorkspacePickerSort,
+} from "@/lib/workspacePickerPreferences";
 import { fileManagerName, useDesktopHostId } from "./RevealInFileManager";
 import {
   WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
@@ -36,18 +42,6 @@ import {
   WorktreeRadioRow,
 } from "./WorktreeRadioRow";
 import { WorkspacePickerEntry } from "./WorkspacePickerEntry";
-
-type SortOrder = "name" | "modified";
-
-const SORT_ORDER_STORAGE_KEY = "omnigent:workspace-picker-sort";
-
-function readSortOrder(): SortOrder {
-  try {
-    return window.localStorage.getItem(SORT_ORDER_STORAGE_KEY) === "modified" ? "modified" : "name";
-  } catch {
-    return "name";
-  }
-}
 
 /** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
 export function isWindowsDrivePath(path: string): boolean {
@@ -426,10 +420,9 @@ interface WorkspacePickerProps {
  * The reference-style chrome separates path navigation from listing search:
  * a header provides up / workspace / home / typed-path / hidden / sort /
  * refresh / close controls, while a dedicated search row filters the current
- * directory, opens folders with the arrow keys and Enter, and jumps to a typed
- * path. On this machine's host, the desktop shell adds the OS folder chooser
- * and folder drops from the file manager. Clicking a folder navigates into it;
- * files stay visible but disabled because
+ * directory. The search row also opens folders with arrows/Enter and jumps to
+ * typed paths; on this machine the shell adds the OS chooser and Finder drops.
+ * Clicking a folder navigates into it; files stay visible but disabled because
  * workspaces must be directories. Commit-style callers get the persistent
  * Cancel / Confirm footer. The picker always uses the canonical full-frame
  * geometry; live ``onNavigate`` remains available only for primitive tests.
@@ -471,9 +464,12 @@ export function WorkspacePicker({
   const [resolvedHome, setResolvedHome] = useState<string | null>(null);
   // Dot-prefixed entries (.git / .venv) are hidden until toggled on.
   const [showHidden, setShowHidden] = useState(false);
-  const [sortOrder, setSortOrder] = useState<SortOrder>(readSortOrder);
-  // Folder row picked with the arrow keys; null falls back to the default highlight.
-  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [sortOrder, setSortOrder] = useState<WorkspacePickerSort>(readWorkspacePickerSort);
+  // Folder picked with the arrow keys, by path so a re-sort or refresh can't
+  // move the highlight onto another row. Null uses the default highlight.
+  const [activePath, setActivePath] = useState<string | null>(null);
+  // Enter confirming an IME candidate must not open a folder.
+  const isComposingRef = useRef(false);
   const listingId = useId();
   const isCoarsePointer = useIsCoarsePointer();
   const [dropTarget, setDropTarget] = useState<HTMLDivElement | null>(null);
@@ -622,12 +618,9 @@ export function WorkspacePicker({
 
   const parent = parentOf(currentAbsolute);
 
-  // Live filter from the search field or path bar (shell-style: type a
-  // fragment, or a path into the current directory, to narrow it). Null when
-  // not filtering.
-  const activeFilter =
-    listingFilter(searchInput, currentAbsolute, resolvedHome) ??
-    listingFilter(pathInput, currentAbsolute, resolvedHome);
+  // Filter from the search field, else the path bar (a fragment or a path into this folder).
+  const searchFilter = listingFilter(searchInput, currentAbsolute, resolvedHome);
+  const activeFilter = searchFilter ?? listingFilter(pathInput, currentAbsolute, resolvedHome);
   // Typing a dot-prefixed fragment reveals hidden entries even with the
   // toggle off, so ".env" can be found without flipping "Show hidden".
   const includeHidden = showHidden || (activeFilter?.startsWith(".") ?? false);
@@ -649,17 +642,16 @@ export function WorkspacePicker({
       );
     });
 
-  // Arrow keys move over the folders (listed first); a plain search
-  // highlights its first match so Enter opens it, while a typed path navigates.
-  const directoryCount = entries.filter((entry) => entry.type === "directory").length;
-  const searchIsPath = isNavigablePath(searchInput);
-  const highlightedIndex = navigationPending
-    ? null
-    : activeIndex !== null && activeIndex < directoryCount
-      ? activeIndex
-      : searchInput.trim() !== "" && !searchIsPath && directoryCount > 0
-        ? 0
-        : null;
+  // Arrow keys move over the folders, which are listed first.
+  const directories = entries.filter((entry) => entry.type === "directory");
+  const highlightedIndex = (() => {
+    if (navigationPending) return null;
+    const active = directories.findIndex((entry) => entry.path === activePath);
+    if (active !== -1) return active;
+    // A search in this folder highlights its first match so Enter opens it;
+    // a path anywhere else navigates there instead.
+    return searchFilter !== null && directories.length > 0 ? 0 : null;
+  })();
 
   const breadcrumbItems = (() => {
     if (currentAbsolute === "") {
@@ -696,42 +688,39 @@ export function WorkspacePicker({
     // mirror effect refill the bar from the new listing.
     userEditedRef.current = false;
     setSearchInput("");
-    setActiveIndex(null);
+    setActivePath(null);
     setPath(next);
     setPathEditing(false);
   }
 
   function handleSearchKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (isImeCompositionKeyEvent(event, isComposingRef.current)) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      if (navigationPending || directoryCount === 0) return;
+      if (navigationPending || directories.length === 0) return;
       event.preventDefault();
       const step = event.key === "ArrowDown" ? 1 : -1;
-      const from = highlightedIndex ?? (step > 0 ? -1 : directoryCount);
-      setActiveIndex(Math.min(Math.max(from + step, 0), directoryCount - 1));
+      const from = highlightedIndex ?? (step > 0 ? -1 : directories.length);
+      setActivePath(directories[Math.min(Math.max(from + step, 0), directories.length - 1)].path);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      const typedPath = searchIsPath ? normalizeTypedPath(searchInput, resolvedHome) : null;
+      const typedPath = isNavigablePath(searchInput)
+        ? normalizeTypedPath(searchInput, resolvedHome)
+        : null;
       if (highlightedIndex !== null) {
-        navigateTo(entries[highlightedIndex].path);
+        navigateTo(directories[highlightedIndex].path);
       } else if (typedPath !== null) {
         navigateTo(typedPath);
       }
     } else if (event.key === "Escape" && searchInput !== "") {
       event.preventDefault();
       setSearchInput("");
-      setActiveIndex(null);
     }
   }
 
   function toggleSortOrder() {
     const next = sortOrder === "name" ? "modified" : "name";
     setSortOrder(next);
-    setActiveIndex(null);
-    try {
-      window.localStorage.setItem(SORT_ORDER_STORAGE_KEY, next);
-    } catch {
-      // Storage unavailable (private mode); the choice lasts for this picker only.
-    }
+    writeWorkspacePickerSort(next);
   }
 
   async function chooseInFileManager() {
@@ -745,10 +734,15 @@ export function WorkspacePicker({
   const isDragActive = useFileDropTarget(
     browsingThisMachine && supportsDroppedFilePaths() ? dropTarget : null,
     (files, event) => {
-      const dropped = droppedFilePath(files[0]);
-      if (dropped === null) return;
-      const isDirectory = event.dataTransfer?.items[0]?.webkitGetAsEntry()?.isDirectory ?? false;
-      navigateTo(isDirectory ? dropped : (parentOf(dropped) ?? dropped));
+      // Entries are only readable during the drop; file managers may add
+      // non-file items (e.g. a URI list) ahead of the file.
+      const fileItem = Array.from(event.dataTransfer?.items ?? []).find(
+        (item) => item.kind === "file",
+      );
+      const isDirectory = fileItem?.webkitGetAsEntry?.()?.isDirectory ?? false;
+      void droppedFilePath(files[0]).then((dropped) => {
+        if (dropped !== null) navigateTo(isDirectory ? dropped : (parentOf(dropped) ?? dropped));
+      });
     },
   );
 
@@ -963,10 +957,7 @@ export function WorkspacePicker({
                 <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
               )
             }
-            onClick={() => {
-              setShowHidden((v) => !v);
-              setActiveIndex(null);
-            }}
+            onClick={() => setShowHidden((v) => !v)}
             testId="workspace-picker-show-hidden"
           />
           <PickerIconButton
@@ -1024,16 +1015,22 @@ export function WorkspacePicker({
               <input
                 type="search"
                 value={searchInput}
-                onChange={(event) => {
-                  setSearchInput(event.target.value);
-                  setActiveIndex(null);
-                }}
+                onChange={(event) => setSearchInput(event.target.value)}
                 onKeyDown={handleSearchKeyDown}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
                 // Typing and arrow keys work as soon as the picker opens; touch
                 // devices keep focus off it so the keyboard doesn't pop up.
                 autoFocus={!isCoarsePointer}
                 placeholder="Search or type a path"
                 aria-label="Search folders and files, or type a path"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded
                 aria-controls={listingId}
                 aria-activedescendant={
                   highlightedIndex !== null ? `${listingId}-${highlightedIndex}` : undefined
@@ -1134,6 +1131,8 @@ export function WorkspacePicker({
               showGitDialog && "pt-0 pb-3",
             )}
             id={listingId}
+            role="listbox"
+            aria-label="Folders and files"
             aria-busy={navigationPending || undefined}
             data-testid="workspace-picker-listing"
           >

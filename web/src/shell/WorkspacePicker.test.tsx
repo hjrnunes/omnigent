@@ -741,21 +741,63 @@ describe("WorkspacePicker keyboard and sorting", () => {
     expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
   });
 
-  it("navigates to a path typed or pasted into search", () => {
+  it("opens the match for a path into this folder, and jumps to a path elsewhere", () => {
     const onNavigate = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
     const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
 
-    // A path into the current folder filters it like a fragment.
+    // A path into the current folder filters it like a fragment, so Enter
+    // opens the folder shown rather than the literal (missing) "/x/d".
     fireEvent.change(search, { target: { value: "/x/d" } });
     expect(rowNames()).toEqual(["docs"]);
-    expect(screen.getByTestId("workspace-picker-entry-docs")).not.toHaveAttribute("data-active");
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/docs");
 
     fireEvent.change(search, { target: { value: "/Users/corey/work//" } });
     fireEvent.keyDown(search, { key: "Enter" });
 
     expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
     expect(search.value).toBe("");
+  });
+
+  it("ignores Enter and arrows while an IME is composing", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.change(search, { target: { value: "s" } });
+    fireEvent.keyDown(search, { key: "ArrowDown", isComposing: true });
+    fireEvent.keyDown(search, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(search, { key: "Enter", keyCode: 229 });
+    // Composition events cover browsers that clear isComposing on the final keydown.
+    fireEvent.compositionStart(search);
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).not.toHaveBeenCalledWith("/x/scripts");
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute("data-active");
+    fireEvent.compositionEnd(search);
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
+  it("keeps the highlighted folder when the rows reorder", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute("data-active");
+    // scripts moves from the second row to the last.
+    fireEvent.click(screen.getByTestId("workspace-picker-sort"));
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
   });
 
   it("sorts folders by date modified and remembers the choice", () => {
@@ -775,7 +817,7 @@ describe("WorkspacePicker keyboard and sorting", () => {
 
 describe("WorkspacePicker on this machine", () => {
   const chooseDirectory = vi.fn<(defaultPath?: string) => Promise<string | null>>();
-  const getPathForFile = vi.fn<(file: File) => string>();
+  const getPathForFile = vi.fn<(file: File) => Promise<string>>();
 
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
@@ -800,12 +842,16 @@ describe("WorkspacePicker on this machine", () => {
   });
 
   function drop(path: string, isDirectory: boolean) {
-    getPathForFile.mockReturnValue(path);
+    getPathForFile.mockResolvedValue(path);
     return fireEvent.drop(screen.getByTestId("workspace-picker"), {
       dataTransfer: {
         types: ["Files"],
         files: [new File([], "dropped")],
-        items: [{ webkitGetAsEntry: () => ({ isDirectory }) }],
+        // Finder can list a URI string ahead of the file itself.
+        items: [
+          { kind: "string", webkitGetAsEntry: () => null },
+          { kind: "file", webkitGetAsEntry: () => ({ isDirectory }) },
+        ],
       },
     });
   }
@@ -827,7 +873,7 @@ describe("WorkspacePicker on this machine", () => {
     await waitFor(() => expect(onSelect).toHaveBeenCalledWith("/Users/corey/other"));
   });
 
-  it("opens a dropped folder, or the folder of a dropped file", () => {
+  it("opens a dropped folder, or the folder of a dropped file", async () => {
     const onNavigate = vi.fn();
     render(
       <WorkspacePicker
@@ -838,9 +884,9 @@ describe("WorkspacePicker on this machine", () => {
     );
 
     drop("/Users/corey/projects/app", true);
-    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/app");
+    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/app"));
     drop("/tmp/notes/todo.txt", false);
-    expect(onNavigate).toHaveBeenLastCalledWith("/tmp/notes");
+    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/tmp/notes"));
   });
 
   it("offers neither on another host or an older shell", () => {

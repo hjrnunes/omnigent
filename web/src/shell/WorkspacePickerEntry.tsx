@@ -42,6 +42,8 @@ export function WorkspacePickerEntry({
         ref={ref}
         id={id}
         type="button"
+        role="option"
+        aria-selected={active}
         disabled={!isDirectory}
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => isDirectory && onOpen(entry.path)}
