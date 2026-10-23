@@ -89,11 +89,9 @@ export function useRevealTarget(path: string | null): RevealTarget | null {
 /** This OS's file manager name: "Finder", "File Explorer", or "file manager". */
 export function fileManagerName(): string {
   const userAgent = navigator.userAgent;
-  return userAgent.includes("Macintosh")
-    ? "Finder"
-    : userAgent.includes("Windows")
-      ? "File Explorer"
-      : "file manager";
+  if (userAgent.includes("Macintosh")) return "Finder";
+  if (userAgent.includes("Windows")) return "File Explorer";
+  return "file manager";
 }
 
 /** "Show in Finder" for a file (selected in its folder), "Open in Finder" for a folder. */

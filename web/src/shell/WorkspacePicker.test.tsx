@@ -761,6 +761,21 @@ describe("WorkspacePicker keyboard and sorting", () => {
     expect(search.value).toBe("");
   });
 
+  it("lets a typed path win over a folder highlighted before typing", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    // A path elsewhere leaves the listing unfiltered, so docs is still shown.
+    fireEvent.change(search, { target: { value: "/Users/corey/work" } });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).not.toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
+  });
+
   it("ignores Enter and arrows while an IME is composing", () => {
     const onNavigate = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);

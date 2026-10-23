@@ -4665,8 +4665,7 @@ function registerIpc() {
   registerFolderChooser({
     ipcMain,
     dialog,
-    windowFor: (event) =>
-      BrowserWindow.fromWebContents(event.sender) ?? activeWindow() ?? undefined,
+    windowFor: (event) => BrowserWindow.fromWebContents(event.sender) ?? undefined,
     isPinnedOriginSender,
   });
 

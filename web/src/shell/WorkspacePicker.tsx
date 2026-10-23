@@ -652,6 +652,7 @@ export function WorkspacePicker({
     // a path anywhere else navigates there instead.
     return searchFilter !== null && directories.length > 0 ? 0 : null;
   })();
+  const highlightedEntry = highlightedIndex !== null ? directories[highlightedIndex] : null;
 
   const breadcrumbItems = (() => {
     if (currentAbsolute === "") {
@@ -1015,7 +1016,12 @@ export function WorkspacePicker({
               <input
                 type="search"
                 value={searchInput}
-                onChange={(event) => setSearchInput(event.target.value)}
+                onChange={(event) => {
+                  setSearchInput(event.target.value);
+                  // Typing restarts the highlight, so a typed path isn't
+                  // overridden by a folder picked before it.
+                  setActivePath(null);
+                }}
                 onKeyDown={handleSearchKeyDown}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
@@ -1033,7 +1039,7 @@ export function WorkspacePicker({
                 aria-expanded
                 aria-controls={listingId}
                 aria-activedescendant={
-                  highlightedIndex !== null ? `${listingId}-${highlightedIndex}` : undefined
+                  highlightedEntry ? `${listingId}-${entries.indexOf(highlightedEntry)}` : undefined
                 }
                 autoComplete="off"
                 spellCheck={false}
@@ -1164,7 +1170,7 @@ export function WorkspacePicker({
                   id={`${listingId}-${index}`}
                   entry={entry}
                   onOpen={navigateTo}
-                  active={index === highlightedIndex}
+                  active={entry === highlightedEntry}
                   variant="compact"
                 />
               ))}

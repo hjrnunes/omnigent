@@ -1258,7 +1258,8 @@ export function supportsDroppedFilePaths(): boolean {
 export async function droppedFilePath(file: File): Promise<string | null> {
   try {
     return (await electronApi()?.getPathForFile?.(file)) || null;
-  } catch {
+  } catch (err) {
+    console.warn("[nativeBridge] electron getPathForFile failed:", err);
     return null;
   }
 }
