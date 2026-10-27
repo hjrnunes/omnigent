@@ -239,6 +239,24 @@ describe("ToolCard rendering", () => {
       error: "Path not found: /repo/missing",
       fields: "DetailsPath/repo/missing",
     },
+    {
+      producer: "failed SDK Pi result with no text",
+      name: "read",
+      output: { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }], isError: true },
+      error: "The tool reported an error.",
+      fields: "Content1TypeimageDataaGk=Mime typeimage/png",
+    },
+    {
+      producer: "failed result with its own error",
+      name: "fetch",
+      output: {
+        error: "Timed out",
+        content: [{ type: "text", text: "Partial page" }],
+        isError: true,
+      },
+      error: "Timed out",
+      fields: "Content1Partial pageType text",
+    },
   ])("shows a $producer above the record's other fields", ({ name, output, error, fields }) => {
     // WHY: a failure can still return data; hiding it behind Raw loses the useful part.
     const { container } = renderCard({

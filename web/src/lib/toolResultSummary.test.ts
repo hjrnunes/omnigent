@@ -233,7 +233,7 @@ describe("summarizeFileEdit", () => {
   it.each(["apply_patch", "mcp__omnigent__apply_patch"])(
     "shows no counts for %s output that does not say it applied",
     (name) => {
-      // Older runners wrote the same output for applied and declined patches.
+      // This output does not say whether the patch applied or was declined.
       const legacy: ToolCall = {
         name,
         args: {
@@ -250,7 +250,7 @@ describe("summarizeFileEdit", () => {
     ["Edit", "Error reading /repo/missing.py: [Errno 2] No such file or directory"],
     ["edit", "Could not find the exact text in a.py."],
   ])("shows no counts for %s output that does not say it applied: %j", (name, output) => {
-    // Unrecognized failures, such as Pi output recorded before it gained an Error: prefix.
+    // Failures without a recognized error prefix, such as a missed Pi edit's text.
     const call = edit(output, {
       name,
       args: { path: "a.py", oldText: "x", newText: "y", old_string: "x", new_string: "y" },

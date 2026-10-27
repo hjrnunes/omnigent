@@ -44,8 +44,8 @@ export interface ToolResultSegment {
   tone?: "added" | "removed";
 }
 
-// Codex patch output leads with its outcome. Older output reads the same whether
-// or not the patch applied, so it gets no counts.
+// Codex patch output leads with its outcome. Output without that line does not
+// say whether the patch applied, so it gets no counts.
 const CODEX_PATCH_APPLIED = "File change applied.";
 // First lines of each harness's successful edit: Claude and Qwen, Claude
 // MultiEdit, Omnigent's built-in Edit, Pi, OpenCode, and a new Qwen file.

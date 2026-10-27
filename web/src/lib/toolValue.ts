@@ -109,7 +109,7 @@ function parseJsonContainer(text: string): unknown {
 }
 
 /** Joined text of an MCP content-block array, or `null` when `value` is not one. */
-function contentBlockText(value: unknown): string | null {
+export function contentBlockText(value: unknown): string | null {
   if (!Array.isArray(value) || value.length === 0) return null;
   const texts: string[] = [];
   for (const block of value) {

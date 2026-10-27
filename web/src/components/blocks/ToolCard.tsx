@@ -41,6 +41,7 @@ import {
 } from "@/lib/toolTitle";
 import {
   type ParsedToolOutput,
+  contentBlockText,
   isRecord,
   parseToolOutput,
   toolErrorMessage,
@@ -290,7 +291,7 @@ type ResultPresentation =
 function presentToolResult(output: string): ResultPresentation {
   const parsed = parseToolOutput(output);
   const error = toolErrorMessage(parsed);
-  if (error !== null) return { kind: "error", message: error, fields: errorContext(parsed) };
+  if (error !== null) return { kind: "error", message: error, fields: errorContext(parsed, error) };
   if (parsed.kind === "json") {
     const pretty = prettyJson(parsed.value);
     if (pretty === null) return { kind: "panel", text: parsed.text, language: "text" };
@@ -306,13 +307,14 @@ function presentToolResult(output: string): ResultPresentation {
 }
 
 /** A failed record's other fields, shown under its error; `null` when it has none. */
-function errorContext(parsed: ParsedToolOutput): Record<string, unknown> | null {
+function errorContext(parsed: ParsedToolOutput, message: string): Record<string, unknown> | null {
   if (parsed.kind !== "json" || !isRecord(parsed.value)) return null;
   const record = parsed.value;
-  // `{"error": true, "message": ...}` already shows its message as the error, and
-  // a `{"content": [...], "isError": true}` result its content's text.
+  // Leave out what the error already shows: `{"error": true, "message": ...}`'s
+  // message, and a `{"content": [...], "isError": true}` result's text.
   const shown = new Set(record.error === true ? ["error", "message"] : ["error"]);
-  if (record.isError === true) shown.add("isError").add("content");
+  if (record.isError === true) shown.add("isError");
+  if (contentBlockText(record.content)?.trim() === message) shown.add("content");
   const rest = Object.entries(record).filter(([key]) => !shown.has(key));
   return rest.length > 0 ? Object.fromEntries(rest) : null;
 }
