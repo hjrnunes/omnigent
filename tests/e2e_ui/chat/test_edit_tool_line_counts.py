@@ -1,11 +1,6 @@
-"""E2E: edit tool rows show their line counts and open on the diff.
+"""E2E: real ``sys_os_edit`` outcomes cross the server and runner into edit rows.
 
-A scripted agent turn (mock LLM) runs two ``sys_os_edit`` calls against a
-real workspace: one replaces three lines with two, the other targets text the
-file does not contain. After the turn settles, the user opens the tool run and
-sees each row's outcome without expanding it: "Updated with 2 additions and 3
-removals" for the applied edit, and the tool's error for the failed one.
-Expanding the applied edit shows its diff behind a Diff | Raw switch.
+An applied and a missed edit check the result lines, their colors and the Diff | Raw view.
 """
 
 from __future__ import annotations

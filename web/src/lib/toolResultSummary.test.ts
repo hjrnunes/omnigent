@@ -210,6 +210,15 @@ describe("summarizeFileEdit", () => {
         state: "output-available",
       }),
     ).toEqual({ text: "Error: oldString not found in content", isError: true });
+    const piFailure = { content: [{ type: "text", text: "Could not find the text in a.py." }] };
+    expect(
+      summarizeFileEdit({
+        name: "edit",
+        args: { path: "a.py", oldText: "x", newText: "y" },
+        output: JSON.stringify({ ...piFailure, isError: true }),
+        state: "output-available",
+      }),
+    ).toEqual({ text: "Could not find the text in a.py.", isError: true });
   });
 
   it.each(["apply_patch", "mcp__omnigent__apply_patch"])(

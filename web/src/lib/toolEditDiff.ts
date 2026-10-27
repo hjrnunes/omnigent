@@ -44,7 +44,10 @@ const EDIT_PAIR_TOOLS = new Set(["Edit", "MultiEdit", "sys_os_edit", "edit"]);
 /** Tool names whose calls `getFileEditDiff` understands. */
 export const FILE_EDIT_TOOL_NAMES: readonly string[] = [...EDIT_PAIR_TOOLS, "apply_patch"];
 
-/** The diff an edit call describes, or `null` when its arguments carry no change. */
+/**
+ * The diff an edit call describes, or `null` when its arguments carry no change.
+ * A batch's counts add up each edit's own change, which can exceed the file's net change.
+ */
 export function getFileEditDiff(name: string, args: Record<string, unknown>): FileEditDiff | null {
   const tool = stripOmnigentPrefix(name);
   if (EDIT_PAIR_TOOLS.has(tool)) return pairsDiff(editPairs(args));

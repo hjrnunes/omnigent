@@ -157,6 +157,10 @@ export function editErrorMessage(output: string): string | null {
     const bracketed = BRACKETED_ERROR_RE.exec(stripAnsi(parsed.text).trim());
     if (bracketed !== null) return nonEmpty(bracketed[1]?.trim()) ?? UNNAMED_ERROR;
   }
+  // SDK Pi stored failed results as `{"content": [...], "isError": true}`.
+  if (parsed.kind === "json" && isRecord(parsed.value) && parsed.value.isError === true) {
+    return nonEmpty(contentBlockText(parsed.value.content)?.trim()) ?? UNNAMED_ERROR;
+  }
   return toolErrorMessage(parsed);
 }
 

@@ -54,6 +54,17 @@ describe("getFileEditDiff", () => {
     ).toMatchObject({ text: "-x = 1\n+x = 2", additions: 1, removals: 1 });
   });
 
+  it("counts each edit of a batch on its own, not the file's net change", () => {
+    const edits = [
+      { old_string: "a", new_string: "a\nb" },
+      { old_string: "b", new_string: "c" },
+    ];
+    expect(getFileEditDiff("MultiEdit", { file_path: "a.txt", edits })).toMatchObject({
+      additions: 2,
+      removals: 1,
+    });
+  });
+
   it("reads OpenCode's camel-case keys and counts a pure insertion", () => {
     expect(
       getFileEditDiff("edit", { filePath: "a.ts", oldString: "", newString: "line 1\nline 2\n" }),

@@ -144,16 +144,23 @@ describe("editErrorMessage", () => {
       "<tool_use_error>String to replace not found.</tool_use_error>",
       "String to replace not found.",
     ],
+    [
+      '{"content": [{"type": "text", "text": "Could not find the text in a.py."}], "isError": true}',
+      "Could not find the text in a.py.",
+    ],
+    ['{"content": [], "isError": true}', "The tool reported an error."],
   ])("reports %s as a failure", (output, message) => {
     expect(editErrorMessage(output)).toBe(message);
   });
 
-  it.each(["[errors] none", "[ERROR] plugin missing; continuing.", "Edit applied."])(
-    "treats %s as a success",
-    (output) => {
-      expect(editErrorMessage(output)).toBeNull();
-    },
-  );
+  it.each([
+    "[errors] none",
+    "[ERROR] plugin missing; continuing.",
+    "Edit applied.",
+    '{"content": [{"type": "text", "text": "Successfully replaced text in a.py."}]}',
+  ])("treats %s as a success", (output) => {
+    expect(editErrorMessage(output)).toBeNull();
+  });
 
   it('matches "[error]" only on the edit path, not in toolErrorMessage', () => {
     const output = "[error] recovered cache entry";
