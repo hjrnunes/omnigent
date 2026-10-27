@@ -14,6 +14,7 @@ describe("getFileEditDiff", () => {
       removals: 1,
       fileCount: 1,
       countsAreMinimum: false,
+      countsAreMaximum: false,
     });
   });
 
@@ -45,6 +46,7 @@ describe("getFileEditDiff", () => {
       removals: 1,
       fileCount: 1,
       countsAreMinimum: false,
+      countsAreMaximum: false,
     });
     const omnigentEdits = [{ oldText: "x = 1", newText: "x = 2" }];
     expect(
@@ -85,7 +87,7 @@ describe("getFileEditDiff", () => {
       new_string: ["new start", ...shared].join("\n"),
     });
     // 501 × 501 lines exceeds the comparison budget, so no shared line is matched.
-    expect(diff).toMatchObject({ additions: 501, removals: 501 });
+    expect(diff).toMatchObject({ additions: 501, removals: 501, countsAreMaximum: true });
   });
 
   it("shares the comparison budget across a call's edits", () => {
@@ -96,7 +98,9 @@ describe("getFileEditDiff", () => {
     };
     // Each 400 × 400 edit fits the budget alone; the second exceeds what the first left.
     const diff = getFileEditDiff("MultiEdit", { file_path: "a.py", edits: [pair, pair] });
-    expect(diff).toMatchObject({ additions: 1 + 400, removals: 1 + 400 });
+    expect(diff).toMatchObject({ additions: 1 + 400, removals: 1 + 400, countsAreMaximum: true });
+    const fits = getFileEditDiff("MultiEdit", { file_path: "a.py", edits: [pair] });
+    expect(fits).toMatchObject({ additions: 1, removals: 1, countsAreMaximum: false });
   });
 
   it("returns null for a no-op, malformed, or non-edit call", () => {

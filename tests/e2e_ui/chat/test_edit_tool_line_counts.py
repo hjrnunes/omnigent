@@ -161,7 +161,7 @@ def test_edit_rows_show_line_counts_and_diff(
     plain = applied_result.evaluate(color)
     added = applied_result.get_by_text("2 additions", exact=True).evaluate(color)
     removed = applied_result.get_by_text("3 removals", exact=True).evaluate(color)
-    # Each count has its own color, distinct from the rest of the line.
+    # Additions and removals use diff colors, not the line's plain color.
     assert len({plain, added, removed}) == 3
     assert failed_result.evaluate(color) != plain
 

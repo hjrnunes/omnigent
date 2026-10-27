@@ -14,6 +14,8 @@ export interface FileEditDiff {
   fileCount: number;
   /** A replace-all edit is diffed once, so its counts cover a single match. */
   countsAreMinimum: boolean;
+  /** A change too large to compare is a whole-block replacement, so its counts can be too high. */
+  countsAreMaximum: boolean;
 }
 
 interface EditPair {
@@ -70,7 +72,7 @@ function editPairs(args: Record<string, unknown>): EditPair[] {
 }
 
 function pairsDiff(pairs: EditPair[]): FileEditDiff | null {
-  const budget = { cells: MAX_LINE_DIFF_CELLS };
+  const budget: DiffBudget = { cells: MAX_LINE_DIFF_CELLS, exceeded: false };
   const hunks = pairs.map((pair) => lineDiff(...pairLines(pair), budget));
   const changed = hunks.filter((hunk) => hunk.some((line) => line.kind !== "context"));
   if (changed.length === 0) return null;
@@ -81,6 +83,7 @@ function pairsDiff(pairs: EditPair[]): FileEditDiff | null {
     removals: countKind(lines, "removed"),
     fileCount: 1,
     countsAreMinimum: pairs.some((pair) => pair.replaceAll),
+    countsAreMaximum: budget.exceeded,
   };
 }
 
@@ -126,6 +129,7 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
     removals,
     fileCount: sections.length,
     countsAreMinimum: false,
+    countsAreMaximum: false,
   };
 }
 
@@ -158,9 +162,10 @@ function pairLines(pair: EditPair): [string[], string[]] {
   return [oldLines, newLines];
 }
 
-/** Comparison steps a call's remaining edits may still use. */
+/** Comparison steps a call's remaining edits may still use, and whether one ran out. */
 interface DiffBudget {
   cells: number;
+  exceeded: boolean;
 }
 
 /** Line diff of a replacement, trimmed to the changes and their nearby context. */
@@ -195,7 +200,10 @@ function middleDiff(oldLines: string[], newLines: string[], budget: DiffBudget):
     ...newLines.map((text): DiffLine => ({ kind: "added", text })),
   ];
   const cells = oldLines.length * newLines.length;
-  if (cells > budget.cells) return replaceAll();
+  if (cells > budget.cells) {
+    budget.exceeded = true;
+    return replaceAll();
+  }
   budget.cells -= cells;
   const width = newLines.length + 1;
   // common[i * width + j]: LCS length of oldLines[i:] and newLines[j:].

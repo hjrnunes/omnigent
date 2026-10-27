@@ -91,7 +91,8 @@ export function summarizeToolResult(call: ToolCall): ToolResultSummary | null {
 /**
  * A finished edit's added and removed line counts, e.g. "Updated with 2
  * additions and 3 removals". Failures keep the usual error line; running,
- * cancelled and unchanged edits (including pure renames) show none.
+ * cancelled and unchanged edits (including pure renames) show none, as do
+ * edits too large to compare, whose counts could overstate the change.
  */
 export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
   const generic = summarizeToolResult(call);
@@ -100,7 +101,9 @@ export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
   if (error !== null) return failure(firstLine(error));
   if (!editApplied(call.name, call.output)) return generic;
   const diff = getFileEditDiff(call.name, call.args);
-  if (diff === null || diff.additions + diff.removals === 0) return generic;
+  if (diff === null || diff.countsAreMaximum || diff.additions + diff.removals === 0) {
+    return generic;
+  }
   const counts: ToolResultSegment[] = [];
   if (diff.additions > 0) counts.push({ text: plural(diff.additions, "addition"), tone: "added" });
   if (diff.removals > 0) counts.push({ text: plural(diff.removals, "removal"), tone: "removed" });

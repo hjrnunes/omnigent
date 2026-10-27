@@ -252,6 +252,18 @@ describe("summarizeFileEdit", () => {
     );
   });
 
+  it("shows no counts for an edit too large to compare line by line", () => {
+    const shared = Array.from({ length: 500 }, (_, index) => `line ${index}`);
+    const large = edit("The file a.py has been updated successfully.", {
+      args: {
+        file_path: "a.py",
+        old_string: [...shared, "old end"].join("\n"),
+        new_string: ["new start", ...shared].join("\n"),
+      },
+    });
+    expect(summarizeFileEdit(large)).toBeNull();
+  });
+
   it("shows no counts for a patch that only renames a file", () => {
     const call: ToolCall = {
       name: "apply_patch",

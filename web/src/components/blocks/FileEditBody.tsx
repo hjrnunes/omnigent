@@ -17,7 +17,8 @@ export function FileEditBody({ call }: { call: ToolCall }) {
   const diff = useMemo(() => getFileEditDiff(name, args), [name, args]);
   const error = useMemo(() => {
     if (output === null) return null;
-    // A failed call's output is its error even without a recognized prefix.
+    // Defensive: the transcript sets output-error only without output, but a direct
+    // caller's failed output is its error even without a recognized prefix.
     const failure = state === "output-error" ? output.trim() || EMPTY_FAILURE : null;
     return editErrorMessage(output) ?? failure;
   }, [output, state]);
