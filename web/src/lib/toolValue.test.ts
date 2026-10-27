@@ -99,6 +99,11 @@ describe("toolErrorMessage", () => {
     ['{"error": true}', "The tool reported an error."],
     ['{"error": {"code": 500}}', "The tool reported an error."],
     ["<tool_use_error></tool_use_error>", "The tool reported an error."],
+    [
+      '{"content": [{"type": "text", "text": "Could not find the text in a.py."}], "details": {}, "isError": true}',
+      "Could not find the text in a.py.",
+    ],
+    ['{"content": [], "isError": true}', "The tool reported an error."],
   ])("reports %s as a failure", (output, message) => {
     expect(toolErrorMessage(parseToolOutput(output))).toBe(message);
   });
@@ -107,6 +112,7 @@ describe("toolErrorMessage", () => {
     "Error handling in the parser works as expected.",
     '{"errors": []}',
     '{"error": null}',
+    '{"content": [{"type": "text", "text": "Done."}], "isError": false}',
     "Task plan updated (2 tasks).",
   ])("treats %s as a success", (output) => {
     expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
@@ -144,11 +150,6 @@ describe("editErrorMessage", () => {
       "<tool_use_error>String to replace not found.</tool_use_error>",
       "String to replace not found.",
     ],
-    [
-      '{"content": [{"type": "text", "text": "Could not find the text in a.py."}], "isError": true}',
-      "Could not find the text in a.py.",
-    ],
-    ['{"content": [], "isError": true}', "The tool reported an error."],
   ])("reports %s as a failure", (output, message) => {
     expect(editErrorMessage(output)).toBe(message);
   });

@@ -220,17 +220,36 @@ describe("ToolCard rendering", () => {
     expect(screen.getByRole("button", { name: "Expand" })).toBeInTheDocument();
   });
 
-  it("shows a reported failure above the record's other fields", () => {
-    // WHY: a partial failure still returns data; hiding it behind Raw loses the useful part.
-    const { container } = renderCard({
+  it.each([
+    {
+      producer: "partial failure",
       name: "search_issues",
+      output: { error: "2 of 3 pages failed", results: ["OMNI-1"] },
+      error: "2 of 3 pages failed",
+      fields: "ResultsOMNI-1",
+    },
+    {
+      producer: "failed SDK Pi result",
+      name: "grep",
+      output: {
+        content: [{ type: "text", text: "Path not found: /repo/missing" }],
+        details: { path: "/repo/missing" },
+        isError: true,
+      },
+      error: "Path not found: /repo/missing",
+      fields: "DetailsPath/repo/missing",
+    },
+  ])("shows a $producer above the record's other fields", ({ name, output, error, fields }) => {
+    // WHY: a failure can still return data; hiding it behind Raw loses the useful part.
+    const { container } = renderCard({
+      name,
       arguments: {},
-      output: JSON.stringify({ error: "2 of 3 pages failed", results: ["OMNI-1"] }),
+      output: JSON.stringify(output),
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("2 of 3 pages failed")).toHaveLength(2);
-    expect(screen.getByTestId("tool-value-view").textContent).toBe("ResultsOMNI-1");
+    expect(screen.getAllByText(error)).toHaveLength(2);
+    expect(screen.getByTestId("tool-value-view").textContent).toBe(fields);
   });
 
   it("keeps a short result with a trailing newline inline", () => {
@@ -465,6 +484,18 @@ describe("ToolCard registered views", () => {
       args: { filePath: "a.py", oldString: "x", newString: "y" },
       output: "[error] Error: oldString not found in content",
       error: "Error: oldString not found in content",
+      diffText: "+y",
+    },
+    {
+      producer: "SDK Pi failed edit",
+      name: "edit",
+      args: { path: "a.py", oldText: "x", newText: "y" },
+      output: JSON.stringify({
+        content: [{ type: "text", text: "Could not find the exact text in a.py." }],
+        details: {},
+        isError: true,
+      }),
+      error: "Could not find the exact text in a.py.",
       diffText: "+y",
     },
   ])(

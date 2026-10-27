@@ -145,6 +145,15 @@ describe("summarizeToolResult", () => {
       expect(
         summarize("github__create_pull_request", '{"result": "Error: 422 Validation Failed"}'),
       ).toEqual({ text: "Error: 422 Validation Failed", isError: true });
+      const piFailure = {
+        content: [{ type: "text", text: "Command exited with code 1" }],
+        details: { truncation: null },
+        isError: true,
+      };
+      expect(summarize("bash", JSON.stringify(piFailure))).toEqual({
+        text: "Command exited with code 1",
+        isError: true,
+      });
     });
   });
 });

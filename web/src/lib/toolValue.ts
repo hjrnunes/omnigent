@@ -135,10 +135,12 @@ const UNNAMED_ERROR = "The tool reported an error.";
 export function toolErrorMessage(parsed: ParsedToolOutput): string | null {
   if (parsed.kind === "json") {
     if (!isRecord(parsed.value)) return null;
-    const { error, message } = parsed.value;
+    const { error, message, isError, content } = parsed.value;
     if (typeof error === "string" && error.length > 0) return error;
     if (isRecord(error)) return nonEmpty(error.message) ?? UNNAMED_ERROR;
     if (error === true) return nonEmpty(message) ?? UNNAMED_ERROR;
+    // A `{"content": [...], "isError": true}` result, as SDK Pi stores its failures.
+    if (isError === true) return nonEmpty(contentBlockText(content)?.trim()) ?? UNNAMED_ERROR;
     return null;
   }
   const text = stripAnsi(parsed.text).trim();
@@ -156,10 +158,6 @@ export function editErrorMessage(output: string): string | null {
   if (parsed.kind === "text") {
     const bracketed = BRACKETED_ERROR_RE.exec(stripAnsi(parsed.text).trim());
     if (bracketed !== null) return nonEmpty(bracketed[1]?.trim()) ?? UNNAMED_ERROR;
-  }
-  // SDK Pi stored failed results as `{"content": [...], "isError": true}`.
-  if (parsed.kind === "json" && isRecord(parsed.value) && parsed.value.isError === true) {
-    return nonEmpty(contentBlockText(parsed.value.content)?.trim()) ?? UNNAMED_ERROR;
   }
   return toolErrorMessage(parsed);
 }

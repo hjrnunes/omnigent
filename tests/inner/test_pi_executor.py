@@ -2756,7 +2756,7 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(tool_completes[0].status, ToolCallStatus.ERROR)
             self.assertIn(error_text, tool_completes[0].error)
             self.assertEqual(tool_completes[0].result, result)
-            # The transcript keeps no error flag, so the mirrored text says it failed.
+            # The transcript keeps no error flag, so the mirrored output marks the failure.
             self.assertEqual(tool_completes[0].metadata["transcript_output"], output)
 
         text_blocks = {"content": [{"type": "text", "text": "Something broke"}]}
@@ -2766,10 +2766,11 @@ class TestRunTurn(unittest.TestCase):
         text_and_image = {"content": [*text_blocks["content"], image]}
         for result, error_text, output in (
             ("Something broke", "Something broke", "Error: Something broke"),
-            (text_blocks, "Something broke", "Error: Something broke"),
-            (with_details, "Something broke", "Error: Something broke"),
-            (image_only, "image/png", f"Error: {json.dumps(image_only)}"),
-            (text_and_image, "Something broke", f"Error: {json.dumps(text_and_image)}"),
+            ("Error: Something broke", "Something broke", "Error: Something broke"),
+            (text_blocks, "Something broke", json.dumps({**text_blocks, "isError": True})),
+            (with_details, "Something broke", json.dumps({**with_details, "isError": True})),
+            (image_only, "image/png", json.dumps({**image_only, "isError": True})),
+            (text_and_image, "Something broke", json.dumps({**text_and_image, "isError": True})),
         ):
             with self.subTest(result=result):
                 _run(_test(result, error_text, output))
@@ -3012,7 +3013,10 @@ async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: 
             "toolCallId": cid,
             "toolName": "read",
             "isError": is_error,
-            "result": {"content": [{"type": "text", "text": f"result_{cid}"}]},
+            "result": {
+                "content": [{"type": "text", "text": f"result_{cid}"}],
+                "details": {"path": cid},
+            },
         }
         for cid in ("read_b", "read_a")
     ]
@@ -3043,7 +3047,10 @@ async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: 
     assert all(item.response_id == "turn_pi" for item in persisted)
     for item in persisted:
         if item.type == "function_call_output":
-            assert f"result_{item.data.call_id}" in item.data.output
+            stored = json.loads(item.data.output)
+            assert stored["content"][0]["text"] == f"result_{item.data.call_id}"
+            assert stored["details"] == {"path": item.data.call_id}
+            assert stored.get("isError", False) is is_error
     assert not adapter._pending_mcp_call_ids
     assert not adapter._observed_tool_calls
 

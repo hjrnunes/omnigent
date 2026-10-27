@@ -309,8 +309,10 @@ function presentToolResult(output: string): ResultPresentation {
 function errorContext(parsed: ParsedToolOutput): Record<string, unknown> | null {
   if (parsed.kind !== "json" || !isRecord(parsed.value)) return null;
   const record = parsed.value;
-  // `{"error": true, "message": ...}` already shows its message as the error.
+  // `{"error": true, "message": ...}` already shows its message as the error, and
+  // a `{"content": [...], "isError": true}` result its content's text.
   const shown = new Set(record.error === true ? ["error", "message"] : ["error"]);
+  if (record.isError === true) shown.add("isError").add("content");
   const rest = Object.entries(record).filter(([key]) => !shown.has(key));
   return rest.length > 0 ? Object.fromEntries(rest) : null;
 }

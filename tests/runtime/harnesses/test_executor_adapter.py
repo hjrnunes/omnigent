@@ -2725,18 +2725,19 @@ def test_tool_complete_transcript_output_replaces_serialized_result() -> None:
         "content": [{"type": "text", "text": "Something broke"}],
         "details": {"path": "a.py"},
     }
+    transcript_output = json.dumps({**result, "isError": True})
     event = ToolCallComplete(
         name="edit",
         status=ToolCallStatus.ERROR,
         result=result,
         error="Something broke",
-        metadata={"call_id": "tc_failed_1", "transcript_output": "Error: Something broke"},
+        metadata={"call_id": "tc_failed_1", "transcript_output": transcript_output},
     )
 
     adapter._translate_event(event, ctx)  # type: ignore[arg-type]
 
     outputs = [e.item for e in ctx.emitted if e.item.get("type") == "function_call_output"]
-    assert [item["output"] for item in outputs] == ["Error: Something broke"]
+    assert [item["output"] for item in outputs] == [transcript_output]
     assert event.result == result
 
 

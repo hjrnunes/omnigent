@@ -1453,23 +1453,14 @@ _ERROR_LEAD_RE = re.compile(r"^error\s*:", re.IGNORECASE)
 
 
 def _failed_tool_output(result: JsonValue) -> str:
-    """Return the transcript text for a failed Pi tool result, led by ``Error:``.
+    """Return the transcript output for a failed Pi tool result.
 
-    The transcript does not carry Pi's error flag, so the text must say the call failed.
+    The transcript does not carry Pi's error flag, so an object result keeps its
+    fields with ``isError`` set, and any other result is text led by ``Error:``.
     """
-    content = result.get("content") if isinstance(result, dict) else result
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        texts = [
-            item["text"]
-            for item in content
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
-        ]
-        # Images or other non-text blocks stay in the serialized result.
-        text = "".join(texts) if texts and len(texts) == len(content) else json.dumps(result)
-    else:
-        text = json.dumps(result)
+    if isinstance(result, dict):
+        return json.dumps({**result, "isError": True})
+    text = result if isinstance(result, str) else json.dumps(result)
     return text if _ERROR_LEAD_RE.match(text) else f"Error: {text}"
 
 
