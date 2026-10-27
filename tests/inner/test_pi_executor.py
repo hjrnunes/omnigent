@@ -2755,16 +2755,19 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(tool_completes), 1)
             self.assertEqual(tool_completes[0].status, ToolCallStatus.ERROR)
             self.assertIn(error_text, tool_completes[0].error)
+            self.assertEqual(tool_completes[0].result, result)
             # The transcript keeps no error flag, so the mirrored text says it failed.
-            self.assertEqual(tool_completes[0].result, output)
+            self.assertEqual(tool_completes[0].metadata["transcript_output"], output)
 
         text_blocks = {"content": [{"type": "text", "text": "Something broke"}]}
+        with_details = {**text_blocks, "details": {"path": "a.py"}}
         image = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
         image_only = {"content": [image]}
         text_and_image = {"content": [*text_blocks["content"], image]}
         for result, error_text, output in (
             ("Something broke", "Something broke", "Error: Something broke"),
             (text_blocks, "Something broke", "Error: Something broke"),
+            (with_details, "Something broke", "Error: Something broke"),
             (image_only, "image/png", f"Error: {json.dumps(image_only)}"),
             (text_and_image, "Something broke", f"Error: {json.dumps(text_and_image)}"),
         ):

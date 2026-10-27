@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  contentEnvelopeText,
   humanizeKey,
   isoTimestampMs,
   parseToolOutput,
@@ -109,6 +110,21 @@ describe("toolErrorMessage", () => {
     "Task plan updated (2 tasks).",
   ])("treats %s as a success", (output) => {
     expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
+  });
+});
+
+describe("contentEnvelopeText", () => {
+  it("joins the text blocks of a content envelope", () => {
+    const value = { content: [{ type: "text", text: "Done." }], details: { diff: "+x" } };
+    expect(contentEnvelopeText(value)).toBe("Done.");
+  });
+
+  it.each([
+    [{ content: [{ type: "text", text: "Failed." }], isError: true }],
+    [{ content: "Done." }],
+    [[{ type: "text", text: "Done." }]],
+  ])("returns null for %j", (value) => {
+    expect(contentEnvelopeText(value)).toBeNull();
   });
 });
 

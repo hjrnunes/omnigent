@@ -83,6 +83,15 @@ export function parseToolOutput(output: string): ParsedToolOutput {
     : { kind: "json", value: inner, text: wrapped };
 }
 
+/**
+ * The text of a `{"content": [...blocks]}` tool result, as SDK Pi stores its own
+ * tools' results, or `null` when `value` is not one or reports an error.
+ */
+export function contentEnvelopeText(value: unknown): string | null {
+  if (!isRecord(value) || value.isError === true) return null;
+  return contentBlockText(value.content);
+}
+
 /** The text in a `{"result": "..."}` wrapper, or `null` when `value` is not one. */
 function resultWrapperText(value: unknown): string | null {
   if (!isRecord(value) || typeof value.result !== "string") return null;

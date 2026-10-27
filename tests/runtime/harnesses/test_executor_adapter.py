@@ -2714,6 +2714,32 @@ def test_non_dispatched_id_tool_complete_emits_output() -> None:
     assert fco_items[0].item.get("call_id") == call_id
 
 
+def test_tool_complete_transcript_output_replaces_serialized_result() -> None:
+    """An executor's ``transcript_output`` is the mirrored output; the raw result is not."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    result = {
+        "content": [{"type": "text", "text": "Something broke"}],
+        "details": {"path": "a.py"},
+    }
+    event = ToolCallComplete(
+        name="edit",
+        status=ToolCallStatus.ERROR,
+        result=result,
+        error="Something broke",
+        metadata={"call_id": "tc_failed_1", "transcript_output": "Error: Something broke"},
+    )
+
+    adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    outputs = [e.item for e in ctx.emitted if e.item.get("type") == "function_call_output"]
+    assert [item["output"] for item in outputs] == ["Error: Something broke"]
+    assert event.result == result
+
+
 def test_idless_tool_complete_is_suppressed() -> None:
     """A ToolCallComplete with no usable call_id emits nothing (no ghost card).
 

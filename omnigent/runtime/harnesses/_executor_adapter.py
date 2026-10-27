@@ -1639,7 +1639,13 @@ def _serialize_args(args: dict[str, Any]) -> str:
 
 
 def _serialize_tool_result(event: ToolCallComplete) -> str:
-    """Stringify a ToolCallComplete for function_call_output (result preferred, error fallback)."""
+    """Stringify a ToolCallComplete for function_call_output.
+
+    Prefers the executor's ``transcript_output``, then the result, then the error.
+    """
+    transcript_output = event.metadata.get("transcript_output")
+    if isinstance(transcript_output, str):
+        return transcript_output
     if event.result is not None:
         return _stringify_tool_payload(event.result)
     if event.error is not None:

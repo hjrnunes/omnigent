@@ -110,12 +110,12 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
       else removals += body.length;
     } else {
       body = unifiedDiffBody(diff);
-      // An empty add or delete still changes a file; an empty in-place update does not.
-      if (body.length === 0 && newPath === change.path) continue;
-      for (const line of body) {
-        if (line.startsWith("+")) additions += 1;
-        else if (line.startsWith("-")) removals += 1;
-      }
+      const added = body.filter((line) => line.startsWith("+")).length;
+      const removed = body.filter((line) => line.startsWith("-")).length;
+      // An empty add or delete still changes a file; an update without changed lines does not.
+      if (added + removed === 0 && newPath === change.path) continue;
+      additions += added;
+      removals += removed;
     }
     sections.push([`--- ${change.path}`, `+++ ${newPath}`, ...body].join("\n"));
   }

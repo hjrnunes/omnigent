@@ -285,6 +285,11 @@ describe("editApplied", () => {
     ["edit", "Created new file: /repo/a.py with provided content."],
     ["mcp__omnigent__sys_os_edit", '{"path": "/repo/a.py", "replacements": 1, "bytes_written": 9}'],
     ["apply_patch", "File change applied.\nupdate /repo/a.py"],
+    // SDK Pi stores its own tools' results whole.
+    [
+      "edit",
+      `{"content": [{"type": "text", "text": "Successfully replaced text in a.py."}], "details": {"diff": "-1 x\\n+1 y", "firstChangedLine": 1}}`,
+    ],
   ])("accepts %s output %j", (name, output) => {
     expect(editApplied(name, output)).toBe(true);
   });
@@ -296,6 +301,11 @@ describe("editApplied", () => {
     ["sys_os_edit", "Replaced 1 occurrence(s) in /repo/a.py"],
     ["apply_patch", "update /repo/a.py"],
     ["apply_patch", "Successfully replaced text in a.py."],
+    [
+      "edit",
+      '{"content": [{"type": "text", "text": "Successfully replaced text in a.py."}], "isError": true}',
+    ],
+    ["edit", '{"content": [{"type": "text", "text": "Could not find the exact text in a.py."}]}'],
   ])("rejects %s output %j", (name, output) => {
     expect(editApplied(name, output)).toBe(false);
   });

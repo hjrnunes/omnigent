@@ -144,6 +144,7 @@ describe("getFileEditDiff", () => {
       changes: [
         { path: "a.py", kind: { type: "add" }, diff: "x\n" },
         { path: "b.py", kind: { type: "update" }, diff: "--- a/b.py\n+++ b/b.py\n" },
+        { path: "c.py", kind: { type: "update" }, diff: "@@ -1 +1 @@\n keep\n" },
         { path: "empty.py", kind: { type: "add" }, diff: "" },
       ],
     });

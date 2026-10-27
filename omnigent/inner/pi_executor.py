@@ -106,6 +106,7 @@ from .executor import (
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
+    ToolCallMetadata,
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
@@ -1452,7 +1453,7 @@ _ERROR_LEAD_RE = re.compile(r"^error\s*:", re.IGNORECASE)
 
 
 def _failed_tool_output(result: JsonValue) -> str:
-    """Return a failed Pi tool result's text, led by ``Error:``.
+    """Return the transcript text for a failed Pi tool result, led by ``Error:``.
 
     The transcript does not carry Pi's error flag, so the text must say the call failed.
     """
@@ -3119,14 +3120,15 @@ class PiExecutor(Executor):
                 else:
                     status = ToolCallStatus.SUCCESS
 
+                completion_metadata: ToolCallMetadata = {"call_id": call_id}
                 if is_error and not is_blocked and result is not None:
-                    result = _failed_tool_output(result)
+                    completion_metadata["transcript_output"] = _failed_tool_output(result)
                 yield ToolCallComplete(
                     name=tool_name,
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
-                    metadata={"call_id": call_id},
+                    metadata=completion_metadata,
                 )
                 continue
 

@@ -7,6 +7,7 @@ import { type ShellToolOutput, parseShellToolOutput } from "@/lib/shellToolOutpu
 import { shellToolCall, stripOmnigentPrefix, toolCallCategory } from "@/lib/toolTitle";
 import {
   type ParsedToolOutput,
+  contentEnvelopeText,
   editErrorMessage,
   firstLine,
   humanizeKey,
@@ -128,7 +129,8 @@ export function editApplied(name: string, output: string): boolean {
     const replacements = record?.replacements;
     return typeof replacements === "number" && replacements > 0;
   }
-  return EDIT_APPLIED_RE.test(stripAnsi(parsed.text).trim());
+  const envelopeText = parsed.kind === "json" ? contentEnvelopeText(parsed.value) : null;
+  return EDIT_APPLIED_RE.test(stripAnsi(envelopeText ?? parsed.text).trim());
 }
 
 function summarizeShellResult(result: ShellToolOutput): ToolResultSummary | null {

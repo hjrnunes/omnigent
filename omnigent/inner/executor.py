@@ -219,7 +219,9 @@ class ToolCallComplete(ExecutorEvent):
     :param metadata: Per-call metadata mirroring
         :attr:`ToolCallRequest.metadata` — primarily the
         provider-native ``call_id`` so downstream consumers can
-        pair this completion with its originating request.
+        pair this completion with its originating request. An
+        optional ``transcript_output`` string replaces the serialized
+        ``result`` in the transcript's ``function_call_output``.
     """
 
     name: str
