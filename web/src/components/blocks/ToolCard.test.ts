@@ -559,6 +559,23 @@ describe("ToolCard registered views", () => {
     expect(container.textContent).toContain("M src/file99.py");
   });
 
+  it.each([
+    ["output-available", "Error: String to replace not found in file."],
+    ["output-error", "Permission denied: /repo/a.py"],
+  ] as const)("shows a %s edit's error when its arguments give no diff", async (state, output) => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py" },
+      output,
+      state,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByTestId("tool-error-box").textContent).toBe(output);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+    expect(screen.queryByText("Output")).toBeNull();
+  });
+
   it("keeps a long diff behind the output preview until expanded", async () => {
     await registerRealView("Edit");
     const lines = Array.from({ length: 100 }, (_, index) => `line${index}`);

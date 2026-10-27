@@ -97,13 +97,11 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
   const sections: string[] = [];
   let additions = 0;
   let removals = 0;
-  let renamed = false;
   for (const change of changes) {
     if (!isRecord(change) || typeof change.path !== "string") continue;
     const kind = isRecord(change.kind) ? change.kind.type : change.kind;
     const movePath = isRecord(change.kind) ? (change.kind.move_path ?? change.kind.movePath) : null;
     const newPath = typeof movePath === "string" && movePath !== "" ? movePath : change.path;
-    if (newPath !== change.path) renamed = true;
     const diff = typeof change.diff === "string" ? change.diff : "";
     let body: string[];
     if (kind === "add" || kind === "delete") {
@@ -115,14 +113,14 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
       body = unifiedDiffBody(diff);
       const added = body.filter((line) => line.startsWith("+")).length;
       const removed = body.filter((line) => line.startsWith("-")).length;
-      // An empty add or delete still changes a file; an update without changed lines does not.
+      // An empty add or delete still changes a file; an unchanged, unrenamed update does not.
       if (added + removed === 0 && newPath === change.path) continue;
       additions += added;
       removals += removed;
     }
     sections.push([`--- ${change.path}`, `+++ ${newPath}`, ...body].join("\n"));
   }
-  if (sections.length === 0 || (additions + removals === 0 && !renamed)) return null;
+  if (sections.length === 0) return null;
   return {
     text: sections.join("\n"),
     additions,

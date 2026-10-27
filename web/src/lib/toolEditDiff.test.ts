@@ -156,6 +156,20 @@ describe("getFileEditDiff", () => {
     expect(diff?.text).toBe("--- a.py\n+++ a.py\n+x\n--- empty.py\n+++ empty.py");
   });
 
+  it("keeps a patch that only adds or deletes an empty file", () => {
+    for (const type of ["add", "delete"]) {
+      const diff = getFileEditDiff("apply_patch", {
+        changes: [{ path: "pkg/__init__.py", kind: { type }, diff: "" }],
+      });
+      expect(diff).toMatchObject({
+        text: "--- pkg/__init__.py\n+++ pkg/__init__.py",
+        additions: 0,
+        removals: 0,
+        fileCount: 1,
+      });
+    }
+  });
+
   it("names a renamed file's destination, even when its content is unchanged", () => {
     const moved = getFileEditDiff("apply_patch", {
       changes: [

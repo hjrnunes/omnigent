@@ -115,8 +115,16 @@ describe("toolErrorMessage", () => {
 
 describe("contentEnvelopeText", () => {
   it("joins the text blocks of a content envelope", () => {
-    const value = { content: [{ type: "text", text: "Done." }], details: { diff: "+x" } };
-    expect(contentEnvelopeText(value)).toBe("Done.");
+    const value = {
+      content: [
+        { type: "text", text: "Successfully replaced text in a.py." },
+        { type: "text", text: "Lines 3-4 changed." },
+      ],
+      details: { diff: "+x" },
+    };
+    expect(contentEnvelopeText(value)).toBe(
+      "Successfully replaced text in a.py.\n\nLines 3-4 changed.",
+    );
   });
 
   it.each([
