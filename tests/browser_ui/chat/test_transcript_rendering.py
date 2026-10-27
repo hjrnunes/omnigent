@@ -620,5 +620,7 @@ def test_failed_edit_rows_show_their_error(
 
     declined.click()
     body = declined.locator("xpath=..")
-    expect(body.get_by_text("File change ended with status declined.").last).to_be_visible()
+    expect(body.get_by_test_id("tool-error-box")).to_contain_text(
+        "File change ended with status declined."
+    )
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
