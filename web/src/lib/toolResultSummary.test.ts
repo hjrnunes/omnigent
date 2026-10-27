@@ -230,32 +230,27 @@ describe("summarizeFileEdit", () => {
     ).toEqual({ text: "Could not find the text in a.py.", isError: true });
   });
 
-  it.each(["apply_patch", "mcp__omnigent__apply_patch"])(
-    "shows no counts for %s output that does not say it applied",
-    (name) => {
-      // This output does not say whether the patch applied or was declined.
-      const legacy: ToolCall = {
-        name,
-        args: {
-          changes: [{ path: "/repo/app.py", kind: { type: "update" }, diff: "@@\n-a\n+b\n" }],
-        },
-        output: "update /repo/app.py",
-        state: "output-available",
-      };
-      expect(summarizeFileEdit(legacy)).toBeNull();
-    },
-  );
-
+  const patchArgs = {
+    changes: [{ path: "/repo/app.py", kind: { type: "update" }, diff: "@@\n-a\n+b\n" }],
+  };
+  const replaceArgs = {
+    path: "a.py",
+    oldText: "x",
+    newText: "y",
+    old_string: "x",
+    new_string: "y",
+  };
   it.each([
-    ["Edit", "Error reading /repo/missing.py: [Errno 2] No such file or directory"],
-    ["edit", "Could not find the exact text in a.py."],
-  ])("shows no counts for %s output that does not say it applied: %j", (name, output) => {
-    // Failures without a recognized error prefix, such as a missed Pi edit's text.
-    const call = edit(output, {
-      name,
-      args: { path: "a.py", oldText: "x", newText: "y", old_string: "x", new_string: "y" },
-    });
-    expect(summarizeFileEdit(call)).toBeNull();
+    { name: "apply_patch", args: patchArgs, output: "update /repo/app.py" },
+    { name: "mcp__omnigent__apply_patch", args: patchArgs, output: "update /repo/app.py" },
+    {
+      name: "Edit",
+      args: replaceArgs,
+      output: "Error reading /repo/missing.py: [Errno 2] No such file or directory",
+    },
+    { name: "edit", args: replaceArgs, output: "Could not find the exact text in a.py." },
+  ])("shows no counts for $name output that does not say it applied: $output", (overrides) => {
+    expect(summarizeFileEdit(edit(overrides.output, overrides))).toBeNull();
   });
 
   it("marks a replace-all edit's counts as a lower bound", () => {
