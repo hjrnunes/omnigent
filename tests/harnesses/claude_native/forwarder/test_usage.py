@@ -697,3 +697,416 @@ async def test_forward_session_cost_tags_display_advance_with_model(
         estimate_box["value"] = 0.90
         await run()
         assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
+
+
+def _abandoned_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Return forwarder warning messages that report an abandoned sample.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: Matching messages, e.g. ``"Abandoned Claude session cost …"``.
+    """
+    return [record.getMessage() for record in caplog.records if "Abandoned" in record.getMessage()]
+
+
+def _fail_telemetry_posts(request: httpx.Request) -> httpx.Response:
+    """
+    Answer every telemetry post with a retryable server error.
+
+    :param request: Outbound HTTP request from the forwarder.
+    :returns: HTTP 503 response.
+    """
+    return httpx.Response(503, json={}, request=request)
+
+
+@pytest.mark.asyncio
+async def test_forward_session_cost_abandons_sample_after_20_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An unchanged cost sample is abandoned after 20 consecutive failures.
+
+    A session whose final cost post keeps failing (server outage) otherwise
+    retries forever; each retry counts as runner activity and defeats the
+    idle watchdog. At the cap the forwarder commits the pending value as
+    posted, clears the retry counters, and stays quiet until cost advances.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    status_box = {"value": 0.01}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": status_box["value"]},
+    )
+    estimate_box = {"value": 0.65}
+    monkeypatch.setattr(
+        forwarder,
+        "_session_cost_estimate",
+        lambda **_kwargs: estimate_box["value"],
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
+    subagent_state = forwarder.SubagentForwardState(
+        subagents={
+            "aaa": forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _fail_telemetry_posts(request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+
+        async def run() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=subagent_state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        max_failures = forwarder._TELEMETRY_POST_MAX_FAILURES
+        for _ in range(max_failures):
+            await run()
+            # Step past the exponential backoff deadline before the next try.
+            now["value"] += 31.0
+
+        assert len(requests) == max_failures
+        assert dedupe.posted_cost == pytest.approx(0.01)
+        assert dedupe.posted_policy_cost == pytest.approx(0.65)
+        assert dedupe.cost_retry_failures == 0
+        assert dedupe.cost_retry_not_before == 0.0
+        assert len(_abandoned_warnings(caplog)) == 1
+
+        # The abandoned sample is committed: an unchanged value posts nothing.
+        await run()
+        await run()
+        assert len(requests) == max_failures
+
+        # The next cost advance resumes posting immediately.
+        status_box["value"] = 0.02
+        await run()
+        assert len(requests) == max_failures + 1
+
+
+@pytest.mark.asyncio
+async def test_forward_session_cost_never_abandons_after_interrupted_streak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Only *consecutive* cost failures count toward the cap.
+
+    A success between two failure streaks resets the counter, so 19
+    failures, a success, and 19 more failures never abandon a sample.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    status_box = {"value": 0.25}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": status_box["value"]},
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
+    failing = {"value": True}
+    dedupe = forwarder._ForwardDedupeState()
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if failing["value"]:
+            return _fail_telemetry_posts(request)
+        return httpx.Response(202, json={}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+
+        async def run() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=forwarder.SubagentForwardState(subagents={}),
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        below_cap = forwarder._TELEMETRY_POST_MAX_FAILURES - 1
+        for _ in range(below_cap):
+            await run()
+            now["value"] += 31.0
+        assert dedupe.cost_retry_failures == below_cap
+
+        failing["value"] = False
+        await run()
+        assert dedupe.cost_retry_failures == 0
+        assert dedupe.posted_cost == pytest.approx(0.25)
+
+        # A new pending sample: 19 more failures must not exhaust the budget.
+        failing["value"] = True
+        now["value"] += 31.0
+        status_box["value"] = 0.30
+        for _ in range(below_cap):
+            await run()
+            now["value"] += 31.0
+
+    assert dedupe.cost_retry_failures == below_cap
+    assert dedupe.posted_cost == pytest.approx(0.25)
+    assert _abandoned_warnings(caplog) == []
+
+
+def _assistant_usage_record(uuid: str, usage: dict[str, int]) -> str:
+    """
+    Build one assistant transcript record carrying ``message.usage``.
+
+    :param uuid: Transcript record id, e.g. ``"a1"``.
+    :param usage: Anthropic ``message.usage`` block for the call.
+    :returns: A JSON-encoded transcript line.
+    """
+    return json.dumps(
+        {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": f"reply {uuid}"}],
+                "usage": usage,
+            },
+        }
+    )
+
+
+class _TranscriptUsagePoller:
+    """Drive transcript usage posts through ``_forward_available_items``."""
+
+    def __init__(self, client: httpx.AsyncClient, bridge_dir: Path, transcript_path: Path) -> None:
+        """
+        Initialize the cursor and dedupe state for one session.
+
+        :param client: Omnigent HTTP client backed by the test transport.
+        :param bridge_dir: Native Claude bridge directory.
+        :param transcript_path: Transcript JSONL path, created empty.
+        :returns: None.
+        """
+        transcript_path.touch()
+        self.client = client
+        self.bridge_dir = bridge_dir
+        self.transcript_path = transcript_path
+        self.dedupe = forwarder._ForwardDedupeState()
+        self.retry_tracker = forwarder._PostRetryTracker()
+        self.state = forwarder.TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=0,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+        )
+
+    async def poll(self, uuid: str, usage: dict[str, int]) -> None:
+        """
+        Append one completed API call, then run one forwarder poll.
+
+        :param uuid: Transcript record id for the new assistant call.
+        :param usage: Anthropic ``message.usage`` block for that call.
+        :returns: None.
+        """
+        with self.transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(_assistant_usage_record(uuid, usage) + "\n")
+        self.state = await forwarder._forward_available_items(
+            client=self.client,
+            session_id="conv_usage",
+            bridge_dir=self.bridge_dir,
+            agent_name="claude-native-ui",
+            state=self.state,
+            retry_tracker=self.retry_tracker,
+            dedupe=self.dedupe,
+        )
+
+
+def _usage_status_state(monkeypatch: pytest.MonkeyPatch, box: dict[str, Any]) -> None:
+    """
+    Serve the statusLine snapshot that feeds the usage post.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param box: Mutable ``{"usage": …}`` box holding ``current_usage``.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"context_window_size": 200_000, "current_usage": box["usage"]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_transcript_usage_retry_counter_resets_on_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Usage failures accumulate a streak that a success clears.
+
+    The counter only exists to bound an unchanged sample; a delivered post
+    proves the server is reachable again, so the next failure starts at 1.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    status_box: dict[str, Any] = {
+        "usage": {"input_tokens": 1000, "output_tokens": 50},
+    }
+    _usage_status_state(monkeypatch, status_box)
+    failing = {"value": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("type") == "external_session_usage" and failing["value"]:
+            return _fail_telemetry_posts(request)
+        return httpx.Response(202, json={}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        poller = _TranscriptUsagePoller(client, bridge_dir, transcript_path)
+        for attempt in range(3):
+            await poller.poll(f"a{attempt}", {"input_tokens": 1000, "output_tokens": 50})
+            assert poller.dedupe.usage_retry_failures == attempt + 1
+
+        failing["value"] = False
+        await poller.poll("a3", {"input_tokens": 1000, "output_tokens": 50})
+
+    assert poller.dedupe.usage_retry_failures == 0
+    assert poller.dedupe.usage == {
+        "context_tokens": 1000,
+        "input_tokens": 1000,
+        "output_tokens": 50,
+    }
+    assert poller.dedupe.recorded_token_usage == {"input_tokens": 1000, "output_tokens": 50}
+
+
+@pytest.mark.asyncio
+async def test_transcript_usage_abandons_sample_after_20_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An unchanged usage sample is abandoned after 20 consecutive failures.
+
+    At the cap the forwarder commits usage, context window, and the recorded
+    token counters so the next poll sees no change, and stops posting until
+    the statusLine reports a different sample.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    usage = {"input_tokens": 1000, "output_tokens": 50}
+    status_box: dict[str, Any] = {"usage": usage}
+    _usage_status_state(monkeypatch, status_box)
+    usage_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("type") == "external_session_usage":
+            usage_posts.append(payload["data"])
+            return _fail_telemetry_posts(request)
+        return httpx.Response(202, json={}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    max_failures = forwarder._TELEMETRY_POST_MAX_FAILURES
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        poller = _TranscriptUsagePoller(client, bridge_dir, transcript_path)
+        for attempt in range(max_failures):
+            await poller.poll(f"a{attempt}", usage)
+            if attempt + 1 < max_failures:
+                assert "Abandoned" not in caplog.text
+
+        assert len(usage_posts) == max_failures
+        assert poller.dedupe.usage_retry_failures == 0
+        assert poller.dedupe.usage == {
+            "context_tokens": 1000,
+            "input_tokens": 1000,
+            "output_tokens": 50,
+        }
+        assert poller.dedupe.context_window == 200_000
+        assert poller.dedupe.recorded_token_usage == usage
+        assert len(_abandoned_warnings(caplog)) == 1
+
+        # The abandoned sample is committed: an unchanged value posts nothing.
+        await poller.poll("a-extra", usage)
+        assert len(usage_posts) == max_failures
+
+        # A new sample resumes posting immediately.
+        status_box["usage"] = {"input_tokens": 1000, "output_tokens": 60}
+        await poller.poll("a-more", {"input_tokens": 1000, "output_tokens": 60})
+
+    assert len(usage_posts) == max_failures + 1
+
+
+@pytest.mark.asyncio
+async def test_transcript_usage_never_abandons_after_interrupted_streak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Only *consecutive* usage failures count toward the cap.
+
+    A success between two failure streaks resets the counter, so 19
+    failures, a success, and 19 more failures never abandon a sample.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    status_box: dict[str, Any] = {
+        "usage": {"input_tokens": 1000, "output_tokens": 50},
+    }
+    _usage_status_state(monkeypatch, status_box)
+    failing = {"value": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("type") == "external_session_usage" and failing["value"]:
+            return _fail_telemetry_posts(request)
+        return httpx.Response(202, json={}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    below_cap = forwarder._TELEMETRY_POST_MAX_FAILURES - 1
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        poller = _TranscriptUsagePoller(client, bridge_dir, transcript_path)
+        for attempt in range(below_cap):
+            await poller.poll(f"a{attempt}", {"input_tokens": 1000, "output_tokens": 50})
+        assert poller.dedupe.usage_retry_failures == below_cap
+
+        failing["value"] = False
+        await poller.poll("a-ok", {"input_tokens": 1000, "output_tokens": 50})
+        assert poller.dedupe.usage_retry_failures == 0
+
+        failing["value"] = True
+        status_box["usage"] = {"input_tokens": 1000, "output_tokens": 60}
+        for attempt in range(below_cap):
+            await poller.poll(f"b{attempt}", {"input_tokens": 1000, "output_tokens": 60})
+
+    assert poller.dedupe.usage_retry_failures == below_cap
+    assert poller.dedupe.usage == {
+        "context_tokens": 1000,
+        "input_tokens": 1000,
+        "output_tokens": 50,
+    }
+    assert _abandoned_warnings(caplog) == []
