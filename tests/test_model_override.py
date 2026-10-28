@@ -32,6 +32,10 @@ from omnigent.models.model_override import (
         "databricks/databricks-gpt-5-4",
         "vendor:tag",
         "o3",
+        # Droid's BYOK / custom ids carry parenthesized suffixes.
+        "custom:OpenAI-GPT-5.6-Luna-(BYOK)-4",
+        "custom:Kimi-K2-[Groq]-0",
+        "custom:cli-proxy-api:opus-5-5",
     ],
 )
 def test_validate_model_override_accepts_real_id_shapes(value: str) -> None:
@@ -61,6 +65,10 @@ def test_validate_model_override_strips_whitespace() -> None:
         'model"quoted"',
         "model with spaces",
         "model\nnewline",
+        # Parentheses are allowed, but they never make a space or a
+        # leading dash safe.
+        "custom:OpenAI GPT (BYOK)-4",
+        "-(BYOK)-4",
         # Flag-shaped values could be parsed as a CLI option.
         "--dangerously-skip-permissions",
         "-flag",

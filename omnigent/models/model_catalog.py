@@ -175,6 +175,11 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# Droid signs in through ``droid`` (device pairing or a Factory API key) and
+# reports the account's models in every ACP ``session/new`` response, so — like
+# devin — the CLI owns the credentials and the live listing.
+_DROID_HARNESSES: frozenset[str] = frozenset({"droid"})
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -222,12 +227,15 @@ class ModelListing:
     :param models: The enumerated models, e.g.
         ``(ModelEntry(id="databricks-gpt-5-4", family="openai"),)``.
     :param note: Human-readable provenance / failure explanation.
+    :param current_model_id: The CLI's current model for this session, when it
+        reports one (droid advertises it in ``session/new``).
     """
 
     source: str
     verified: bool
     models: tuple[ModelEntry, ...]
     note: str
+    current_model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -623,6 +631,8 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
+    if (canonical_harness or "") in _DROID_HARNESSES:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="droid", detail="droid CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(canonical_harness or "")
     if harness_type is None:
@@ -1178,7 +1188,8 @@ def catalog_for_spec(
         ``spec.sub_agents``).
     :param transport: Optional httpx transport override for tests.
     :returns: Mapping of worker name → row dict with ``source`` /
-        ``verified`` / ``models`` / ``note`` keys.
+        ``verified`` / ``models`` / ``note`` keys, plus ``currentModelId``
+        when the CLI reports one.
     """
     rows: dict[str, _JsonObject] = {}
     for sub in getattr(spec, "sub_agents", None) or []:
@@ -1256,6 +1267,8 @@ def _listing_payload(listing: ModelListing) -> _JsonObject:
         "models": models,
         "note": listing.note,
     }
+    if listing.current_model_id is not None:
+        payload["currentModelId"] = listing.current_model_id
     return payload
 
 
@@ -1331,7 +1344,11 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in ("cursor-agent", "devin"):
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in (
+        "cursor-agent",
+        "devin",
+        "droid",
+    ):
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -1343,11 +1360,12 @@ def _listing_for_provider(
         return cached
     try:
         if provider.kind == SUBSCRIPTION_KIND:
-            listing = (
-                _fetch_devin_cli_listing(provider)
-                if provider.cli == "devin"
-                else _fetch_cursor_cli_listing(provider)
-            )
+            if provider.cli == "devin":
+                listing = _fetch_devin_cli_listing(provider)
+            elif provider.cli == "droid":
+                listing = _fetch_droid_cli_listing(provider)
+            else:
+                listing = _fetch_cursor_cli_listing(provider)
         elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
@@ -1429,6 +1447,28 @@ def _fetch_devin_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
             for option in options
         ),
         note=f"live models advertised by the {provider.cli or 'devin'} CLI",
+    )
+
+
+def _fetch_droid_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from the installed Droid CLI.
+
+    The probe sends only ``initialize`` + ``session/new`` (no prompt, so no
+    tokens) and reports the account's ``availableModels`` — including the
+    ``custom:`` BYOK and proxy ids — plus the session's ``currentModelId``.
+    """
+    from omnigent.inner.droid_models import list_droid_cli_model_options
+
+    probed = list_droid_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=option.id, family=model_family_token(option.id))
+            for option in probed.models
+        ),
+        note=f"live models advertised by the {provider.cli or 'droid'} CLI",
+        current_model_id=probed.current_model_id,
     )
 
 

@@ -1444,6 +1444,151 @@ def test_cursor_listing_failure_degrades_to_usable_static_row(
     assert "cannot run here" not in listing.note
 
 
+def test_resolve_provider_droid_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The droid harness resolves to droid's own login, not ``none``.
+
+    Droid authenticates through ``droid`` (device pairing or a Factory API
+    key), so omnigent resolves no provider config for it and the CLI is the
+    authority on the account's models.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("droid"), "droid")
+    assert provider.kind == "subscription"
+    assert provider.cli == "droid"
+    assert provider.detail == "droid CLI login"
+
+
+def test_droid_listing_uses_live_cli_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A droid worker lists the models its CLI advertises.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.inner import droid_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        droid_models,
+        "list_droid_cli_model_options",
+        lambda: droid_models.DroidModelListing(
+            models=(
+                droid_models.DroidModelOption(id="gpt-6-luna", name="GPT-6 Luna"),
+                droid_models.DroidModelOption(
+                    id="custom:OpenAI-GPT-5.6-Luna-(BYOK)-4",
+                    name="Red Hat GPT-5.6 Luna",
+                ),
+            ),
+            current_model_id="gpt-6-luna",
+        ),
+    )
+    listing = list_models_for_worker(_worker_spec("droid"), "droid")
+    assert listing.source == "cli"
+    assert listing.verified is True
+    assert [m.id for m in listing.models] == [
+        "gpt-6-luna",
+        "custom:OpenAI-GPT-5.6-Luna-(BYOK)-4",
+    ]
+    assert listing.current_model_id == "gpt-6-luna"
+    assert "live models advertised" in listing.note
+
+
+def test_droid_listing_failure_degrades_to_usable_static_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed droid probe must not report the dead-worker shape.
+
+    Droid carries its own login, so a missing binary or a failed handshake
+    says nothing about dispatchability.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.inner import droid_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+
+    def fail() -> droid_models.DroidModelListing:
+        raise OSError("droid unavailable")
+
+    monkeypatch.setattr(droid_models, "list_droid_cli_model_options", fail)
+
+    listing = list_models_for_worker(_worker_spec("droid"), "droid")
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert listing.models == ()
+    assert listing.current_model_id is None
+    assert "can still run" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+def test_droid_listing_failure_is_empty_and_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient droid probe failure does not cache an empty catalog.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.inner import droid_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def fail() -> droid_models.DroidModelListing:
+        nonlocal calls
+        calls += 1
+        raise OSError("droid unavailable")
+
+    monkeypatch.setattr(droid_models, "list_droid_cli_model_options", fail)
+
+    first = list_models_for_worker(_worker_spec("droid"), "droid")
+    second = list_models_for_worker(_worker_spec("droid"), "droid")
+
+    assert first.models == second.models == ()
+    assert calls == 2
+
+
+def test_droid_catalog_row_reports_the_current_model_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``GET /v1/sessions/<id>/models`` carries droid's ``currentModelId``.
+
+    The picker and the E2E contract read the current model from the row, so
+    the payload must keep it alongside the live ``custom:`` ids.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.inner import droid_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setattr(
+        droid_models,
+        "list_droid_cli_model_options",
+        lambda: droid_models.DroidModelListing(
+            models=(
+                droid_models.DroidModelOption(id="auto", name="Auto Model"),
+                droid_models.DroidModelOption(id="custom:Kimi-K2-[Groq]-0", name="Kimi K2 Groq"),
+            ),
+            current_model_id="auto",
+        ),
+    )
+
+    row = catalog_for_spec(_worker_spec("droid"))["self"]
+
+    assert row["source"] == "cli"
+    assert row["currentModelId"] == "auto"
+    assert [model["id"] for model in row["models"]] == ["auto", "custom:Kimi-K2-[Groq]-0"]
+
+
 def test_none_listing_explains_dead_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

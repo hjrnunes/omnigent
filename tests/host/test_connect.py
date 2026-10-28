@@ -723,6 +723,99 @@ async def test_handle_model_options_devin_probe_failure_still_warns(
     assert record.exc_info[1] is failure
 
 
+async def test_handle_model_options_serves_the_droid_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The droid harness previews the models its CLI advertises."""
+    from omnigent.inner import droid_models
+
+    monkeypatch.setattr(
+        droid_models,
+        "list_droid_cli_model_options",
+        lambda: droid_models.DroidModelListing(
+            models=(
+                droid_models.DroidModelOption(id="gpt-6-luna", name="GPT-6 Luna", is_current=True),
+                droid_models.DroidModelOption(
+                    id="custom:OpenAI-GPT-5.6-Luna-(BYOK)-4",
+                    name="Red Hat GPT-5.6 Luna",
+                ),
+            ),
+            current_model_id="gpt-6-luna",
+        ),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_droid", harness="droid"),
+    )
+
+    source = {"kind": "subscription", "label": "Subscription", "name": "droid"}
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_droid",
+        status="ok",
+        models=[
+            {
+                "id": "gpt-6-luna",
+                "displayName": "GPT-6 Luna",
+                "isCurrent": True,
+                "source": source,
+            },
+            {
+                "id": "custom:OpenAI-GPT-5.6-Luna-(BYOK)-4",
+                "displayName": "Red Hat GPT-5.6 Luna",
+                "isCurrent": False,
+                "source": source,
+            },
+        ],
+    )
+
+
+async def test_handle_model_options_droid_without_a_listing_is_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed probe leaves the picker empty without blocking the launch."""
+    from omnigent.inner import droid_models
+
+    monkeypatch.setattr(
+        droid_models,
+        "list_droid_cli_model_options",
+        lambda: droid_models.DroidModelListing(),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_droid_empty", harness="droid"),
+    )
+
+    assert result.status == "ok"
+    assert result.models == []
+    assert result.error is None
+
+
+async def test_handle_model_options_droid_probe_failure_still_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected probe failure stays diagnosable in the host log."""
+    from omnigent.inner import droid_models
+
+    failure = RuntimeError("droid probe unavailable")
+    monkeypatch.setattr(droid_models, "list_droid_cli_model_options", Mock(side_effect=failure))
+    host = _make_host_process()
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="failed_droid", harness="droid"),
+        )
+
+    assert result.status == "failed"
+    assert result.models == []
+    assert result.error == "failed to resolve Droid model options"
+    record = next(r for r in caplog.records if r.message == "Droid model catalog unavailable")
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+    assert record.exc_info[1] is failure
+
+
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str
