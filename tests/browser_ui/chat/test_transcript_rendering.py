@@ -495,12 +495,22 @@ def test_reduced_motion_transcript_holds_still_at_the_bottom(
 
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"
 _PR_ERROR = "Error: 422 Validation Failed: A pull request already exists"
+_ISSUE_DESCRIPTION = (
+    "## Context\n\n"
+    "Follow-up to [#11607](<https://github.com/omnigent-ai/omnigent/pull/11607>).\n\n"
+    "1. Show added and removed line counts.\n2. Show display names for MCP servers."
+)
 
 
 def _seed_tool_calls(chat: ChatSessionContract) -> None:
     """One settled turn: a plan update, an MCP lookup, and a failing MCP call."""
     response_id = "tool-rows-response"
-    issue = {"id": "OMNI-12243", "title": _ISSUE_TITLE, "state": "In Review"}
+    issue = {
+        "id": "OMNI-12243",
+        "title": _ISSUE_TITLE,
+        "state": "In Review",
+        "description": _ISSUE_DESCRIPTION,
+    }
     todo_list = [
         {"id": 1, "title": "Find review workflow", "status": "completed"},
         {"id": 2, "title": "Fetch open PRs", "status": "in-progress"},
@@ -518,7 +528,11 @@ def _seed_tool_calls(chat: ChatSessionContract) -> None:
         *tool_call_items(
             "call-issue",
             "mcp__linear__get_issue",
-            {"id": "OMNI-12243", "includeComments": False},
+            {
+                "id": "OMNI-12243",
+                "includeComments": False,
+                "fields": ["id", "title", "description", "state", "labels"],
+            },
             json.dumps([{"type": "text", "text": json.dumps(issue)}]),
             response_id=response_id,
         ),
@@ -561,6 +575,8 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     issue = page.get_by_role("button", name=re.compile(r"^Get issue"))
     # Known MCP servers carry their brand spelling, not the config name.
     expect(issue.get_by_text("Linear", exact=True)).to_be_visible()
+    # The list of fields to return is not the subject of the call.
+    expect(issue).not_to_contain_text("items")
     expect(issue.get_by_test_id("tool-result-line")).to_have_text(f"{_ISSUE_TITLE} · In Review")
     failure = page.get_by_role("button", name=re.compile(r"^Create pull request"))
     expect(failure.get_by_text("GitHub", exact=True)).to_be_visible()
@@ -580,10 +596,33 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
     issue.click()
-    fields = issue.locator("xpath=..").get_by_test_id("tool-value-view")
+    card = issue.locator("xpath=..")
+    fields = card.get_by_test_id("tool-value-view")
     expect(fields.last).to_contain_text(f"Title{_ISSUE_TITLE}")
+    # Input and Result share one label column, so their values start at the same offset.
+    value_left = (
+        "views => views.map(view => view.querySelector('dd').getBoundingClientRect().left)"
+    )
+    input_left, result_left = fields.evaluate_all(value_left)
+    assert abs(input_left - result_left) < 1
+    # A markdown description reads as prose with working links, not as source.
+    description = card.get_by_test_id("tool-prose-value")
+    expect(description.get_by_role("link", name="#11607")).to_be_visible()
+    expect(description).not_to_contain_text("](")
+    font = description.locator("p").first.evaluate("el => getComputedStyle(el).fontFamily")
+    assert "mono" not in font.lower()
+    # A description's heading stays near body size instead of the chat's 1.4em.
+    sizes = description.evaluate(
+        "el => ['h2', 'p'].map("
+        "tag => parseFloat(getComputedStyle(el.querySelector(tag)).fontSize))"
+    )
+    assert sizes[0] <= sizes[1] * 1.1, sizes
     raw = page.get_by_role("tab", name="Raw")
     expect(page.get_by_role("tab", name="Fields")).to_have_attribute("aria-selected", "true")
     raw.click()
     expect(raw).to_have_attribute("aria-selected", "true")
     expect(transcript).to_contain_text('"includeComments": false')
+    # Raw names its panels like the Fields view's sections.
+    expect(card.get_by_text("Input", exact=True)).to_be_visible()
+    expect(card.get_by_text("Result", exact=True)).to_be_visible()
+    expect(card).not_to_contain_text("Parameters")

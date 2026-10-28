@@ -4766,6 +4766,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "workspace",
     "host_id",
     "execution_target",
+    "project_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4782,6 +4783,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "host_id",
     "execution_target",
     "state",
+    "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -4791,6 +4793,42 @@ def _scheduled_task_url(task_id: object) -> str | None:
     if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
         return None
     return f"/v1/scheduled-tasks/{task_id.lower()}"
+
+
+async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+    """
+    Return the id of the caller's project named *name*, creating it if missing.
+
+    Uses the projects API the web picker uses, so a typed name files sessions
+    and automations into the same project. A create that loses a race to the
+    same name (409) reuses the project the other request made.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param name: The project name, e.g. ``"nightly triage"``.
+    :returns: The project id.
+    :raises ValueError: If the name is blank or the project can't be resolved.
+    """
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("project_name must not be empty")
+
+    async def find() -> str | None:
+        resp = await server_client.get("/v1/projects", timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        projects = resp.json().get("data", [])
+        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
+
+    existing = await find()
+    if existing is not None:
+        return existing
+    created = await server_client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
+    if created.status_code < 400:
+        return str(created.json()["id"])
+    racer = await find() if created.status_code == 409 else None
+    if racer is not None:
+        return racer
+    raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
 
 
 async def _execute_scheduled_task_tool(
@@ -4820,12 +4858,35 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if "project_name" in args and "project_id" in args:
+        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
+    raw_project_name = args.get("project_name")
+    if "project_name" in args and not isinstance(raw_project_name, str):
+        return json.dumps(
+            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
+        )
+    project_name = raw_project_name if isinstance(raw_project_name, str) else None
+    wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
+        "project_name" in args or "project_id" in args
+    )
 
     try:
+        if wants_project:
+            # Older servers reject the field; refuse before creating a project for it.
+            info = await server_client.get("/v1/info", timeout=30.0)
+            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+                return json.dumps(
+                    {
+                        "error": f"{tool_name}: this server does not support automation "
+                        "projects; retry without project_name or project_id"
+                    }
+                )
         if tool_name == "sys_scheduled_task_list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            if project_name is not None:
+                payload["project_id"] = await _project_id_for_name(server_client, project_name)
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
@@ -4840,7 +4901,18 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                resp = None
+                if project_name is not None:
+                    # Confirm the task first so a bad id doesn't leave a new project behind.
+                    existing = await server_client.get(task_url, timeout=30.0)
+                    if existing.status_code >= 400:
+                        resp = existing
+                    else:
+                        payload["project_id"] = await _project_id_for_name(
+                            server_client, project_name
+                        )
+                if resp is None:
+                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001

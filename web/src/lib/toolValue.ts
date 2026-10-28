@@ -263,3 +263,69 @@ export function isoTimestampMs(text: string): number | null {
   const ms = Date.parse(text);
   return Number.isFinite(ms) ? ms : null;
 }
+
+// The only field names whose text renders as markdown (an issue description, a PR body).
+const PROSE_KEY_WORDS = new Set(["body", "comment", "description", "note", "summary"]);
+// Field names whose text is source, a command, output or data, which must keep its exact layout.
+const CODE_KEY_WORDS = new Set([
+  "cmd",
+  "code",
+  "command",
+  "content",
+  "contents",
+  "diff",
+  "html",
+  "json",
+  "log",
+  "logs",
+  "output",
+  "patch",
+  "pattern",
+  "query",
+  "regex",
+  "script",
+  "source",
+  "sql",
+  "stack",
+  "stderr",
+  "stdout",
+  "str",
+  "string",
+  "traceback",
+  "xml",
+  "yaml",
+]);
+
+// JSON, XML or an HTML document, but not prose opening with `[link](url)` or `[1] See`.
+function looksLikeData(text: string): boolean {
+  const start = text.trimStart();
+  if (/^(?:\{|<\?xml\b|<!DOCTYPE\b)/i.test(start)) return true;
+  if (!start.startsWith("[")) return false;
+  // `[{`, `["`, `[[` and `[]` open an array even when the text is cut off.
+  if (/^\[\s*[[{"\]]/.test(start)) return true;
+  try {
+    JSON.parse(start);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a long string under `key` is prose to render as markdown rather than literal text. */
+export function isProseText(text: string, key?: string): boolean {
+  const keyWords = key === undefined ? [] : identifierWords(key);
+  if (!keyWords.some((word) => hasKeyWord(PROSE_KEY_WORDS, word))) return false;
+  if (keyWords.some((word) => hasKeyWord(CODE_KEY_WORDS, word))) return false;
+  return !looksLikeData(text);
+}
+
+// A key word or its plural (`commands`, `patches`, `queries`) in `words`.
+function hasKeyWord(words: ReadonlySet<string>, word: string): boolean {
+  const singulars = [
+    word,
+    word.replace(/s$/, ""),
+    word.replace(/es$/, ""),
+    word.replace(/ies$/, "y"),
+  ];
+  return singulars.some((singular) => words.has(singular));
+}

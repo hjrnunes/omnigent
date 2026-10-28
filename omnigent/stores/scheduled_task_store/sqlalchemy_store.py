@@ -7,9 +7,10 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -213,6 +214,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
@@ -238,6 +240,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 base_branch=None,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
+                project_id=project_id,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -346,6 +349,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
@@ -355,7 +359,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``workspace``, ``host_id``, ``max_cost_usd``, and
+        ``workspace``, ``host_id``, ``project_id``, ``max_cost_usd``, and
         ``last_run_conversation_id``, the sentinel default means "not provided /
         leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
@@ -411,6 +415,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
+                changed = True
             if execution_target is not None:
                 encoded_target = encode_scheduled_task_execution_target(execution_target)
                 if row.execution_target != encoded_target:
@@ -437,6 +444,26 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_task", write)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """Clear the task's project only while it is still *project_id*."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlScheduledTask)
+                    .where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.project_id == project_id,
+                    )
+                    .values(project_id=None, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "clear_task_project", write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""

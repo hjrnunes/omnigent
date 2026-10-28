@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   humanizeKey,
+  isProseText,
   isoTimestampMs,
   parseToolOutput,
   pickTitleField,
@@ -146,5 +147,34 @@ describe("isoTimestampMs", () => {
     expect(isoTimestampMs("2026-02-30T10:00:00Z")).toBeNull();
     expect(isoTimestampMs("2026-13-01T10:00:00Z")).toBeNull();
     expect(isoTimestampMs("tomorrow at 9")).toBeNull();
+  });
+});
+
+describe("isProseText", () => {
+  it("renders text under a prose field name as markdown", () => {
+    for (const key of ["description", "pr_body", "comments", "releaseNote", "summary"]) {
+      expect(isProseText("## Summary\n\n- Fix it", key)).toBe(true);
+    }
+    expect(isProseText("[1] See the RFC.\n\nMore notes", "summary")).toBe(true);
+  });
+
+  it("keeps text under any other field name literal", () => {
+    // WHY: markdown-looking text is often code or output; only a prose field name marks prose.
+    const markdown = "## Setup\n\n- Run **the app**\n";
+    expect(isProseText(markdown)).toBe(false);
+    for (const key of ["text", "prompt", "message", "content", "oldText", "output", "body_html"]) {
+      expect(isProseText(markdown, key)).toBe(false);
+    }
+  });
+
+  it("keeps data under a prose field name literal", () => {
+    for (const data of [
+      '{\n  "error": "bad"\n}',
+      "[\n  true,\n  false\n]",
+      '<?xml version="1.0"?>\n<a/>',
+      "<!DOCTYPE html>\n<p>Hi</p>",
+    ]) {
+      expect(isProseText(data, "body")).toBe(false);
+    }
   });
 });

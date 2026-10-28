@@ -197,6 +197,17 @@ describe("resolveServerInfo session_search_scope", () => {
   });
 });
 
+describe("resolveServerInfo scheduled_task_projects", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["yes", false],
+  ])("reads %j as %j", async (advertised, expected) => {
+    const payload = advertised === undefined ? {} : { scheduled_task_projects: advertised };
+    expect((await probe(payload)).scheduled_task_projects).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);

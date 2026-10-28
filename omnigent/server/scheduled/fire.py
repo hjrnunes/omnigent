@@ -80,6 +80,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
@@ -200,6 +201,11 @@ class FireDeps:
     # ``app.state``, read per fire for the default-public-sessions policy.
     # ``None`` (tests, embedders) leaves every fired session private.
     app_state: Any | None = None
+    # Confirms a task's project still exists before filing the session into it.
+    project_store: Any | None = None
+    # Who owns a single-user task's projects and open tabs: "local" behind an
+    # auth provider, ``None`` on a server without one.
+    single_user_owner: str | None = RESERVED_USER_LOCAL
 
 
 @dataclass
@@ -595,6 +601,9 @@ async def _run_fire_for_task(
             error_code="owner_grant_failed",
         )
         return
+    _announce_session_added(
+        effective.user_id if effective.user_id is not None else deps.single_user_owner, conv.id
+    )
 
     # Default-public access is optional decoration on top of the owner
     # grant, so a failure here must not cancel an otherwise-ready run — the
@@ -946,6 +955,33 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     )
 
 
+async def _fire_project_id(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Return the project to file a fired session into, or ``None``.
+
+    A deleted project leaves the session unfiled and is cleared from the task.
+    """
+    if task.project_id is None or deps.project_store is None:
+        # Without a store the id can't be verified, so file nothing.
+        return None
+    owner = task.user_id if task.user_id is not None else deps.single_user_owner
+    project = await asyncio.to_thread(deps.project_store.get, task.project_id, user_id=owner)
+    if project is None:
+        _logger.warning(
+            "scheduled fire: task %s project %s no longer exists; leaving the session unfiled",
+            task.id,
+            task.project_id,
+        )
+        # Clear only if the task still names this project; never fail the run.
+        try:
+            await asyncio.to_thread(
+                deps.scheduled_task_store.clear_project_id, task.id, task.project_id
+            )
+        except Exception:
+            _logger.exception("scheduled fire: task %s could not clear its project", task.id)
+        return None
+    return project.id
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     conv: Conversation = await asyncio.to_thread(
@@ -956,6 +992,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
         labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+        project_id=await _fire_project_id(deps, task),
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:
