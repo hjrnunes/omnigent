@@ -105,6 +105,99 @@ def test_mint_pi_session_id_is_safe() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_compaction_replaces_history_and_preserves_native_tail(with_tail: bool) -> None:
+    tail_items = [
+        _user_item("retained user"),
+        *[
+            _function_call_item(
+                name="read", call_id=call_id, arguments='{"path":"test.txt"}', item_id=call_id
+            )
+            for call_id in ("call_a", "call_b")
+        ],
+        *[
+            _function_output_item(
+                call_id=call_id, output=f"contents {call_id}", item_id=f"out_{call_id}"
+            )
+            for call_id in ("call_a", "call_b")
+        ],
+        _assistant_item("retained answer"),
+    ]
+    tail_records = pi_session_records_from_session_items(
+        tail_items,
+        session_id="source",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )[1:]
+    messages = [entry["message"] for entry in tail_records] if with_tail else []
+    summary_message = {
+        "role": "compactionSummary",
+        "summary": "latest checkpoint",
+        "tokensBefore": 9000,
+        "timestamp": 0,
+    }
+    system_message = {"role": "system", "content": "native system", "timestamp": 0}
+    items = [
+        _user_item("summarized raw history"),
+        {"id": "old", "type": "compaction", "summary": "old checkpoint"},
+        _assistant_item("also summarized"),
+        {
+            "id": "latest",
+            "type": "compaction",
+            "summary": "latest checkpoint",
+            "compacted_messages": [system_message, summary_message, *messages],
+        },
+        # A late duplicate must not replay a retained result twice.
+        *(
+            [_function_output_item(call_id="call_b", output="contents call_b")]
+            if with_tail
+            else []
+        ),
+        _user_item("after checkpoint", item_id="later", response_id="later"),
+        _assistant_item("after answer", item_id="later-answer", response_id="later"),
+    ]
+    original = json.dumps(items)
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_fork",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    checkpoint = next(entry for entry in records if entry["type"] == "compaction")
+    assert checkpoint["summary"] == "latest checkpoint"
+    assert checkpoint["tokensBefore"] == 9000
+    assert checkpoint["systemMessage"] == system_message
+    boundary = records.index(checkpoint)
+    assert [entry["message"] for entry in records[1:boundary]] == messages
+    assert checkpoint["firstKeptEntryId"] == (records[1]["id"] if with_tail else checkpoint["id"])
+    assert [entry["message"]["content"][0]["text"] for entry in records[boundary + 1 :]] == [
+        "after checkpoint",
+        "after answer",
+    ]
+    assert "summarized" not in json.dumps(records)
+    assert "old checkpoint" not in json.dumps(records)
+    assert json.dumps(items) == original
+    for previous, current in itertools.pairwise(records[1:]):
+        assert current["parentId"] == previous["id"]
+    assert records[1]["parentId"] is None
+
+
+def test_legacy_summary_only_compaction_does_not_restore_old_transcript() -> None:
+    records = pi_session_records_from_session_items(
+        [
+            _user_item("old raw transcript"),
+            {"id": "compact", "type": "compaction", "summary": "legacy summary"},
+        ],
+        session_id="conv_legacy",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    assert len(records) == 2
+    assert records[1]["type"] == "compaction"
+    assert records[1]["summary"] == "legacy summary"
+    assert records[1]["firstKeptEntryId"] == records[1]["id"]
+
+
 def test_records_header_first_and_well_formed() -> None:
     records = pi_session_records_from_session_items(
         [_user_item("hello"), _assistant_item("hi there")],

@@ -1187,13 +1187,20 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user"])
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
 def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
 (async () => {
   const kind = process.argv[3];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "boundary", summary: "checkpoint" } }],
+      messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 100 }],
+    }),
+  };
   const events = {
     tool_call: ["message_update", { assistantMessageEvent: {
       type: "toolcall_end", toolCall: { id: "call-1", name: "read", arguments: { path: "a" } },
@@ -1205,6 +1212,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
       type: "thinking_end", contentIndex: 0, content: "plan",
     } }],
     user: ["input", { text: "terminal prompt", source: "extension" }],
+    compaction: ["session_compact", {}],
   };
   if (kind === "tool_result") {
     await handlers.message_update(events.tool_call[1], ctx);
@@ -1234,7 +1242,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
-  if (kind !== "user") {
+  if (kind !== "user" && kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
     await invoke();
@@ -1249,6 +1257,76 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("receipt", ["valid", "unreadable", "absent", "timeout"])
+def test_compaction_snapshot_orders_history_and_tolerates_receipts(
+    tmp_path: Path, receipt: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const receiptMode = process.argv[3];
+  const messages = [
+    { role: "compactionSummary", summary: "checkpoint", tokensBefore: 9000 },
+    { role: "assistant", content: [
+      { type: "toolCall", id: "read-1", name: "read", arguments: {path: "a"} },
+    ] },
+    { role: "toolResult", toolCallId: "read-1", toolName: "read",
+      content: [{type: "text", text: "retained result"}] },
+  ];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+      messages,
+    }),
+  };
+  let release;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data.item_type === "message") {
+      await new Promise(resolve => { release = resolve; });
+    }
+    const response = { ok: true, status: 200 };
+    if (receiptMode !== "absent") response.json = async () => {
+      if (receiptMode === "unreadable") throw new Error("receipt truncated after commit");
+      if (receiptMode === "timeout") await new Promise((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => reject(new Error("receipt timed out")));
+      });
+      return { item_id: "persisted-user" };
+    };
+    return response;
+  };
+  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  const expectedSnapshot = structuredClone(messages);
+  // Repeated summary text can make Pi's event point at an older checkpoint.
+  const compacting = handlers.session_compact(
+    {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
+  );
+  messages[2].content[0].text = "later mutation";
+  assert.equal(posted.length, 1, "checkpoint cannot overtake pending history");
+  release();
+  await compacting;
+  assert.equal(posted.length, 2);
+  const compact = posted[1].data;
+  assert.equal(compact.item_type, "compaction");
+  assert.equal(compact.source_id, "pi:compaction:native-1:latest");
+  assert.equal(compact.item_data.window_id, "latest");
+  assert.equal(compact.item_data.summary, "checkpoint");
+  assert.equal(compact.item_data.last_item_id,
+    receiptMode === "valid" ? "persisted-user" : "compact_boundary_session-1");
+  assert.deepEqual(compact.item_data.compacted_messages, expectedSnapshot);
+  assert.deepEqual(retryDelays, []);
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(notices, []);
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

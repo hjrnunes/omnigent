@@ -624,20 +624,24 @@ Cross-harness journeys:
   billing or recovery after the runner deletes the bridge directory.
 - **`resume`, Pi compaction → restart → continuation → fork (own environment):**
   `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_compacted_restart_then_fork`
-  runs two real file reads and manual compaction through the API, then replaces
-  the native Pi process. Separate cases keep the runner, abruptly replace the
-  runner while its idle native pane is still alive, or remove native history
-  before relaunch.
-  Preserved files retain their compaction checkpoint; missing files reconstruct
-  the original tool history from server items. Continuation and a subsequent
-  independent fork receive both results without duplicating tools or replies.
-  Artifacts include provider requests, server transcripts, native JSONL and real
-  tmux text captures. The local provider scripts replies and compaction summaries;
-  a small retention setting forces compaction on a short history. Missing-file
-  rebuilds and forks replay the full server transcript instead of the native
-  checkpoint; long histories near context capacity remain unvalidated. This does
-  not cover live gateways, browser controls, sandboxing or loss during an
-  active turn.
+  runs parallel file reads and two actual Pi compactions through the API, then
+  replaces the native Pi process. Separate cases keep the runner, abruptly
+  replace the runner while its idle native pane is still alive, or remove native
+  history before relaunch. Preserved files retain their checkpoint. Missing-file
+  reconstruction and forks restore the shared compaction snapshot: Pi's summary,
+  retained native tool-call/result pairs and subsequent turns. The parent
+  transcript stays unchanged; resume keeps its native identity and forks mint one.
+  A scripted provider enforces the same 16,384 serialized-message-byte limit from
+  the first request. Continuation, reconstruction and fork must fit it without
+  resurrecting summarized reads or duplicating retained tools/replies.
+  Artifacts include full provider payloads, server transcripts, native JSONL and
+  genuine tmux text captures. This tests a bounded synthetic capacity limit,
+  not vendor token limits or model recall. The retention setting is deliberately
+  small; large production histories remain unvalidated. Older sessions compacted
+  before checkpoint persistence have no server snapshot until another compaction;
+  losing their native files still requires full-transcript reconstruction.
+  There is no startup backfill. Live gateways, browser controls, sandboxing,
+  automatic-compaction triggering and active-turn loss are not covered here.
 - **`resume`, Pi user setup (own environment):**
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
   and process resume through the server/host/runner. User skills/extensions and

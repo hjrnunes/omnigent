@@ -32,6 +32,7 @@ it for free from Pi's event semantics.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import re
@@ -243,6 +244,9 @@ def pi_session_records_from_session_items(
       rejects a replayed result whose name is empty. Only the first output
       committed for a ``call_id`` is replayed: Anthropic rejects a history with
       two ``tool_result`` blocks for one ``tool_use``.
+    - latest ``compaction`` -> Pi checkpoint with the actual summary and
+      projected native messages retained by Pi. It replaces earlier history;
+      subsequent items still use the normal tool-pairing conversion.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -280,9 +284,27 @@ def pi_session_records_from_session_items(
         "cwd": str(cwd),
     }
     entries: list[_JsonObject] = []
+    checkpoint: _JsonObject | None = None
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if item.get("type") != "compaction" or not isinstance(item.get("summary"), str):
+            continue
+        checkpoint, entries = _pi_compaction_records(
+            item,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            timestamp=timestamp,
+        )
+        items = items[index + 1 :]
+        break
+    kept_ids = {entry["id"] for entry in entries}
     skip_response_ids = _interrupted_response_ids(items)
     tool_names = _function_call_names(items)
-    replayed_call_ids: set[str] = set()
+    replayed_call_ids: set[str] = {
+        cast(str, message["toolCallId"])
+        for entry in entries
+        if (message := cast(_JsonObject, entry["message"])).get("role") == "toolResult"
+    }
     group: _AssistantResponseGroup | None = None
 
     def flush_group() -> None:
@@ -351,12 +373,82 @@ def pi_session_records_from_session_items(
                 model=eff_model,
             )
     flush_group()
-    records: list[_JsonObject] = [header, *_pair_pi_tool_results(entries)]
+    entries = _pair_pi_tool_results(entries)
+    if checkpoint is not None:
+        # Pi places the checkpoint after its retained entries on disk, but
+        # projects its summary before them. Later turns follow the checkpoint.
+        boundary = max(
+            (i + 1 for i, entry in enumerate(entries) if entry["id"] in kept_ids), default=0
+        )
+        checkpoint["firstKeptEntryId"] = entries[0]["id"] if boundary else checkpoint["id"]
+        entries.insert(boundary, checkpoint)
+    records: list[_JsonObject] = [header, *entries]
     parent_id: str | None = None
     for entry in records[1:]:
         entry["parentId"] = parent_id
         parent_id = cast(str, entry["id"])
     return records
+
+
+def _pi_compaction_records(
+    item: _JsonObject,
+    *,
+    session_id: str,
+    external_session_id: str,
+    timestamp: str,
+) -> tuple[_JsonObject, list[_JsonObject]]:
+    """Restore Pi's projected messages from the shared compaction snapshot.
+
+    :param item: A shared compaction item containing Pi's canonical projection.
+    :param session_id: Omnigent conversation identity for generated entry ids.
+    :param external_session_id: Destination native identity, distinct for forks.
+    :param timestamp: Timestamp for the rebuilt entries.
+    :returns: Native checkpoint and retained messages; legacy summaries have no tail.
+    """
+
+    def entry_id(index: int) -> str:
+        return _synthetic_pi_entry_id(
+            session_id=session_id,
+            external_session_id=external_session_id,
+            item=item,
+            index=0,
+            suffix=f"compaction-{index}",
+        )
+
+    checkpoint: _JsonObject = {
+        "type": "compaction",
+        "id": entry_id(-1),
+        "timestamp": timestamp,
+        "summary": item["summary"],
+        "tokensBefore": 0,
+    }
+    entries: list[_JsonObject] = []
+    messages = item.get("compacted_messages")
+    for index, message in enumerate(messages if isinstance(messages, list) else []):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "compactionSummary":
+            checkpoint["tokensBefore"] = message.get("tokensBefore", 0)
+        elif role == "system":
+            checkpoint["systemMessage"] = copy.deepcopy(message)
+        elif role in {
+            "user",
+            "assistant",
+            "toolResult",
+            "custom",
+            "bashExecution",
+            "branchSummary",
+        }:
+            entries.append(
+                {
+                    "type": "message",
+                    "id": entry_id(index),
+                    "timestamp": timestamp,
+                    "message": copy.deepcopy(message),
+                }
+            )
+    return checkpoint, entries
 
 
 def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:

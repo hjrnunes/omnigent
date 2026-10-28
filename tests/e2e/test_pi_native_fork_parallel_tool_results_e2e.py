@@ -44,6 +44,8 @@ _MODEL = "pi-mock-sonnet"
 _CALL_IDS = ["toolu_par_a", "toolu_par_b"]
 _MIXED_TEXT = "Reading both seeded files."
 _RESPONSES_MODEL = "gpt-mock-resume"
+_CONTEXT_BYTE_LIMIT = 16_384
+_RETAINED_CALL_IDS = ["toolu_tail_a", "toolu_tail_b"]
 _RECOVERED_OUTPUT = "Contents recovered from the missing call."
 PiForkRig = tuple[httpx.Client, ServerRunner, list[dict[str, Any]], list[str]]
 
@@ -96,7 +98,8 @@ def pi_fork_rig(
     ]
     requests: list[dict[str, Any]] = []
     auth_failures: list[str] = []
-    command_auth = getattr(request, "param", False)
+    command_auth = getattr(request, "param", False) is True
+    bounded_context = getattr(request, "param", None) == "capacity"
     token_file = workspace / "token"
     mode_file = workspace / "auth-mode"
     token_file.write_text("mock-key")
@@ -138,6 +141,26 @@ def pi_fork_rig(
                 self.send_error(401, "Unexpected test credential")
                 return
             requests.append(body)
+            message_bytes = len(json.dumps(body.get("messages", [])).encode())
+            if bounded_context and message_bytes > _CONTEXT_BYTE_LIMIT:
+                payload = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": (
+                                f"Context capacity exceeded: {message_bytes} > "
+                                f"{_CONTEXT_BYTE_LIMIT}"
+                            ),
+                        },
+                    }
+                ).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if command_auth and len(requests) == 1:
                 token_file.write_text("rotated-during-tools")
             if path == "/v1/responses":
@@ -391,17 +414,37 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
                 client.delete(f"/v1/sessions/{session_id}")
 
 
+@pytest.mark.parametrize("pi_fork_rig", ["capacity"], indirect=True)
 @pytest.mark.parametrize("restart_scope", ["process", "runner", "missing-files"])
 def test_pi_native_compacted_restart_then_fork(
     pi_fork_rig: PiForkRig, tmp_path: Path, restart_scope: str
 ) -> None:
     """Real Pi compacts tool history, restarts, continues, then forks independently."""
     client, stack, requests, replies = pi_fork_rig
+    for name in ("alpha", "beta"):
+        (stack.workspace / f"{name}.txt").write_text(
+            f"{name}-contents\n"
+            + "\n".join(
+                f"build step {number:04}: artifact {name}-{number:04} verified; checksum preserved"
+                for number in range(60)
+            )
+        )
     summary = "RECOVERY-CHECKPOINT: read alpha-contents and beta-contents; do not repeat tools."
     replies[2:] = [
         anthropic_sse_text_response(text, model=_MODEL)
-        for text in ("READY-TO-COMPACT", summary, "RESTART-CONTINUED", "FORK-CONTINUED")
+        for text in (
+            "READY-TO-COMPACT",
+            summary,
+            "SECOND-TOOLS-DONE",
+            "TAIL-TOOLS-DONE",
+            summary,
+            "COMPACT-CONTINUED",
+            "RESTART-CONTINUED",
+            "FORK-CONTINUED",
+        )
     ]
+    replies.insert(4, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_next_"))
+    replies.insert(6, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_tail_"))
     settings = stack.runner_home / ".pi/agent/settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"compaction": {"keepRecentTokens": 100}}))
@@ -466,8 +509,51 @@ def test_pi_native_compacted_restart_then_fork(
         ).raise_for_status()
         session_file = next((bridge / "sessions").glob("*.jsonl"))
         _wait(lambda: '"type":"compaction"' in session_file.read_text())
+        turn(session_id, "Read both files again for a second review.", "SECOND-TOOLS-DONE")
+        for name in ("alpha", "beta"):
+            (stack.workspace / f"{name}.txt").write_text(f"{name}-contents retained tail\n")
+        turn(session_id, "Read the updated files for the retained handoff.", "TAIL-TOOLS-DONE")
+        client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "compact", "data": {}}
+        ).raise_for_status()
+        _wait(lambda: session_file.read_text().count('"type":"compaction"') == 2)
+        turn(session_id, "Continue from the compacted checkpoint.", "COMPACT-CONTINUED")
         compacted = session_file.read_bytes()
         assert summary in compacted.decode()
+        native_entries = [json.loads(line) for line in compacted.decode().splitlines()]
+        native_checkpoints = [entry for entry in native_entries if entry["type"] == "compaction"]
+        checkpoints = [item for item in items(session_id) if item["type"] == "compaction"]
+        assert len(checkpoints) == 2
+        assert [item["window_id"] for item in checkpoints] == [
+            entry["id"] for entry in native_checkpoints
+        ]
+        assert [item["summary"] for item in checkpoints] == [
+            entry["summary"] for entry in native_checkpoints
+        ]
+        latest = native_checkpoints[-1]
+        first_kept = next(
+            i
+            for i, entry in enumerate(native_entries)
+            if entry.get("id") == latest["firstKeptEntryId"]
+        )
+        expected_tail = [
+            entry["message"]
+            for entry in native_entries[first_kept : native_entries.index(latest)]
+            if entry["type"] == "message"
+        ]
+        assert [
+            message
+            for message in checkpoints[-1]["compacted_messages"]
+            if message["role"] in {"user", "assistant", "toolResult"}
+        ] == expected_tail
+        assert (
+            sorted(
+                message["toolCallId"]
+                for message in expected_tail
+                if message["role"] == "toolResult"
+            )
+            == _RETAINED_CALL_IDS
+        )
         (tmp_path / "before-restart.jsonl").write_bytes(compacted)
         assert all(f"{name}-contents" in json.dumps(requests[3]) for name in ("alpha", "beta"))
         _wait(lambda: client.get(f"/v1/sessions/{session_id}").json()["status"] == "idle")
@@ -515,9 +601,10 @@ def test_pi_native_compacted_restart_then_fork(
         turn(session_id, "Continue using the two file results.", "RESTART-CONTINUED")
         resumed = json.dumps(requests[-1]["messages"])
         assert all(f"{name}-contents" in resumed for name in ("alpha", "beta"))
+        assert summary in resumed
+        assert "Read both files." not in resumed
+        assert "build step 0059" not in resumed
         if restart_scope != "missing-files":
-            assert summary in resumed
-            assert "Read both files." not in resumed
             assert session_file.read_bytes().startswith(compacted)
         assert (
             client.get(f"/v1/sessions/{session_id}").json()["external_session_id"]
@@ -534,6 +621,38 @@ def test_pi_native_compacted_restart_then_fork(
         assert all(
             text in history for text in ("alpha-contents", "beta-contents", "RESTART-CONTINUED")
         )
+        assert summary in history
+        assert "build step 0059" not in history
+        for request in requests[-3:]:
+            messages = request["messages"]
+            tool_blocks = [
+                block
+                for message in messages
+                for block in message["content"]
+                if isinstance(block, dict)
+            ]
+            assert (
+                sorted(block["id"] for block in tool_blocks if block["type"] == "tool_use")
+                == _RETAINED_CALL_IDS
+            )
+            assert (
+                sorted(
+                    block["tool_use_id"] for block in tool_blocks if block["type"] == "tool_result"
+                )
+                == _RETAINED_CALL_IDS
+            )
+            for index, message in enumerate(messages):
+                results = [
+                    block["tool_use_id"]
+                    for block in message["content"]
+                    if isinstance(block, dict) and block["type"] == "tool_result"
+                ]
+                if results:
+                    assert sorted(results) == sorted(
+                        block["id"]
+                        for block in messages[index - 1]["content"]
+                        if block["type"] == "tool_use"
+                    )
         assert items(session_id) == parent_items
         assert (
             client.get(f"/v1/sessions/{fork_id}").json()["external_session_id"]
@@ -542,12 +661,14 @@ def test_pi_native_compacted_restart_then_fork(
         for target in session_ids:
             transcript = items(target)
             for kind in ("function_call", "function_call_output"):
-                assert (
-                    sorted(item["call_id"] for item in transcript if item["type"] == kind)
-                    == _CALL_IDS
-                )
+                assert sorted(
+                    item["call_id"] for item in transcript if item["type"] == kind
+                ) == sorted([*_CALL_IDS, "toolu_next_a", "toolu_next_b", *_RETAINED_CALL_IDS])
             (tmp_path / f"{target}-items.json").write_text(json.dumps(transcript, indent=2))
-        assert len(requests) == 6
+        assert len(requests) == 12
+        sizes = [len(json.dumps(request["messages"]).encode()) for request in requests]
+        assert max(sizes) <= _CONTEXT_BYTE_LIMIT
+        print(f"Constant context limit {_CONTEXT_BYTE_LIMIT} bytes; request sizes: {sizes}")
         (tmp_path / "after-restart-terminal.txt").write_text(pane("capture-pane", "-p", "-S", "-"))
         print(
             f"{restart_scope}: Pi pane {old_pid} -> {new_pid}; "

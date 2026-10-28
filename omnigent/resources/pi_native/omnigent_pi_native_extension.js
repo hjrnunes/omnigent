@@ -915,7 +915,7 @@ function assistantItemPostTimeoutMs(config) {
 }
 
 // History and completion delivery share bounded retries.
-async function postEventWithRetry(config, body, signal) {
+async function postEventWithRetry(config, body, signal, readReceipt = false) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
@@ -929,11 +929,18 @@ async function postEventWithRetry(config, body, signal) {
       Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
-      return await postEventChecked(
+      const response = await postEventChecked(
         config,
         body,
         signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       );
+      if (!readReceipt) return response;
+      try {
+        // Receipt reads share the POST timeout; an accepted write is never retried.
+        return await response?.json?.();
+      } catch (_err) {
+        return;
+      }
     } catch (err) {
       lastError = err;
     } finally {
@@ -963,13 +970,18 @@ function createHistoryQueue(config) {
   let queuedBytes = 0;
   let worker = null;
   let closed = false;
+  let lastItemId = null;
 
   async function deliver(item) {
     if (item.accepted) return;
-    await postEventWithRetry(config, {
+    if (item.data.item_type === "compaction") {
+      item.data.item_data.last_item_id ||= lastItemId || `compact_boundary_${config.sessionId}`;
+    }
+    const receipt = await postEventWithRetry(config, {
       type: "external_conversation_item",
       data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
-    }, controller.signal);
+    }, controller.signal, true);
+    lastItemId = typeof receipt?.item_id === "string" ? receipt.item_id : null;
     item.accepted = true;
     item.onAccepted?.();
   }
@@ -1580,6 +1592,29 @@ module.exports = function (pi) {
   const config = readConfig();
   const history = createHistoryQueue(config);
   pi.on("session_shutdown", () => history.close());
+  pi.on("session_compact", async (_event, ctx) => {
+    const projection = ctx.sessionManager.buildSessionProjection();
+    // Pi 1.3's event can name an older entry when summaries repeat.
+    const checkpoint = projection.entries[0]?.sourceEntry;
+    if (checkpoint?.type !== "compaction") return;
+    const sourceId = `pi:compaction:${ctx.sessionManager.getSessionId()}:${checkpoint.id}`;
+    const item = history.enqueue(
+      {
+        item_type: "compaction",
+        item_data: {
+          summary: checkpoint.summary,
+          last_item_id: "",
+          model: ctx.model?.id || null,
+          token_count: Math.ceil(checkpoint.summary.length / 4),
+          window_id: checkpoint.id,
+          compacted_messages: structuredClone(projection.messages),
+        },
+      },
+      sourceId,
+      { onFailure: () => ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error") },
+    );
+    if (item) await item.settled;
+  });
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
