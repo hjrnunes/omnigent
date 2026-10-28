@@ -2329,6 +2329,11 @@ def create_runner_app(
             content={"error": error},
         )
 
+    @app.get("/v1/side_chat_capabilities")
+    async def side_chat_capabilities() -> dict[str, bool]:
+        """Advertise correlated starts and per-child settings from this runner build."""
+        return {"settings": True}
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -6492,7 +6497,13 @@ def create_runner_app(
                     )
                 else:
                     await side_chat.submit_side_turn(
-                        _side_client, str(_side_thread_id), _side_text
+                        _side_client,
+                        str(_side_thread_id),
+                        _side_text,
+                        model=body.get("model_override"),
+                        effort=body.get("reasoning_effort"),
+                        reset_effort="reasoning_effort" in body
+                        and body["reasoning_effort"] is None,
                     )
             except CodexAppServerResponseError as exc:
                 # Codex refused the turn (e.g. typing into a multi-agent-v2
@@ -6513,6 +6524,17 @@ def create_runner_app(
                         if _missing
                         else "codex_side_chat_rejected",
                         "detail": _rpc_message,
+                    },
+                )
+            except ValueError:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "codex_side_chat_settings_unavailable",
+                        "detail": (
+                            "Could not resolve the side chat's default effort. "
+                            "Select an explicit effort and retry."
+                        ),
                     },
                 )
             except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
@@ -6551,6 +6573,8 @@ def create_runner_app(
                 _side_chat.request_side_chat(
                     await _codex_native_bridge_dir_for_session(conversation_id),
                     _side_question,
+                    settings=body.get("side_chat_settings"),
+                    draft_id=body.get("side_chat_draft_id"),
                 )
                 _logger.info(
                     "Codex /side recorded without starting a turn: conv=%s",

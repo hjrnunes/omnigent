@@ -41,6 +41,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -158,6 +159,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
     _resolve_harness,
+    _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
@@ -1572,6 +1574,27 @@ def register_core_routes(
         )
         _set_read_state(user_id, session_id, body.last_seen, body.unread)
         return Response(status_code=204)
+
+    @router.get("/sessions/{session_id}/side_chat_capabilities")
+    async def side_chat_capabilities(request: Request, session_id: str) -> dict[str, bool]:
+        """Report settings support only when both server and current runner implement it."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        if is_side_chat_child(conv.labels) and conv.parent_conversation_id:
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+            if parent is not None:
+                conv = parent
+        client = await _get_runner_client(conv.id, runner_router, conversation=conv)
+        return {"settings": await _runner_supports_side_chat_settings(client)}
 
     # ── GET /sessions/{session_id} ───────────────────────────────
 
@@ -3183,7 +3206,13 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        live_model_change = not body.silent and (model_override is not None or clear_model)
+        # Ephemeral side threads have no terminal; apply their saved picks on the next turn.
+        defer_side_settings = conv is not None and is_side_chat_child(conv.labels)
+        live_model_change = (
+            not body.silent
+            and not defer_side_settings
+            and (model_override is not None or clear_model)
+        )
         wake_for_model_change = (
             live_model_change
             and conv is not None
@@ -3219,6 +3248,14 @@ def register_core_routes(
         if update_result is None:
             raise _session_not_found()
         updated = update_result.conversation
+        if defer_side_settings and (clear_effort or effort is not None):
+            from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"},
+            )
         effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
@@ -3260,7 +3297,7 @@ def register_core_routes(
             _cancel_pending_archive_stop(session_id)
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
-        live_forward = not body.silent
+        live_forward = not body.silent and not defer_side_settings
         codex_native = (
             updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
             == _CODEX_NATIVE_WRAPPER_LABEL_VALUE

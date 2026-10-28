@@ -9882,7 +9882,18 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       await useChatStore.getState().switchTo("conv_codex_side");
       useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
 
-      await useChatStore.getState().send("/side what was my last message?", "agent_xyz");
+      await useChatStore
+        .getState()
+        .send("/side what was my last message?", "agent_xyz", undefined, {
+          sideChatSettings: { modelOverride: "gpt-6-sol", reasoningEffort: "max" },
+        });
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url).endsWith("/conv_codex_side/events") && init?.method === "POST",
+      );
+      expect(JSON.parse(call![1]!.body as string).data.side_chat_settings).toEqual({
+        model: "gpt-6-sol",
+        effort: "max",
+      });
 
       const after = useChatStore.getState();
       expect(after.pendingUserMessages).toHaveLength(0);
@@ -9929,6 +9940,96 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const after = useChatStore.getState();
       expect(after.pendingUserMessages).toHaveLength(1);
       expect(after.awaitingSideChatFor).toBeNull();
+    });
+  });
+
+  describe("side chat first-turn acceptance", () => {
+    it("settles a reconnect snapshot and ignores results from an earlier attempt", () => {
+      useChatStore.setState({
+        sideChatToOpen: null,
+        sideChatComposers: {
+          "pending:tab": {
+            text: "question",
+            files: [],
+            settings: { reasoningEffort: "high" },
+            starting: true,
+            startRequestId: "pending:retry",
+          },
+        },
+      });
+      handleSessionEvent({
+        type: "side_chat_result",
+        conversationId: "parent",
+        draftId: "pending:old",
+        childSessionId: null,
+      });
+      expect(useChatStore.getState().sideChatComposers["pending:tab"].starting).toBe(true);
+      // The live result was missed; reconnect replays this same persisted event.
+      handleSessionEvent({
+        type: "side_chat_result",
+        conversationId: "parent",
+        draftId: "pending:retry",
+        childSessionId: "child",
+      });
+      expect(useChatStore.getState().sideChatToOpen).toEqual({
+        childId: "child",
+        parentId: "parent",
+        pendingId: "pending:tab",
+      });
+    });
+    it("keeps text and settings through child creation and asynchronous failure, then opens the successful retry", async () => {
+      seedSession("conv_draft_parent", []);
+      await useChatStore.getState().switchTo("conv_draft_parent");
+      const draft = {
+        text: "Explain this",
+        files: [],
+        settings: { modelOverride: "gpt-6-sol", reasoningEffort: "high" },
+        starting: true,
+      };
+      useChatStore.setState({
+        sessionHarness: "codex-native",
+        awaitingSideChatFor: null,
+        sideChatToOpen: null,
+        sideChatComposers: { "pending:test": draft },
+      });
+      await useChatStore.getState().send("/side Explain this", "agent_xyz", undefined, {
+        sideChatDraftId: "pending:test",
+        sideChatSettings: draft.settings,
+      });
+      expect(useChatStore.getState().awaitingSideChatFor).toBeNull();
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_draft_parent",
+        childSessionId: "failed_child",
+        agentId: "agent_xyz",
+        parentSessionId: "conv_draft_parent",
+      });
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers["pending:test"]).toEqual(draft);
+      handleSessionEvent({
+        type: "side_chat_result",
+        conversationId: "conv_draft_parent",
+        draftId: "pending:test",
+        childSessionId: null,
+      });
+      expect(useChatStore.getState().sideChatComposers["pending:test"]).toEqual({
+        ...draft,
+        starting: false,
+      });
+      useChatStore
+        .getState()
+        .updateSideChatComposer("pending:test", (current) => ({ ...current, starting: true }));
+      handleSessionEvent({
+        type: "side_chat_result",
+        conversationId: "conv_draft_parent",
+        draftId: "pending:test",
+        childSessionId: "retry_child",
+      });
+      expect(useChatStore.getState().sideChatToOpen).toEqual({
+        childId: "retry_child",
+        parentId: "conv_draft_parent",
+        pendingId: "pending:test",
+      });
     });
   });
 

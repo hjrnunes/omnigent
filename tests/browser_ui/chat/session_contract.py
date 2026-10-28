@@ -546,6 +546,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     )
     contract.json(f"{session_api}/agent", lambda _request: handle._agent())
     contract.json(f"{session_api}/child_sessions", empty)
+    contract.json(f"{session_api}/side_chat_capabilities", {"settings": True})
     contract.json(f"{session_api}/resources/terminals", empty)
     contract.response(f"{session_api}/read-state", method="PUT")
     for resource in ("environments/default", "github"):

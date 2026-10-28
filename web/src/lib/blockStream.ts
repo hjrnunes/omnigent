@@ -1012,6 +1012,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "session_sandbox_status":
     case "session_mcp_startup":
     case "session_input_consumed":
+    case "side_chat_result":
     case "session_created":
       return;
 

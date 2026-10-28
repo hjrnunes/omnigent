@@ -80,6 +80,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
@@ -4317,6 +4318,7 @@ async def _create_and_publish_codex_child(
     # Stable title so the (parent, title) unique index prevents race-condition
     # duplicate rows when the forwarder retries a failed registration.
     title = f"codex-native-ui-subagent:{thread_id}"
+    side_chat = is_side_chat_child(labels)
     try:
         child = await asyncio.to_thread(
             conversation_store.create_conversation,
@@ -4326,6 +4328,10 @@ async def _create_and_publish_codex_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            model_override=(
+                (parent_conv.model_override or parent_conv.reported_model) if side_chat else None
+            ),
+            reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5721,6 +5727,18 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _runner_supports_side_chat_settings(client: httpx.AsyncClient | None) -> bool:
+    """Negotiate against the running process; older runners have no capability route."""
+    if client is None:
+        return False
+    try:
+        response = await asyncio.wait_for(client.get("/v1/side_chat_capabilities"), timeout=3)
+        payload = response.json() if response.status_code == 200 else None
+        return isinstance(payload, dict) and payload.get("settings") is True
+    except (httpx.HTTPError, TimeoutError, ValueError):
+        return False
 
 
 async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:

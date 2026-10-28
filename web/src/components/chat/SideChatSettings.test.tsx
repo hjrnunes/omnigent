@@ -1,3 +1,4 @@
+import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -11,6 +12,10 @@ import type * as AgentLabels from "@/lib/agentLabels";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { SideChatSettings } from "./SideChatSettings";
+
+vi.mock("@/hooks/useSideChatSettingsSupport", () => ({
+  useSideChatSettingsSupport: vi.fn(() => true),
+}));
 
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabels>()),
@@ -91,6 +96,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.mocked(useSideChatSettingsSupport).mockReturnValue(true);
   cleanup();
   cache.clear();
   conversationRegistry.clear();
@@ -488,7 +494,8 @@ it.each([
   { harness: "codex-native", labels: {} },
   { harness: null, labels: { "omnigent.wrapper": "codex-native-ui" } },
   { harness: null, labels: { "omnigent.codex_native.agent_nickname": "Side chat" } },
-])("leaves native Codex settings for the separate implementation (%j)", (metadata) => {
+])("hides native Codex settings when unsupported (%j)", (metadata) => {
+  vi.mocked(useSideChatSettingsSupport).mockReturnValue(false);
   mount({ ...child, ...metadata } as Session);
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
@@ -599,3 +606,27 @@ it.each([
     else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
   },
 );
+
+it("uses the parent catalog while targeting a native Codex side thread", async () => {
+  mount({
+    ...child,
+    harness: "codex-native",
+    parentSessionId: "parent",
+    codexModelOptions: [],
+    labels: {
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+  await waitFor(() =>
+    expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
+      modelOverride: "model-b",
+      reasoningEffort: "low",
+    }),
+  );
+  expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
+});

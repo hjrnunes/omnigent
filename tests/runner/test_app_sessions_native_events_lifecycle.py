@@ -5460,9 +5460,13 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", [False, True], ids=["follow-up", "side-command"])
+@pytest.mark.parametrize(
+    "command,inherited",
+    [(False, False), (False, True), (True, False)],
+    ids=["follow-up", "inherited-default", "side-command"],
+)
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5497,8 +5501,14 @@ async def test_events_codex_side_chat_preserves_indentation(
             {"type": "input_text", "text": f" \n /side {question}" if command else question}
         ],
     }
+    if command:
+        payload["side_chat_settings"] = {"model": "gpt-6-sol", "effort": "max"}
+        payload["side_chat_draft_id"] = "pending:test"
     if not command:
         payload["codex_side_thread_id"] = "thread_side"
+        payload["model_override"] = "gpt-6-sol"
+        if not inherited:
+            payload["reasoning_effort"] = "max"
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
@@ -5510,14 +5520,26 @@ async def test_events_codex_side_chat_preserves_indentation(
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
             question
         ]
+        assert side_chat.peek_side_chat_requests(bridge_dir)[0].draft_id == "pending:test"
+        assert side_chat.peek_side_chat_requests(bridge_dir)[0].settings == {
+            "model": "gpt-6-sol",
+            "effort": "max",
+        }
         assert fake_client.requests == []
     else:
-        assert fake_client.requests == [
+        assert [call for call in fake_client.requests if call[0] != "model/list"] == [
             (
                 "turn/start",
-                {"threadId": "thread_side", "input": [{"type": "text", "text": question}]},
+                {
+                    "threadId": "thread_side",
+                    "input": [{"type": "text", "text": question}],
+                    "model": "gpt-6-sol",
+                    **({"effort": "max"} if not inherited else {}),
+                },
             )
         ]
+        if inherited:
+            assert not any(method == "model/list" for method, _ in fake_client.requests)
         assert fake_client.closed
 
 
@@ -5623,6 +5645,15 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
             "thread not found: 0199-abc",
         ),
         (ConnectionError("websocket closed 1011"), 503, "codex_side_chat_unavailable", None),
+        (
+            ValueError("Codex model capabilities unavailable for None"),
+            409,
+            "codex_side_chat_settings_unavailable",
+            (
+                "Could not resolve the side chat's default effort. "
+                "Select an explicit effort and retry."
+            ),
+        ),
     ],
 )
 async def test_events_codex_side_chat_message_failure_is_structured(

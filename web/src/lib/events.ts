@@ -810,6 +810,13 @@ export interface SessionInterruptedEvent {
  * Sub-agent rendering is out of scope for the sessions migration;
  * until that lands this event is a no-op.
  */
+export interface SideChatResultEvent {
+  type: "side_chat_result";
+  conversationId: string;
+  draftId: string;
+  childSessionId: string | null;
+}
+
 export interface SessionCreatedEvent {
   type: "session_created";
   /** Parent session id — the carrier stream's conversation id. */
@@ -1041,6 +1048,7 @@ export type StreamEvent =
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
+  | SideChatResultEvent
   | SessionCreatedEvent
   | SessionSupersededEvent
   | SessionResourceCreatedEvent

@@ -5546,7 +5546,7 @@ describe("Composer reply quotes", () => {
   });
 });
 
-describe("Composer startSideChat (text-select → Ask in side chat)", () => {
+describe("Composer side-chat drafts", () => {
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();
@@ -5568,6 +5568,19 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     cleanup();
     clearSessionDrafts();
     vi.restoreAllMocks();
+  });
+
+  it("opens an empty Codex side-chat draft from the add tray without replacing the main draft", async () => {
+    render(<Composer {...composerProps()} />);
+    const user = userEvent.setup();
+    await user.type(textarea(), "Keep this parent draft");
+    await user.click(screen.getByTestId("composer-attach"));
+    await user.click(screen.getByRole("menuitem", { name: /Start a new side chat/ }));
+    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen?.parentId).toBe("conv_test");
+    expect(sideChatToOpen?.childId).toMatch(/^pending:/);
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
+    expect(textarea()).toHaveValue("Keep this parent draft");
   });
 
   it("opens a pending side-chat tab quoting the selection, leaving the main composer empty", () => {

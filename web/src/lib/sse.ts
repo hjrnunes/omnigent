@@ -41,6 +41,7 @@ import type {
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
+  SideChatResultEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
@@ -859,6 +860,20 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       requestedAt: Number(p.requested_at ?? 0),
       responseId: typeof p.response_id === "string" ? p.response_id : undefined,
     } satisfies SessionInterruptedEvent;
+  }
+  if (eventType === "session.side_chat_result") {
+    if (
+      typeof data.conversation_id !== "string" ||
+      typeof data.draft_id !== "string" ||
+      (data.child_session_id !== null && typeof data.child_session_id !== "string")
+    )
+      return null;
+    return {
+      type: "side_chat_result",
+      conversationId: data.conversation_id,
+      draftId: data.draft_id,
+      childSessionId: data.child_session_id,
+    } satisfies SideChatResultEvent;
   }
   if (eventType === "session.created") {
     const conversationId = data.conversation_id;

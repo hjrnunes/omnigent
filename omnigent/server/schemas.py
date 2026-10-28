@@ -3920,6 +3920,15 @@ class SessionInterruptedEvent(_SSEEventBase):
     data: SessionInterruptedPayload
 
 
+class SideChatResultEvent(_SSEEventBase):
+    """Settle a pending web draft after native first-turn acceptance or failure."""
+
+    type: Literal["session.side_chat_result"]
+    conversation_id: str
+    draft_id: str
+    child_session_id: str | None
+
+
 class SessionCreatedEvent(_SSEEventBase):
     """
     A child (sub-agent) session was spawned from this session.
@@ -5054,6 +5063,7 @@ ServerStreamEvent = Annotated[
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
+    | SideChatResultEvent
     | SessionSupersededEvent
     | SessionBtwSidechatEvent
     | SessionPresenceEvent

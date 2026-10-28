@@ -407,8 +407,10 @@ If the native session's model list is empty, the picker uses the same host
 catalog as the main composer until the session's list arrives.
 Available choices follow the harness's capabilities; viewers and closed chats
 cannot change them. A failed start keeps the draft and selections for retry
-without changing the parent's settings. Native Codex retains its existing
-side-thread flow and does not expose these controls; it is a separate follow-up.
+without changing the parent's settings. Native Codex advertises these controls only when the server and runner support
+side-thread settings. Its first message carries the draft choices through the
+parent runner to the ephemeral child thread. Creation-result recovery is still
+incomplete: a lost completion delivery or executor fallback can strand a draft.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -737,11 +739,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
   picker. Session metadata and message dispatch are mocked.
-- **`side-chat-lifecycle`, native Codex:**
+- **`side-chat-lifecycle`, `side-chat-settings`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
   inherited context in the model request, isolated follow-ups, and a parent
-  that stays usable after closing its side chat.
+  that stays usable after closing its side chat. Desktop/mobile variants select
+  draft model and effort and change follow-up effort; scripted provider requests
+  verify child-only application. These scenarios do not cover lost completion
+  delivery or the executor fallback.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,

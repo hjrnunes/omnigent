@@ -1250,6 +1250,7 @@ def register_events_routes(
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            "external_side_chat_result",
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -2623,6 +2624,44 @@ def register_events_routes(
             # Returned to the agy reader so it can mirror the child cascade's
             # steps into this id.
             return {"queued": False, "child_session_id": child_id}
+        if body.type == "external_side_chat_result":
+            draft_id = body.data.get("draft_id")
+            child_id = body.data.get("child_session_id")
+            if (
+                not isinstance(draft_id, str)
+                or not draft_id.startswith("pending:")
+                or len(draft_id) > 200
+            ):
+                raise OmnigentError("Invalid side chat draft", code=ErrorCode.INVALID_INPUT)
+            if child_id is not None:
+                child = (
+                    await asyncio.to_thread(conversation_store.get_conversation, child_id)
+                    if isinstance(child_id, str)
+                    else None
+                )
+                if (
+                    child is None
+                    or child.parent_conversation_id != session_id
+                    or not is_side_chat_child(child.labels)
+                ):
+                    raise OmnigentError("Invalid side chat child", code=ErrorCode.INVALID_INPUT)
+            from omnigent.harnesses.codex_native.side_chat import RESULT_LABEL_PREFIX
+
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {RESULT_LABEL_PREFIX + draft_id: child_id or "failed"},
+            )
+            session_stream.publish(
+                session_id,
+                {
+                    "type": "session.side_chat_result",
+                    "conversation_id": session_id,
+                    "draft_id": draft_id,
+                    "child_session_id": child_id,
+                },
+            )
+            return {"queued": False}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
             child_id = await _persist_external_codex_subagent_start(
                 session_id,
@@ -3558,6 +3597,19 @@ def register_events_routes(
             stay in this async hook.
             """
             events: list[dict[str, Any]] = []
+            from omnigent.harnesses.codex_native.side_chat import RESULT_LABEL_PREFIX
+
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            for key, value in (current.labels if current is not None else {}).items():
+                if key.startswith(RESULT_LABEL_PREFIX):
+                    events.append(
+                        {
+                            "type": "session.side_chat_result",
+                            "conversation_id": session_id,
+                            "draft_id": key.removeprefix(RESULT_LABEL_PREFIX),
+                            "child_session_id": None if value == "failed" else value,
+                        }
+                    )
             try:
                 page = await asyncio.to_thread(
                     conversation_store.list_conversations,

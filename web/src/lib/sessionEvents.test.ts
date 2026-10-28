@@ -238,6 +238,34 @@ describe("session.interrupted (NESTED envelope)", () => {
   });
 });
 
+describe("session.side_chat_result", () => {
+  it.each([null, "conv_child"])("decodes the first-turn result (%s)", (childSessionId) => {
+    expect(
+      parse("session.side_chat_result", {
+        conversation_id: "conv_parent",
+        draft_id: "pending:test",
+        child_session_id: childSessionId,
+      }),
+    ).toEqual([
+      {
+        type: "side_chat_result",
+        conversationId: "conv_parent",
+        draftId: "pending:test",
+        childSessionId,
+      },
+    ]);
+  });
+  it("rejects malformed results", () => {
+    expect(
+      parse("session.side_chat_result", {
+        conversation_id: "conv_parent",
+        draft_id: 123,
+        child_session_id: null,
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe("session.created (FLAT envelope)", () => {
   it("lifts parent + child + agent ids", () => {
     const out = parse("session.created", {

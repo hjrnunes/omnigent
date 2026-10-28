@@ -1,3 +1,4 @@
+import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import { useState } from "react";
 import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -53,12 +54,15 @@ export function SideChatSettings({
   const queryClient = useQueryClient();
   const state = useConversationEntryState(session.id);
   const nativeSide = session.labels?.["omnigent.codex_native.agent_nickname"] === "Side chat";
-  const settingsSupported =
-    !nativeSide &&
-    session.harness !== "codex-native" &&
-    session.labels?.["omnigent.wrapper"] !== "codex-native-ui";
+  const settingsSupported = useSideChatSettingsSupport(
+    session.id,
+    nativeSide ||
+      session.harness === "codex-native" ||
+      session.labels?.["omnigent.wrapper"] === "codex-native-ui",
+  );
   const sourceId = session.parentSessionId ?? parentIdFromLabels(session.labels);
   const { session: parent } = useSession(sourceId);
+  const parentState = useConversationEntryState(nativeSide ? sourceId : null);
   const families = useHarnessEffortFamilies();
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -83,8 +87,12 @@ export function SideChatSettings({
     },
   });
   const catalogs = [state.codexModelOptions, session.codexModelOptions];
+  if (nativeSide) catalogs.push(parentState.codexModelOptions, parent?.codexModelOptions);
+  const capabilities = nativeSide
+    ? { ...session, labels: { ...session.labels, "omnigent.wrapper": "codex-native-ui" } }
+    : session;
   const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
-  const kind = modelPickerKindForConv(session, sessionOptions);
+  const kind = modelPickerKindForConv(capabilities, sessionOptions);
   const probeHarness =
     kind === "codex" || kind === "claude" || kind === "devin" ? `${kind}-native` : null;
   const { data: hostOptions } = useHostModelOptions(
@@ -122,8 +130,8 @@ export function SideChatSettings({
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort
       : (session.reasoningEffort ?? null);
-  const supportsEffort = shouldShowEffortPicker(session, family);
-  const efforts = supportsEffort ? effortLevelsForConv(session, options, model, family) : [];
+  const supportsEffort = shouldShowEffortPicker(capabilities, family);
+  const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
   const showModels = kind !== null && options.length > 0;
   if (!settingsSupported || (!showModels && efforts.length === 0)) return null;
   const disabled =
@@ -168,7 +176,7 @@ export function SideChatSettings({
                       ? currentFusionCombo(option.fusion, model ?? "").modelUid
                       : option.id;
                     const nextEfforts = supportsEffort
-                      ? effortLevelsForConv(session, options, nextModel, family)
+                      ? effortLevelsForConv(capabilities, options, nextModel, family)
                       : [];
                     const nextEffort = effortAfterModelChange(effort, nextEfforts);
                     void save({

@@ -320,6 +320,18 @@ def test_session_created_event_basic_fields() -> None:
     assert dumped["parent_session_id"] == "conv_parent"
 
 
+@pytest.mark.parametrize("child_id", [None, "conv_child"])
+def test_side_chat_result_round_trips_through_union(child_id: str | None) -> None:
+    raw = {
+        "type": "session.side_chat_result",
+        "conversation_id": "conv_parent",
+        "draft_id": "pending:test",
+        "child_session_id": child_id,
+    }
+    parsed = _ADAPTER.validate_python(raw)
+    assert parsed.model_dump(exclude_unset=True) == raw
+
+
 def test_session_created_event_round_trips_through_union() -> None:
     """A session.created dict is dispatched to SessionCreatedEvent."""
     raw = {

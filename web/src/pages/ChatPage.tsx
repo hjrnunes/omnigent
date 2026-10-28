@@ -111,7 +111,6 @@ import {
 import {
   isSideChatCommand,
   newPendingSideChatId,
-  SIDE_CHAT_COMMAND_PREFIX,
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
@@ -4219,16 +4218,14 @@ function ComposerImpl(
                 onSideChat={
                   composerSessionId && !isReadOnly && supportsSideChat(sessionHarness)
                     ? () => {
-                        if (usesNativeSideChatFork(sessionHarness)) {
-                          // Codex forks in-process from a typed /side; prefill so
-                          // the user types the question.
-                          setValue(SIDE_CHAT_COMMAND_PREFIX);
-                          setCommandError(null);
-                          dirtyRef.current = true;
-                          return;
-                        }
                         const sourceId = useChatStore.getState().conversationId;
                         if (sourceId === null) return;
+                        if (usesNativeSideChatFork(sessionHarness)) {
+                          useChatStore
+                            .getState()
+                            .openSideChatWithDraft(newPendingSideChatId(), "", sourceId);
+                          return;
+                        }
                         createSideChat(sourceId).then(
                           ({ childSessionId }) =>
                             useChatStore.setState({

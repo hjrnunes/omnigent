@@ -6304,6 +6304,42 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    draft_id = body.data.get("side_chat_draft_id")
+    if draft_id is not None:
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+
+        if (
+            harness != "codex-native"
+            or not is_side_chat_command(_extract_user_text_for_routing(body))
+            or not isinstance(draft_id, str)
+            or not draft_id.startswith("pending:")
+            or len(draft_id) > 200
+        ):
+            raise OmnigentError("Invalid side chat draft", code=ErrorCode.INVALID_INPUT)
+        event["side_chat_draft_id"] = draft_id
+    side_settings = body.data.get("side_chat_settings")
+    if side_settings is not None:
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
+
+        if (
+            harness != "codex-native"
+            or not is_side_chat_command(_extract_user_text_for_routing(body))
+            or not isinstance(side_settings, dict)
+            or any(
+                value is not None and not isinstance(value, str)
+                for value in side_settings.values()
+            )
+        ):
+            raise OmnigentError("Invalid side chat settings", code=ErrorCode.INVALID_INPUT)
+        side_model, side_effort = validate_session_model_metadata(
+            model_override=side_settings.get("model"),
+            reasoning_effort=side_settings.get("effort"),
+        )
+        event["side_chat_settings"] = {
+            key: value
+            for key, value in (("model", side_model), ("effort", side_effort))
+            if value is not None or (key == "effort" and key in side_settings)
+        }
     if agent_revision is not None:
         event["agent_revision"] = agent_revision
     # The web's stable id for this message rides along so the runner can name
@@ -7779,6 +7815,7 @@ async def _forward_codex_side_chat_turn(
         child lacks a parent id or a Codex thread-id label.
     """
     from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL
     from omnigent.server.routes._sessions.common import (
         _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     )
@@ -7793,6 +7830,13 @@ async def _forward_codex_side_chat_turn(
             "type": "message",
             "content": body.data.get("content"),
             "codex_side_thread_id": child_thread_id,
+            **({"model_override": conv.model_override} if conv.model_override is not None else {}),
+            **(
+                {"reasoning_effort": conv.reasoning_effort}
+                if conv.reasoning_effort is not None
+                or conv.labels.get(EFFORT_RESET_LABEL) == "true"
+                else {}
+            ),
         },
     )
     if resp.status_code >= 400:
@@ -7993,6 +8037,22 @@ async def _dispatch_session_event_to_runner_impl(
         opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
             _extract_user_text_for_routing(body)
         )
+        if opens_side_chat and (
+            body.data.get("side_chat_draft_id") is not None
+            or body.data.get("side_chat_settings") is not None
+        ):
+            from omnigent.server.routes._sessions.helpers import (
+                _runner_supports_side_chat_settings,
+            )
+
+            if not await _runner_supports_side_chat_settings(runner_client):
+                raise OmnigentError(
+                    (
+                        "This runner cannot apply side-chat settings. Update the host and "
+                        "restart the session, or open a side chat without settings."
+                    ),
+                    code=ErrorCode.INVALID_INPUT,
+                )
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.
@@ -13062,7 +13122,11 @@ def _validate_session_model_selection(
     :raises OmnigentError: If the harness cannot be resolved or its model policy rejects the pick.
     """
     from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
     from omnigent.runtime.workflow import _find_spec_by_name
+
+    if _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels):
+        return
 
     harness = canonicalize_harness(conv.harness_override)
     if harness and harness != "acp":
