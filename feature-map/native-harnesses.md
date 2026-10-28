@@ -622,6 +622,22 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi compaction → restart → continuation → fork (own environment):**
+  `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_compacted_restart_then_fork`
+  runs two real file reads and manual compaction through the API, then replaces
+  the native Pi process. Separate cases keep the runner, abruptly replace the
+  runner while its idle native pane is still alive, or remove native history
+  before relaunch.
+  Preserved files retain their compaction checkpoint; missing files reconstruct
+  the original tool history from server items. Continuation and a subsequent
+  independent fork receive both results without duplicating tools or replies.
+  Artifacts include provider requests, server transcripts, native JSONL and real
+  tmux text captures. The local provider scripts replies and compaction summaries;
+  a small retention setting forces compaction on a short history. Missing-file
+  rebuilds and forks replay the full server transcript instead of the native
+  checkpoint; long histories near context capacity remain unvalidated. This does
+  not cover live gateways, browser controls, sandboxing or loss during an
+  active turn.
 - **`resume`, Pi user setup (own environment):**
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
   and process resume through the server/host/runner. User skills/extensions and

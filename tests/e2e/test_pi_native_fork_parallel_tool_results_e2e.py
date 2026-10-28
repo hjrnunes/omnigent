@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import shlex
 import shutil
 import subprocess
@@ -24,9 +23,15 @@ import pytest
 from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 from omnigent.inner._proc import process_alive
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
-from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
-from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.live_server import terminate_process
+from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.session import (
+    bind_session_runner,
+    bundle_files,
+    post_session_bundle,
+    send_user_text,
+)
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
@@ -40,6 +45,7 @@ _CALL_IDS = ["toolu_par_a", "toolu_par_b"]
 _MIXED_TEXT = "Reading both seeded files."
 _RESPONSES_MODEL = "gpt-mock-resume"
 _RECOVERED_OUTPUT = "Contents recovered from the missing call."
+PiForkRig = tuple[httpx.Client, ServerRunner, list[dict[str, Any]], list[str]]
 
 
 def _wait(predicate: Callable[[], Any]) -> Any:
@@ -71,7 +77,7 @@ def _parallel_response(workspace: Path) -> str:
 @pytest.fixture
 def pi_fork_rig(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
-) -> Iterator[tuple[httpx.Client, str, list[dict[str, Any]]]]:
+) -> Iterator[PiForkRig]:
     pi_binary = os.environ.get("OMNIGENT_PI_PATH") or shutil.which("pi")
     for binary in (pi_binary or "pi", "node"):
         if reason := cli_unavailable_reason(binary):
@@ -186,42 +192,34 @@ def pi_fork_rig(
             monkeypatch.delenv(key)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(config))
-    token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(token)
+    monkeypatch.setenv("OMNIGENT_PI_PATH", str(pi_binary))
     try:
         with (
             tempfile.TemporaryDirectory(prefix="pi-fork-", dir="/tmp") as short_tmp,
-            isolated_local_server(tmp_path, env={"OMNIGENT_CONFIG_HOME": str(config)}) as base_url,
+            server_runner(
+                tmp_path,
+                workspace=workspace,
+                server_env={"OMNIGENT_CONFIG_HOME": str(config)},
+            ) as stack,
             httpx.Client(
-                base_url=base_url,
+                base_url=stack.base_url,
                 trust_env=False,
                 timeout=30,
                 headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
             ) as client,
-            (tmp_path / "runner.log").open("w") as log,
         ):
-            runner = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
-                env=local_server_env(
-                    {
-                        "HOME": str(home),
-                        "TMPDIR": short_tmp,
-                        "OMNIGENT_PI_PATH": str(pi_binary),
-                        "OMNIGENT_RUNNER_ID": runner_id,
-                        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
-                        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                        "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                        "RUNNER_SERVER_URL": base_url,
-                    }
-                ),
-                stdout=log,
-                stderr=subprocess.STDOUT,
+            stack.start_runner(
+                env={
+                    "OMNIGENT_CONFIG_HOME": str(config),
+                    "TMPDIR": short_tmp,
+                    "OMNIGENT_PI_PATH": str(pi_binary),
+                }
             )
             try:
-                _wait(lambda: client.get(f"/v1/runners/{runner_id}/status").json().get("online"))
-                yield client, runner_id, requests
+                yield client, stack, requests, replies
             finally:
-                terminate_process(runner)
+                (tmp_path / "provider-requests.json").write_text(json.dumps(requests, indent=2))
+                terminate_process(stack.runner)
                 for socket in Path(short_tmp).rglob("tmux.sock"):
                     subprocess.run(
                         ["tmux", "-S", str(socket), "kill-server"], capture_output=True, timeout=10
@@ -235,9 +233,10 @@ def pi_fork_rig(
 
 @pytest.mark.parametrize("resume_api", ["anthropic", "responses"])
 def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
-    pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path, resume_api: str
+    pi_fork_rig: PiForkRig, tmp_path: Path, resume_api: str
 ) -> None:
-    client, runner_id, requests = pi_fork_rig
+    client, stack, requests, _ = pi_fork_rig
+    runner_id = stack.runner_id
     spec = _materialize_pi_agent_spec(tmp_path)
     instructions = "OMNI_PI_FORK_ROLE act as the chief of staff."
     spec.write_text(
@@ -392,12 +391,181 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
                 client.delete(f"/v1/sessions/{session_id}")
 
 
+@pytest.mark.parametrize("restart_scope", ["process", "runner", "missing-files"])
+def test_pi_native_compacted_restart_then_fork(
+    pi_fork_rig: PiForkRig, tmp_path: Path, restart_scope: str
+) -> None:
+    """Real Pi compacts tool history, restarts, continues, then forks independently."""
+    client, stack, requests, replies = pi_fork_rig
+    summary = "RECOVERY-CHECKPOINT: read alpha-contents and beta-contents; do not repeat tools."
+    replies[2:] = [
+        anthropic_sse_text_response(text, model=_MODEL)
+        for text in ("READY-TO-COMPACT", summary, "RESTART-CONTINUED", "FORK-CONTINUED")
+    ]
+    settings = stack.runner_home / ".pi/agent/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"compaction": {"keepRecentTokens": 100}}))
+    spec = _materialize_pi_agent_spec(tmp_path)
+    created = post_session_bundle(
+        client.post,
+        "/v1/sessions",
+        bundle_files({spec.name: spec.read_bytes()}),
+        metadata={"labels": dict(_SESSION_LABELS)},
+    )
+    created.raise_for_status()
+    session_id = created.json()["session_id"]
+    session_ids = [session_id]
+    terminal_url = f"/v1/sessions/{session_id}/resources/terminals"
+    bridge = stack.runner_home / ".omnigent/pi-native" / bridge_dir_for_session_id(session_id).name
+
+    def items(target: str) -> list[dict[str, Any]]:
+        response = client.get(
+            f"/v1/sessions/{target}/items", params={"limit": 1000, "order": "asc"}
+        )
+        response.raise_for_status()
+        result = response.json()["data"]
+        assert not [item for item in result if item["type"] == "error"], result
+        return result
+
+    def turn(target: str, prompt: str, reply: str) -> None:
+        send_user_text(client, session_id=target, text=prompt)
+        _wait(lambda: reply in json.dumps(items(target)))
+        assert (
+            sum(
+                item.get("role") == "assistant" and reply in json.dumps(item.get("content"))
+                for item in items(target)
+            )
+            == 1
+        )
+
+    def pane(*args: str) -> str:
+        return subprocess.check_output(
+            [
+                "tmux",
+                "-S",
+                terminal["tmux_socket"],
+                args[0],
+                "-t",
+                terminal["tmux_target"],
+                *args[1:],
+            ],
+            text=True,
+            timeout=10,
+        )
+
+    try:
+        bind_session_runner(client.patch, "", session_id, stack.runner_id)
+        turn(session_id, "Read both files.", "PARALLEL-TOOLS-DONE")
+        turn(
+            session_id,
+            "Keep both file results for the handoff. " * 25,
+            "READY-TO-COMPACT",
+        )
+        client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "compact", "data": {}}
+        ).raise_for_status()
+        session_file = next((bridge / "sessions").glob("*.jsonl"))
+        _wait(lambda: '"type":"compaction"' in session_file.read_text())
+        compacted = session_file.read_bytes()
+        assert summary in compacted.decode()
+        (tmp_path / "before-restart.jsonl").write_bytes(compacted)
+        assert all(f"{name}-contents" in json.dumps(requests[3]) for name in ("alpha", "beta"))
+        _wait(lambda: client.get(f"/v1/sessions/{session_id}").json()["status"] == "idle")
+        before = client.get(f"/v1/sessions/{session_id}").json()
+        terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
+        old_pid = pane("display-message", "-p", "#{pane_pid}").strip()
+        (tmp_path / "before-restart-terminal.txt").write_text(
+            pane("capture-pane", "-p", "-S", "-")
+        )
+        assert stack.runner is not None
+        old_runner_pid = stack.runner.pid
+        if restart_scope == "runner":
+            # Leave the idle native pane alive when its owning runner disappears.
+            assert process_alive(int(old_pid))
+            print(
+                f"Runner loss: idle Pi pane {old_pid} alive before killing runner {old_runner_pid}"
+            )
+            stack.runner.kill()
+            stack.runner.wait(timeout=10)
+            _wait(lambda: not client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"])
+            stack.runner = None
+            stack.start_runner(
+                env={
+                    "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+                    "OMNIGENT_PI_PATH": os.environ.get("OMNIGENT_PI_PATH") or shutil.which("pi"),
+                    "TMPDIR": str(Path(terminal["tmux_socket"]).parents[1]),
+                }
+            )
+            assert stack.runner is not None and stack.runner.pid != old_runner_pid
+        else:
+            client.delete(f"{terminal_url}/terminal_pi_main").raise_for_status()
+            _wait(lambda: not process_alive(int(old_pid)))
+        if restart_scope == "missing-files":
+            session_file.unlink()
+        else:
+            assert session_file.read_bytes() == compacted
+        client.post(
+            terminal_url,
+            json={"terminal": "pi", "session_key": "main", "ensure_native_terminal": True},
+        ).raise_for_status()
+        terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
+        new_pid = pane("display-message", "-p", "#{pane_pid}").strip()
+        assert new_pid != old_pid
+        assert not process_alive(int(old_pid)), "Production recovery must reap the old Pi pane"
+        turn(session_id, "Continue using the two file results.", "RESTART-CONTINUED")
+        resumed = json.dumps(requests[-1]["messages"])
+        assert all(f"{name}-contents" in resumed for name in ("alpha", "beta"))
+        if restart_scope != "missing-files":
+            assert summary in resumed
+            assert "Read both files." not in resumed
+            assert session_file.read_bytes().startswith(compacted)
+        assert (
+            client.get(f"/v1/sessions/{session_id}").json()["external_session_id"]
+            == before["external_session_id"]
+        )
+        parent_items = items(session_id)
+        fork = client.post(f"/v1/sessions/{session_id}/fork", json={})
+        fork.raise_for_status()
+        fork_id = fork.json()["id"]
+        session_ids.append(fork_id)
+        bind_session_runner(client.patch, "", fork_id, stack.runner_id)
+        turn(fork_id, "Continue independently using the same file results.", "FORK-CONTINUED")
+        history = json.dumps(requests[-1]["messages"])
+        assert all(
+            text in history for text in ("alpha-contents", "beta-contents", "RESTART-CONTINUED")
+        )
+        assert items(session_id) == parent_items
+        assert (
+            client.get(f"/v1/sessions/{fork_id}").json()["external_session_id"]
+            != before["external_session_id"]
+        )
+        for target in session_ids:
+            transcript = items(target)
+            for kind in ("function_call", "function_call_output"):
+                assert (
+                    sorted(item["call_id"] for item in transcript if item["type"] == kind)
+                    == _CALL_IDS
+                )
+            (tmp_path / f"{target}-items.json").write_text(json.dumps(transcript, indent=2))
+        assert len(requests) == 6
+        (tmp_path / "after-restart-terminal.txt").write_text(pane("capture-pane", "-p", "-S", "-"))
+        print(
+            f"{restart_scope}: Pi pane {old_pid} -> {new_pid}; "
+            f"runner {old_runner_pid} -> {stack.runner.pid}; compact/continue/fork passed"
+        )
+    finally:
+        for target in reversed(session_ids):
+            with suppress(httpx.HTTPError):
+                client.delete(f"/v1/sessions/{target}")
+
+
 @pytest.mark.parametrize("pi_fork_rig", [True], indirect=True, ids=["token-command"])
 def test_pi_native_token_failure_recovers_without_replaying_tools(
-    pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path
+    pi_fork_rig: PiForkRig, tmp_path: Path
 ) -> None:
     """Real server/runner/Pi: refresh, classified failures, cleanup and same-PID recovery."""
-    client, runner_id, requests = pi_fork_rig
+    client, stack, requests, _ = pi_fork_rig
+    runner_id = stack.runner_id
     workspace = tmp_path / "workspace"
     spec = _materialize_pi_agent_spec(tmp_path)
     created = post_session_bundle(
