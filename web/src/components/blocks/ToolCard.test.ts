@@ -499,7 +499,8 @@ describe("ToolCard registered views", () => {
 
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByText("Diff", { selector: "span" })).toBeInTheDocument();
+    // The Diff tab names the view, so a single file's panel carries no second "Diff" title.
+    expect(screen.getAllByText("Diff")).toHaveLength(1);
     expect(container.textContent).toContain("-TIMEOUT = 30");
     expect(container.textContent).toContain("+TIMEOUT = 60");
     expect(screen.queryByText("Input")).toBeNull();
@@ -516,7 +517,7 @@ describe("ToolCard registered views", () => {
       args: { changes: [{ path: "/repo/app.py", kind: { type: "update" }, diff: "@@\n-a\n+b\n" }] },
       output: "Error: File change ended with status declined.\nupdate /repo/app.py",
       error: "Error: File change ended with status declined.",
-      diffText: "+++ /repo/app.py",
+      diffText: "+b",
     },
     {
       producer: "OpenCode failed edit",
@@ -552,8 +553,9 @@ describe("ToolCard registered views", () => {
       expect(line.textContent).toBe(error);
       expect(line).toHaveClass("text-destructive");
       fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-      // The expanded body repeats the error in a box above the diff.
+      // The expanded body repeats the error in a box, then labels the diff as not applied.
       expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+      expect(screen.getByText("Requested change, not applied:")).toBeInTheDocument();
       expect(container.textContent).toContain(diffText);
     },
   );
@@ -591,6 +593,9 @@ describe("ToolCard registered views", () => {
     const text = container.textContent ?? "";
     expect(text).toContain(output);
     expect(text.indexOf(output)).toBeLessThan(text.indexOf("+y"));
+    expect(
+      screen.getByText("Requested change; the output does not confirm it applied:"),
+    ).toBeInTheDocument();
   });
 
   it.each([

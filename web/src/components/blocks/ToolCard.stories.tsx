@@ -167,6 +167,66 @@ export const McpFailureCollapsed: Story = {
   },
 };
 
+// A Claude edit: its line counts on the result line, its diff when expanded.
+export const EditExpanded: Story = {
+  args: {
+    name: "Edit",
+    arguments: {
+      file_path: "/repo/src/greet.py",
+      old_string:
+        "def greet(name):\n    print('Hello ' + name)\n    print('Welcome back')\n    return name\n",
+      new_string:
+        "def greet(name):\n    message = f'Hello {name}! Welcome back.'\n    print(message)\n    return name\n",
+    },
+    output: "The file /repo/src/greet.py has been updated successfully.",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.009,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A Codex patch over three files: one panel per file, named with its change kind.
+export const PatchExpanded: Story = {
+  args: {
+    name: "apply_patch",
+    arguments: {
+      changes: [
+        {
+          path: "/repo/src/greet.py",
+          kind: { type: "update" },
+          diff: "@@ -1,3 +1,3 @@\n def greet(name):\n-    print('Hello ' + name)\n+    print(f'Hello {name}')\n     return name\n",
+        },
+        {
+          path: "/repo/src/farewell.py",
+          kind: { type: "add" },
+          diff: "def farewell(name):\n    print(f'Bye {name}')\n",
+        },
+        { path: "/repo/src/legacy.py", kind: { type: "delete" }, diff: "LEGACY = True\n" },
+      ],
+    },
+    output:
+      "File change applied.\nupdate /repo/src/greet.py\nadd /repo/src/farewell.py\ndelete /repo/src/legacy.py",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.04,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A missed edit: the error, then the requested change labeled as not applied.
+export const FailedEditExpanded: Story = {
+  args: {
+    name: "Edit",
+    arguments: { file_path: "/repo/README.md", old_string: "Hi", new_string: "Hello" },
+    output: "<tool_use_error>String to replace not found in file.</tool_use_error>",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.006,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
 export const ScheduledTaskExpanded: Story = {
   args: {
     name: "sys_scheduled_task_create",

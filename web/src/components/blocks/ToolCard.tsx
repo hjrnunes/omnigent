@@ -49,6 +49,7 @@ import {
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import {
+  DIFF_TONE_CLASS,
   CodePanel,
   CopyTextButton,
   OutputSection,
@@ -534,7 +535,7 @@ function ToolResultLine({ summary }: { summary: ToolResultSummary }) {
           <span
             // eslint-disable-next-line react/no-array-index-key
             key={index}
-            className={segment.tone && RESULT_TONE_CLASS[segment.tone]}
+            className={segment.tone && DIFF_TONE_CLASS[segment.tone]}
           >
             {segment.text}
           </span>
@@ -551,12 +552,6 @@ function ToolResultLine({ summary }: { summary: ToolResultSummary }) {
     </span>
   );
 }
-
-// Same colors as the changed-files diffstat.
-const RESULT_TONE_CLASS = {
-  added: "text-green-600 dark:text-green-400",
-  removed: "text-red-600 dark:text-red-400",
-} as const;
 
 /** The dynamic part of a trigger row: a shell command, a linked file path, or plain text. */
 function ToolTitleBody({

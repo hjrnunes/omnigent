@@ -9,10 +9,17 @@ describe("getFileEditDiff", () => {
       new_string: "HOST = 'localhost'\nTIMEOUT = 60\nRETRIES = 3\n",
     });
     expect(diff).toEqual({
-      text: " HOST = 'localhost'\n-TIMEOUT = 30\n+TIMEOUT = 60\n RETRIES = 3",
+      files: [
+        {
+          path: "/repo/config.py",
+          kind: "update",
+          text: " HOST = 'localhost'\n-TIMEOUT = 30\n+TIMEOUT = 60\n RETRIES = 3",
+          additions: 1,
+          removals: 1,
+        },
+      ],
       additions: 1,
       removals: 1,
-      fileCount: 1,
       countsAreMinimum: false,
       countsAreMaximum: false,
     });
@@ -21,7 +28,7 @@ describe("getFileEditDiff", () => {
   it("does not count unchanged lines between two changes", () => {
     // WHY: trimming only the common prefix and suffix would count "b" as removed and re-added.
     const diff = getFileEditDiff("edit", { path: "x", oldText: "a\nb\nc", newText: "A\nb\nC" });
-    expect(diff?.text).toBe("-a\n+A\n b\n-c\n+C");
+    expect(diff?.files[0]?.text).toBe("-a\n+A\n b\n-c\n+C");
     expect(diff).toMatchObject({ additions: 2, removals: 2 });
   });
 
@@ -31,7 +38,7 @@ describe("getFileEditDiff", () => {
       old_string: ["a", ...middle, "z"].join("\n"),
       new_string: ["A", ...middle, "Z"].join("\n"),
     });
-    expect(diff?.text).toBe("-a\n+A\n 1\n 2\n@@\n 5\n 6\n-z\n+Z");
+    expect(diff?.files[0]?.text).toBe("-a\n+A\n 1\n 2\n@@\n 5\n 6\n-z\n+Z");
   });
 
   it("joins each edit of a MultiEdit or sys_os_edit call as its own hunk", () => {
@@ -40,18 +47,19 @@ describe("getFileEditDiff", () => {
       { old_string: "two", new_string: "two" },
       { old_string: "three\n", new_string: "three\nfour\n" },
     ];
-    expect(getFileEditDiff("MultiEdit", { file_path: "a.txt", edits })).toEqual({
-      text: "@@\n-one\n+uno\n@@\n three\n+four",
+    expect(getFileEditDiff("MultiEdit", { file_path: "a.txt", edits })).toMatchObject({
+      files: [{ path: "a.txt", text: "@@\n-one\n+uno\n@@\n three\n+four" }],
       additions: 2,
       removals: 1,
-      fileCount: 1,
-      countsAreMinimum: false,
-      countsAreMaximum: false,
     });
     const omnigentEdits = [{ oldText: "x = 1", newText: "x = 2" }];
     expect(
       getFileEditDiff("mcp__omnigent__sys_os_edit", { path: "a.py", edits: omnigentEdits }),
-    ).toMatchObject({ text: "-x = 1\n+x = 2", additions: 1, removals: 1 });
+    ).toMatchObject({
+      files: [{ path: "a.py", text: "-x = 1\n+x = 2" }],
+      additions: 1,
+      removals: 1,
+    });
   });
 
   it("counts each edit of a batch on its own, not the file's net change", () => {
@@ -68,17 +76,17 @@ describe("getFileEditDiff", () => {
   it("reads OpenCode's camel-case keys and counts a pure insertion", () => {
     expect(
       getFileEditDiff("edit", { filePath: "a.ts", oldString: "", newString: "line 1\nline 2\n" }),
-    ).toMatchObject({ text: "+line 1\n+line 2", additions: 2, removals: 0 });
+    ).toMatchObject({ files: [{ path: "a.ts", text: "+line 1\n+line 2" }], additions: 2 });
   });
 
   it("shows an edit that only adds or removes a final newline as a blank line", () => {
     expect(getFileEditDiff("Edit", { old_string: "a", new_string: "a\n" })).toMatchObject({
-      text: " a\n+",
+      files: [{ text: " a\n+" }],
       additions: 1,
       removals: 0,
     });
     expect(getFileEditDiff("Edit", { old_string: "a\n", new_string: "a" })).toMatchObject({
-      text: " a\n-",
+      files: [{ text: " a\n-" }],
       additions: 0,
       removals: 1,
     });
@@ -88,7 +96,11 @@ describe("getFileEditDiff", () => {
         { old_string: "end", new_string: "end\n" },
       ],
     });
-    expect(batch).toMatchObject({ text: "@@\n-x\n+y\n@@\n end\n+", additions: 2, removals: 1 });
+    expect(batch).toMatchObject({
+      files: [{ text: "@@\n-x\n+y\n@@\n end\n+" }],
+      additions: 2,
+      removals: 1,
+    });
   });
 
   it("shows a change too large to compare line by line as a whole-block replacement", () => {
@@ -121,7 +133,7 @@ describe("getFileEditDiff", () => {
     expect(getFileEditDiff("mcp__linear__edit", { oldText: "a", newText: "b" })).toBeNull();
   });
 
-  it("counts every file of a Codex apply_patch, by change kind", () => {
+  it("splits a Codex apply_patch into one section per file, by change kind", () => {
     const diff = getFileEditDiff("apply_patch", {
       changes: [
         {
@@ -133,25 +145,24 @@ describe("getFileEditDiff", () => {
         { path: "/repo/old.py", kind: { type: "delete" }, diff: "gone\n" },
       ],
     });
-    expect(diff).toMatchObject({ additions: 3, removals: 2, fileCount: 3 });
-    expect(diff?.text).toBe(
-      [
-        "--- /repo/app.py",
-        "+++ /repo/app.py",
-        "@@ -1,3 +1,3 @@",
-        " import os",
-        "-DEBUG = True",
-        "+DEBUG = False",
-        " print(os.name)",
-        "--- /repo/new.py",
-        "+++ /repo/new.py",
-        "+print('hi')",
-        "+print('bye')",
-        "--- /repo/old.py",
-        "+++ /repo/old.py",
-        "-gone",
-      ].join("\n"),
-    );
+    expect(diff).toMatchObject({ additions: 3, removals: 2 });
+    expect(diff?.files).toEqual([
+      {
+        path: "/repo/app.py",
+        kind: "update",
+        text: "@@ -1,3 +1,3 @@\n import os\n-DEBUG = True\n+DEBUG = False\n print(os.name)",
+        additions: 1,
+        removals: 1,
+      },
+      {
+        path: "/repo/new.py",
+        kind: "add",
+        text: "+print('hi')\n+print('bye')",
+        additions: 2,
+        removals: 0,
+      },
+      { path: "/repo/old.py", kind: "delete", text: "-gone", additions: 0, removals: 1 },
+    ]);
   });
 
   it("does not count an update that changes nothing as one of the patch's files", () => {
@@ -163,8 +174,11 @@ describe("getFileEditDiff", () => {
         { path: "empty.py", kind: { type: "add" }, diff: "" },
       ],
     });
-    expect(diff).toMatchObject({ additions: 1, removals: 0, fileCount: 2 });
-    expect(diff?.text).toBe("--- a.py\n+++ a.py\n+x\n--- empty.py\n+++ empty.py");
+    expect(diff).toMatchObject({ additions: 1, removals: 0 });
+    expect(diff?.files.map((file) => [file.path, file.text])).toEqual([
+      ["a.py", "+x"],
+      ["empty.py", ""],
+    ]);
   });
 
   it("keeps a patch that only adds or deletes an empty file", () => {
@@ -173,10 +187,9 @@ describe("getFileEditDiff", () => {
         changes: [{ path: "pkg/__init__.py", kind: { type }, diff: "" }],
       });
       expect(diff).toMatchObject({
-        text: "--- pkg/__init__.py\n+++ pkg/__init__.py",
+        files: [{ path: "pkg/__init__.py", kind: type, text: "" }],
         additions: 0,
         removals: 0,
-        fileCount: 1,
       });
     }
   });
@@ -191,14 +204,23 @@ describe("getFileEditDiff", () => {
         },
       ],
     });
-    expect(moved?.text).toBe("--- /repo/old.py\n+++ /repo/new.py\n@@ -1 +1 @@\n-a\n+b");
+    expect(moved?.files).toEqual([
+      {
+        path: "/repo/old.py",
+        newPath: "/repo/new.py",
+        kind: "update",
+        text: "@@ -1 +1 @@\n-a\n+b",
+        additions: 1,
+        removals: 1,
+      },
+    ]);
     const renamedOnly = getFileEditDiff("apply_patch", {
       changes: [
         { path: "/repo/a.py", kind: { type: "update", move_path: "/repo/b.py" }, diff: "" },
       ],
     });
     expect(renamedOnly).toMatchObject({
-      text: "--- /repo/a.py\n+++ /repo/b.py",
+      files: [{ path: "/repo/a.py", newPath: "/repo/b.py", text: "" }],
       additions: 0,
       removals: 0,
     });
@@ -235,7 +257,7 @@ describe("getFileEditDiff", () => {
       ],
     });
     expect(diff).toMatchObject({ additions: 1, removals: 1 });
-    expect(diff?.text).toBe("--- q.sql\n+++ q.sql\n--- old note\n+-- new note");
+    expect(diff?.files[0]?.text).toBe("--- old note\n+-- new note");
   });
 
   it("strips only one file header pair from an update diff without a hunk header", () => {
@@ -249,7 +271,7 @@ describe("getFileEditDiff", () => {
       ],
     });
     expect(diff).toMatchObject({ additions: 1, removals: 1 });
-    expect(diff?.text).toBe("--- notes.txt\n+++ notes.txt\n--- old\n+++ new");
+    expect(diff?.files[0]?.text).toBe("--- old\n+++ new");
   });
 
   it("skips an update diff's own file headers when counting", () => {
@@ -262,7 +284,7 @@ describe("getFileEditDiff", () => {
         },
       ],
     });
-    expect(diff).toMatchObject({ additions: 1, removals: 1, fileCount: 1 });
+    expect(diff).toMatchObject({ files: [{ path: "a.txt" }], additions: 1, removals: 1 });
   });
 
   it("returns null for an apply_patch without usable changes", () => {

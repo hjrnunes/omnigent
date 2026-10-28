@@ -5,13 +5,23 @@
 import { stripOmnigentPrefix } from "@/lib/toolTitle";
 import { isRecord } from "@/lib/toolValue";
 
-export interface FileEditDiff {
-  /** Unified-diff text: `+`, `-` and ` ` (context) lines, `@@` between hunks. */
+/** One file's part of an edit. */
+export interface FileDiffSection {
+  path: string;
+  /** Where a rename moved the file; absent when it stays put. */
+  newPath?: string;
+  kind: "update" | "add" | "delete";
+  /** Diff lines: `+`, `-` and ` ` (context), with `@@` between hunks. */
   text: string;
   additions: number;
   removals: number;
-  /** Files the edit touched. */
-  fileCount: number;
+}
+
+export interface FileEditDiff {
+  /** One section per file the edit touched. */
+  files: FileDiffSection[];
+  additions: number;
+  removals: number;
   /** A replace-all edit is diffed once, so its counts cover a single match. */
   countsAreMinimum: boolean;
   /** A change too large to compare is a whole-block replacement, so its counts can be too high. */
@@ -50,7 +60,7 @@ export const FILE_EDIT_TOOL_NAMES: readonly string[] = [...EDIT_PAIR_TOOLS, "app
  */
 export function getFileEditDiff(name: string, args: Record<string, unknown>): FileEditDiff | null {
   const tool = stripOmnigentPrefix(name);
-  if (EDIT_PAIR_TOOLS.has(tool)) return pairsDiff(editPairs(args));
+  if (EDIT_PAIR_TOOLS.has(tool)) return pairsDiff(editPairs(args), editPath(args));
   if (tool === "apply_patch") return patchChangesDiff(args.changes);
   return null;
 }
@@ -66,6 +76,12 @@ function asPair(value: unknown): EditPair | null {
   return { oldText, newText, replaceAll };
 }
 
+/** The edited file under each harness's key, or "" when the call names none. */
+function editPath(args: Record<string, unknown>): string {
+  const path = args.file_path ?? args.path ?? args.filePath;
+  return typeof path === "string" ? path : "";
+}
+
 function editPairs(args: Record<string, unknown>): EditPair[] {
   if (Array.isArray(args.edits)) {
     return args.edits.map(asPair).filter((pair): pair is EditPair => pair !== null);
@@ -74,17 +90,19 @@ function editPairs(args: Record<string, unknown>): EditPair[] {
   return single === null ? [] : [single];
 }
 
-function pairsDiff(pairs: EditPair[]): FileEditDiff | null {
+function pairsDiff(pairs: EditPair[], path: string): FileEditDiff | null {
   const budget: DiffBudget = { cells: MAX_LINE_DIFF_CELLS, exceeded: false };
   const hunks = pairs.map((pair) => lineDiff(...pairLines(pair), budget));
   const changed = hunks.filter((hunk) => hunk.some((line) => line.kind !== "context"));
   if (changed.length === 0) return null;
   const lines = changed.flatMap((hunk) => (changed.length > 1 ? [GAP, ...hunk] : hunk));
+  const additions = countKind(lines, "added");
+  const removals = countKind(lines, "removed");
+  const text = lines.map(formatLine).join("\n");
   return {
-    text: lines.map(formatLine).join("\n"),
-    additions: countKind(lines, "added"),
-    removals: countKind(lines, "removed"),
-    fileCount: 1,
+    files: [{ path, kind: "update", text, additions, removals }],
+    additions,
+    removals,
     countsAreMinimum: pairs.some((pair) => pair.replaceAll),
     countsAreMaximum: budget.exceeded,
   };
@@ -97,38 +115,47 @@ function pairsDiff(pairs: EditPair[]): FileEditDiff | null {
  */
 function patchChangesDiff(changes: unknown): FileEditDiff | null {
   if (!Array.isArray(changes)) return null;
-  const sections: string[] = [];
-  let additions = 0;
-  let removals = 0;
+  const files: FileDiffSection[] = [];
   for (const change of changes) {
     if (!isRecord(change) || typeof change.path !== "string") continue;
     const kind = isRecord(change.kind) ? change.kind.type : change.kind;
     const movePath = isRecord(change.kind) ? (change.kind.move_path ?? change.kind.movePath) : null;
     const newPath = typeof movePath === "string" && movePath !== "" ? movePath : change.path;
     const diff = typeof change.diff === "string" ? change.diff : "";
-    let body: string[];
+    const moved = newPath === change.path ? {} : { newPath };
     if (kind === "add" || kind === "delete") {
       const prefix = kind === "add" ? "+" : "-";
-      body = splitLines(diff).map((line) => `${prefix}${line}`);
-      if (kind === "add") additions += body.length;
-      else removals += body.length;
-    } else {
-      body = unifiedDiffBody(diff);
-      const added = body.filter((line) => line.startsWith("+")).length;
-      const removed = body.filter((line) => line.startsWith("-")).length;
-      // An empty add or delete still changes a file; an unchanged, unrenamed update does not.
-      if (added + removed === 0 && newPath === change.path) continue;
-      additions += added;
-      removals += removed;
+      const body = splitLines(diff).map((line) => `${prefix}${line}`);
+      const count = body.length;
+      files.push({
+        path: change.path,
+        ...moved,
+        kind,
+        text: body.join("\n"),
+        additions: kind === "add" ? count : 0,
+        removals: kind === "delete" ? count : 0,
+      });
+      continue;
     }
-    sections.push([`--- ${change.path}`, `+++ ${newPath}`, ...body].join("\n"));
+    const body = unifiedDiffBody(diff);
+    const additions = body.filter((line) => line.startsWith("+")).length;
+    const removals = body.filter((line) => line.startsWith("-")).length;
+    // An empty add or delete still changes a file; an unchanged, unrenamed update does not.
+    if (additions + removals === 0 && newPath === change.path) continue;
+    files.push({
+      path: change.path,
+      ...moved,
+      kind: "update",
+      text: body.join("\n"),
+      additions,
+      removals,
+    });
   }
-  if (sections.length === 0) return null;
+  if (files.length === 0) return null;
   return {
-    text: sections.join("\n"),
-    additions,
-    removals,
-    fileCount: sections.length,
+    files,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    removals: files.reduce((sum, file) => sum + file.removals, 0),
     countsAreMinimum: false,
     countsAreMaximum: false,
   };

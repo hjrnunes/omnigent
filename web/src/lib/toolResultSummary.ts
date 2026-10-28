@@ -108,7 +108,7 @@ export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
   if (diff.additions > 0) counts.push({ text: plural(diff.additions, "addition"), tone: "added" });
   if (diff.removals > 0) counts.push({ text: plural(diff.removals, "removal"), tone: "removed" });
   const target =
-    diff.fileCount > 1 ? `Updated ${plural(diff.fileCount, "file")} with ` : "Updated with ";
+    diff.files.length > 1 ? `Updated ${plural(diff.files.length, "file")} with ` : "Updated with ";
   const segments: ToolResultSegment[] = [
     { text: diff.countsAreMinimum ? `${target}at least ` : target },
   ];
