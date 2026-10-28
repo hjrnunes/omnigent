@@ -355,6 +355,9 @@ class ExecutorSpec:
         re-reading raw YAML.
     :param context_files: Pi context-file discovery override. None uses Pi's default.
     :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
+    :param autonomy: Droid autonomy tier (``normal`` / ``spec`` / ``auto-low`` /
+        ``auto-medium`` / ``auto-high``) applied to the ACP session. None or
+        ``inherit`` keeps Droid's own settings-file level.
     """
 
     model: str | None = None
@@ -363,6 +366,7 @@ class ExecutorSpec:
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
     context_files: bool | None = None
     system_prompt_mode: str | None = None
+    autonomy: str | None = None
 
 
 # ---------------------------------------------------------------------------

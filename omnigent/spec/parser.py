@@ -105,7 +105,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"context_files", "system_prompt_mode"}
+    {"context_files", "system_prompt_mode", "autonomy"}
 )
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
