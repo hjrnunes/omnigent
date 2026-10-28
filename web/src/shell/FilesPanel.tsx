@@ -74,12 +74,6 @@ interface FilesPanelProps {
    */
   onClose?: () => void;
   /**
-   * False while the panel is kept mounted but hidden behind a file or shell
-   * tab. Hiding drops the list's scroll offset, so showing it again re-arms
-   * the saved-offset restore.
-   */
-  active?: boolean;
-  /**
    * Frameless mode: drops the rounded card chrome and fills the parent
    * container's height (like the `onClose` drawer) — but without a close
    * button. Used by the inline right panel where the panel is embedded in a
@@ -251,7 +245,6 @@ export function FilesPanel({
   onSortChange,
   onClose,
   frameless,
-  active = true,
 }: FilesPanelProps) {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const conversationId = sessionId ?? routeId;
@@ -462,8 +455,9 @@ export function FilesPanel({
   // `isLoading` — the files queries are disabled (not loading) until the
   // environment query resolves.
   const scrollRef = useRef<HTMLElement>(null);
-  const scrollKey =
-    active && conversationId ? `files:${conversationId}:${flatView ? "changed" : "all"}` : null;
+  const scrollKey = conversationId
+    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
+    : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
   // An idle-stopped managed sandbox is asleep, not failed: its status stays

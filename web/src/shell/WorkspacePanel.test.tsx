@@ -44,20 +44,11 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({
-    flatView,
-    conversationId,
-    active,
-  }: {
-    flatView: boolean;
-    conversationId: string;
-    active?: boolean;
-  }) => (
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
-      data-active={String(active)}
     />
   ),
 }));
@@ -646,20 +637,18 @@ describe("WorkspacePanel content area", () => {
       selectedFilePath: null,
     });
     const panel = screen.getByTestId("files-panel-stub");
-    expect(panel).toHaveAttribute("data-active", "true");
+    expect(panel.parentElement).not.toHaveClass("invisible");
 
     rerender({ selectedFilePath: "src/App.tsx" });
     // The viewer owns the slot; the scope panel stays mounted (same node, so
-    // tree state survives) inside a hidden wrapper.
+    // tree state survives) inside an invisible wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel).toHaveAttribute("data-active", "false");
-    expect(panel.parentElement).toHaveClass("hidden");
+    expect(panel.parentElement).toHaveClass("invisible");
 
     rerender({ selectedFilePath: null });
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel).toHaveAttribute("data-active", "true");
-    expect(panel.parentElement).toHaveClass("flex");
+    expect(panel.parentElement).not.toHaveClass("invisible");
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -748,8 +737,7 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ selectedTerminalKey: termKey });
     expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel).toHaveAttribute("data-active", "false");
-    expect(panel.parentElement).toHaveClass("hidden");
+    expect(panel.parentElement).toHaveClass("invisible");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
