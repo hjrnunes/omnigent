@@ -73,6 +73,8 @@ try:
     from celpy.adapter import json_to_cel
     from celpy.celparser import CELParseError
     from celpy.evaluation import CELEvalError
+
+    from omnigent.policies.builtins._cel_short_circuit import ShortCircuitRunner
 except ImportError:
     celpy = None  # type: ignore[assignment]
 
@@ -93,7 +95,7 @@ _log = logging.getLogger(__name__)
 @lru_cache(maxsize=512)
 def _compiled_cel_program(expression: str):
     assert celpy is not None, "celpy must be importable to compile CEL expressions"
-    env = celpy.Environment()
+    env = celpy.Environment(runner_class=ShortCircuitRunner)
     ast = env.compile(expression)
     return env.program(ast)
 
