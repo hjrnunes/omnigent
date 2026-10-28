@@ -27,10 +27,6 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
-vi.mock("@/hooks/useSideChatSettingsSupport", () => ({
-  useSideChatSettingsSupport: vi.fn(() => false),
-}));
-
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,

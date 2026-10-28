@@ -22,7 +22,7 @@ from tests.e2e_ui.messages.test_native_codex_render_parity import (
     _wait_terminal_connected,
 )
 
-from .test_side_chat_entrypoints import _ASSISTANT, _items, _send_parent
+from .test_side_chat_entrypoints import _ASSISTANT, _items, _send_parent, _start_side_chat
 
 
 @pytest.mark.nightly
@@ -39,7 +39,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     mock_llm_server_url: str,
     mobile: bool,
 ) -> None:
-    """Native forks inherit context, isolate follow-ups, and leave the parent usable."""
+    """Existing native forks change model/effort on follow-ups without changing the parent."""
     base_url, session_id = native_codex_mock_session
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
@@ -81,34 +81,17 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     assert capabilities.status_code == 200, capabilities.text
     assert capabilities.json() == {"settings": True}, capabilities.text
 
-    page.get_by_test_id("composer-attach").click()
-    page.get_by_role("menuitem", name="Start a new side chat").click()
     pane = page.locator(".side-chat-backdrop")
-    settings = pane.get_by_role("button", name="Side chat model and effort")
-    settings.click()
-    page.get_by_test_id("side-chat-model-edit").click()
-    option = page.locator('[data-model-id$="gpt-6-sol"]')
-    selected_model = option.get_attribute("data-model-id")
-    assert selected_model
-    option.click()
-    page.locator('[data-effort-level="high"]').click()
-    page.keyboard.press("Escape")
-    page.get_by_test_id("side-chat-input").fill(question)
-    if not mobile:
-        # Lose the response after the real fork exists; retry must recover that child.
-        def lose_creation_response(route):
-            response = route.fetch()
-            assert response.ok, response.text()
-            route.abort("failed")
-
-        page.route("**/side_chats/*", lose_creation_response, times=1)
+    if mobile:
+        _start_side_chat(page, "slash", question)
+    else:
+        open_right_rail(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        rail.get_by_role("button", name="Open new", exact=True).click()
+        page.get_by_role("menuitem", name="Side chat", exact=True).click()
+        expect(pane.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
+        page.get_by_test_id("side-chat-input").fill(question)
         page.get_by_test_id("side-chat-send").click()
-        expect(
-            page.get_by_text("Couldn't start a side chat for this session.", exact=True)
-        ).to_be_visible()
-        expect(page.get_by_test_id("side-chat-input")).to_have_value(question)
-        expect(page.get_by_test_id("side-chat-send")).to_be_enabled()
-    page.get_by_test_id("side-chat-send").click()
     expect(pane.locator(_ASSISTANT).filter(has_text="First native side answer.")).to_be_visible(
         timeout=60_000
     )
@@ -129,8 +112,6 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     child_response.raise_for_status()
     parent, child = parent_response.json(), child_response.json()
     assert child["runner_id"] == parent["runner_id"]
-    assert child["model_override"] == selected_model
-    assert child["reasoning_effort"] == "high"
     first_requests = [
         request
         for request in get_mock_requests(mock_llm_server_url)
@@ -141,10 +122,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
         )
     ]
     assert first_requests
-    assert {
-        (request["model"], request.get("reasoning", {}).get("effort"))
-        for request in first_requests
-    } == {(selected_model, "high")}
+    assert {request["model"] for request in first_requests} == {"gpt-4o"}
     child_thread_id = child["labels"]["omnigent.codex_native.subagent_thread_id"]
     assert child_thread_id
     assert child_thread_id != parent["external_session_id"]
@@ -154,8 +132,11 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     expect(settings).to_be_visible(timeout=30_000)
     settings.click()
     page.get_by_test_id("side-chat-model-edit").click()
+    option = page.locator('[data-model-id$="gpt-6-sol"]')
+    selected_model = option.get_attribute("data-model-id")
+    assert selected_model and selected_model != first_requests[0]["model"]
     with page.expect_response(f"**/v1/sessions/{child_id}") as picked_model:
-        page.locator(f'[data-model-id="{selected_model}"]').click()
+        option.click()
     assert picked_model.value.ok
     with page.expect_response(f"**/v1/sessions/{child_id}") as picked_effort:
         page.locator('[data-effort-level="max"]').click()
@@ -235,24 +216,3 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     ]
     assert parent_requests
     assert {request["model"] for request in parent_requests} == {"gpt-4o"}
-
-    if not mobile:
-        # Other desktop entry points reach the same native draft controls.
-        open_right_rail(page)
-        rail = page.get_by_role("complementary", name="Workspace")
-        rail.get_by_role("button", name="Open new", exact=True).click()
-        page.get_by_role("menuitem", name="Side chat", exact=True).click()
-        expect(pane.get_by_role("button", name="Side chat model and effort")).to_be_visible()
-        page.get_by_role("button", name="Close Side chat 1", exact=True).click()
-        page.locator(_ASSISTANT).get_by_text(parent_reply, exact=True).select_text()
-        page.get_by_role("button", name="Ask in side chat", exact=True).click()
-        expect(pane.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
-        expect(pane.get_by_role("button", name="Side chat model and effort")).to_be_visible()
-        page.get_by_role("button", name="Close Side chat 1", exact=True).click()
-        page.get_by_placeholder("Send a message…").fill(f"/side {question}")
-        page.get_by_role("button", name="Send", exact=True).click()
-        expect(
-            pane.locator(_ASSISTANT).filter(has_text="First native side answer.")
-        ).to_be_visible(timeout=60_000)
-        expect(pane.get_by_role("button", name="Side chat model and effort")).to_be_visible()
-        page.get_by_role("button", name="Close Side chat 1", exact=True).click()

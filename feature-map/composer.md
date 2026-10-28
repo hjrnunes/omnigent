@@ -49,7 +49,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   and capability rules. Draft selections apply when the child is created;
   live selections update that child's session. A live Claude picker follows
   the runner's reported model if a requested change is refused. Native Codex
-  side-thread selections apply to the next turn without changing the parent;
+  side chats show these controls after creation; selections apply to the next
+  turn without changing the parent;
   older runners hide these controls.
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
@@ -344,7 +345,9 @@ collapsed labels.
 
 **Side chat** (from an existing session): choose **+ → Start a new side chat**
 in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
-text. Open the side-chat model pill to choose model/effort before or after its
+text. For native Codex, send the first message before using its model/effort
+pill; later selections apply on the next turn. For other supported harnesses,
+open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
 for draft persistence and parent-isolation checks. The microphone beside
 **Ask a side question...** starts dictation.

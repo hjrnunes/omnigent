@@ -1596,58 +1596,6 @@ def register_core_routes(
         client = await _get_runner_client(conv.id, runner_router, conversation=conv)
         return {"settings": await _runner_supports_side_chat_settings(client)}
 
-    @router.put("/sessions/{session_id}/side_chats/{request_id}")
-    async def create_native_side_chat(
-        request: Request, session_id: str, request_id: str
-    ) -> dict[str, str]:
-        """Create an empty native fork; normal child PATCH/events handle settings and sends."""
-        from uuid import UUID
-
-        from omnigent.server.routes._sessions.orchestration import _codex_side_chat_runner_error
-
-        try:
-            request_id = str(UUID(request_id))
-        except ValueError as exc:
-            raise OmnigentError(
-                "Invalid side-chat creation id", code=ErrorCode.INVALID_INPUT
-            ) from exc
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
-        conv = access.conversation or await asyncio.to_thread(
-            conversation_store.get_conversation, session_id
-        )
-        if conv is None:
-            raise _session_not_found()
-        if conv.labels.get("omnigent.wrapper") != "codex-native-ui":
-            raise OmnigentError(
-                "Native side chats require a Codex parent", code=ErrorCode.INVALID_INPUT
-            )
-        client = await _get_runner_client(conv.id, runner_router, conversation=conv)
-        if not await _runner_supports_side_chat_settings(client):
-            raise OmnigentError(
-                "Update the host and restart the session to create a native side chat.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-        assert client is not None
-        response = await client.put(
-            f"/v1/sessions/{session_id}/side_chats/{request_id}", timeout=25
-        )
-        if response.status_code >= 400:
-            raise _codex_side_chat_runner_error(response)
-        child_id = response.json().get("child_session_id")
-        child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
-        if (
-            child is None
-            or child.parent_conversation_id != session_id
-            or not is_side_chat_child(child.labels)
-        ):
-            raise OmnigentError(
-                "Runner returned no side-chat child", code=ErrorCode.RUNNER_UNAVAILABLE
-            )
-        return {"child_session_id": child.id}
-
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(

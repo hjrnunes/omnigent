@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -164,7 +163,8 @@ async def fork_ephemeral_side_thread(
     settings = settings or {}
     if settings.get("model"):
         params["model"] = settings["model"]
-    # thread/fork has no effort field, so set it as a fork config override.
+    # thread/fork has no effort field; a later thread/settings/update would drop
+    # the fork's developer instructions, so set it as a fork config override.
     if settings.get("effort"):
         params["config"] = {"model_reasoning_effort": settings["effort"]}
     response = await codex_client.request("thread/fork", params)
@@ -183,10 +183,10 @@ class SideChatEffortUnavailable(ValueError):
 async def _resolve_side_effort(
     codex_client: CodexAppServerClient, thread_id: str, effort: str | None, model: str | None
 ) -> str:
-    """Resolve a reset against the live thread when no model override was saved."""
+    """Resolve effort against the live thread when no model override was saved."""
     from omnigent.harnesses.codex_native.app_server import resolve_codex_effort_for_model
 
-    if effort is None and model is None:
+    if model is None:
         response = await codex_client.request(
             "thread/read", {"threadId": thread_id, "includeTurns": False}
         )
@@ -410,26 +410,25 @@ async def register_side_fork_child(
     child_thread_id = thread.get("id")
     if not isinstance(child_thread_id, str) or not child_thread_id:
         return None
-    async with forwarder_state.side_chat_registration_lock:
-        existing = forwarder_state.session_for_child_thread(child_thread_id)
-        if existing is not None:
-            return existing
+    existing = forwarder_state.session_for_child_thread(child_thread_id)
+    if existing is not None:
+        return existing
 
-        # Reuse the whole sub-agent pipeline: it registers the child, maps the
-        # thread so _resolve_event_session routes its events to the child session,
-        # AND backfills the thread via thread/resume. Skipping the backfill leaves
-        # the side chat an empty session that never shows its answer.
-        from omnigent.harnesses.codex_native import forwarder as _fwd
+    # Reuse the whole sub-agent pipeline: it registers the child, maps the
+    # thread so _resolve_event_session routes its events to the child session,
+    # AND backfills the thread via thread/resume. Skipping the backfill leaves
+    # the side chat an empty session that never shows its answer.
+    from omnigent.harnesses.codex_native import forwarder as _fwd
 
-        await _fwd._ensure_child_session(
-            ap_client,
-            parent_session_id=parent_session_id,
-            parent_thread_id=parent_thread_id,
-            child_thread_id=child_thread_id,
-            item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME},
-            forwarder_state=forwarder_state,
-        )
-        return forwarder_state.session_for_child_thread(child_thread_id)
+    await _fwd._ensure_child_session(
+        ap_client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=parent_thread_id,
+        child_thread_id=child_thread_id,
+        item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME},
+        forwarder_state=forwarder_state,
+    )
+    return forwarder_state.session_for_child_thread(child_thread_id)
 
 
 def request_side_chat(bridge_dir: Path, question: str) -> None:
@@ -499,121 +498,3 @@ def discard_side_chat_request(path: Path) -> None:
 def _unlink_quietly(path: Path) -> None:
     with contextlib.suppress(OSError):
         path.unlink()
-
-
-def _write_creation(path: Path, record: _JsonObject, *, create: bool = False) -> None:
-    """Publish a complete bridge record; concurrent callers cannot replace a request."""
-    temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(json.dumps(record), encoding="utf-8")
-        if create:
-            with contextlib.suppress(FileExistsError):
-                os.link(temporary, path)
-        else:
-            temporary.replace(path)
-    finally:
-        _unlink_quietly(temporary)
-
-
-async def create_side_chat(bridge_dir: Path, request_id: str) -> str:
-    """Return the same child on retries, without sending a message to either thread.
-
-    Creation records live with the native bridge, outside session labels. The
-    long-lived forwarder owns the fork and records its result before replying.
-    """
-    request_id = str(uuid.UUID(request_id))
-    directory = bridge_dir / "side_chat_creations"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{request_id}.json"
-    await asyncio.to_thread(_write_creation, path, {"state": "pending"}, create=True)
-    deadline = asyncio.get_running_loop().time() + 20
-    while True:
-        record = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
-        if record.get("child_session_id"):
-            return str(record["child_session_id"])
-        if record.get("error"):
-            raise RuntimeError(record["error"])
-        if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("Side chat creation is still pending. Retry to recover this chat.")
-        await asyncio.sleep(0.1)
-
-
-async def drive_side_chat_creations(
-    codex_client: CodexAppServerClient,
-    ap_client: httpx.AsyncClient,
-    *,
-    bridge_dir: Path,
-    parent_session_id: str,
-    parent_thread_id: str,
-    forwarder_state: _CodexForwarderState,
-) -> None:
-    """Create empty native children, checkpointing the fork before server registration."""
-    for path in sorted((bridge_dir / "side_chat_creations").glob("*.json")):
-        try:
-            record = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
-            if record.get("child_session_id") or record.get("error"):
-                continue
-            if record["state"] == "forking":
-                # A lost native RPC result is ambiguous. Never fork again for this request.
-                record["error"] = "The Codex fork result was lost. Open a new side-chat tab."
-                await asyncio.to_thread(_write_creation, path, record)
-                continue
-            if record["state"] == "pending":
-                settings = await parent_side_chat_settings(codex_client, bridge_dir)
-                record.update(
-                    state="forking", settings=settings, parent_thread_id=parent_thread_id
-                )
-                await asyncio.to_thread(_write_creation, path, record)
-                try:
-                    thread_id = await fork_ephemeral_side_thread(
-                        codex_client, parent_thread_id, settings=settings
-                    )
-                    if thread_id is None:
-                        raise RuntimeError("Codex returned no side-chat thread.")
-                except Exception:
-                    record["error"] = (
-                        "Codex could not create the side chat. Open a new side-chat tab."
-                    )
-                    await asyncio.to_thread(_write_creation, path, record)
-                    _logger.warning("Codex side-chat creation failed", exc_info=True)
-                    continue
-                record.update(state="registering", thread_id=thread_id)
-                await asyncio.to_thread(_write_creation, path, record)
-            if record["parent_thread_id"] != parent_thread_id:
-                record["error"] = "The parent Codex thread changed. Open a new side-chat tab."
-                await asyncio.to_thread(_write_creation, path, record)
-                continue
-            child_id = await register_side_fork_child(
-                ap_client,
-                forwarder_state=forwarder_state,
-                parent_session_id=parent_session_id,
-                parent_thread_id=parent_thread_id,
-                event={
-                    "method": "thread/started",
-                    "params": {
-                        "thread": {
-                            "id": record["thread_id"],
-                            "ephemeral": True,
-                            "forkedFromId": parent_thread_id,
-                        }
-                    },
-                },
-            )
-            if child_id is None:
-                continue  # Registration retries the known thread; it never creates another fork.
-            settings = record["settings"]
-            response = await ap_client.patch(
-                f"/v1/sessions/{child_id}",
-                json={
-                    "silent": True,
-                    **({"model_override": settings["model"]} if "model" in settings else {}),
-                    **({"reasoning_effort": settings["effort"]} if "effort" in settings else {}),
-                },
-            )
-            response.raise_for_status()
-            record["child_session_id"] = child_id
-            await asyncio.to_thread(_write_creation, path, record)
-        except Exception:
-            _logger.warning(
-                "Codex side-chat registration will retry: %s", path.name, exc_info=True
-            )

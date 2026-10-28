@@ -1,4 +1,3 @@
-import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import type { FilePosition, OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
@@ -71,7 +70,7 @@ import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { ApiError, createSideChat, stopSession } from "@/lib/sessionsApi";
+import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import {
@@ -902,10 +901,6 @@ function WorkspacePanelImpl({
   // pair on, so a signal rekeys the OLDEST awaiting tab (FIFO). A single ref
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
-  const nativeSettingsSupported = useSideChatSettingsSupport(
-    conversationId,
-    usesNativeSideChatFork(sideChatHarness),
-  );
   const awaitingPendingIdsRef = useRef<string[]>([]);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
@@ -953,15 +948,15 @@ function WorkspacePanelImpl({
         onRightRailTabChange("sidechat");
       }
     : undefined;
-  // Create the child before sending. Stable draft IDs recover native forks
-  // after a lost response; old runners retain their plaintext /side path.
+  // First message sent in a pending side-chat tab: create the fork now. The
+  // pending tab stays put and is rekeyed to the real child once it arrives (via
+  // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
+  // forks in-process (its runner intercepts the `/side` message on the parent,
+  // kept prompt-cache-warm); every other harness forks server-side and reuses
+  // the parent's live runner. Rejects so the composer re-enables and keeps
+  // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    if (usesNativeSideChatFork(sideChatHarness) && !nativeSettingsSupported) {
-      const settings = useChatStore.getState().sideChatComposers[pendingId]?.settings;
-      if (settings && Object.keys(settings).length) {
-        toast.error("Update the host and restart the session to apply these side-chat settings.");
-        return Promise.reject(new Error("Side-chat settings unavailable"));
-      }
+    if (usesNativeSideChatFork(sideChatHarness)) {
       if (parentAgentId === null) return Promise.reject(new Error("no agent"));
       // The child arrives asynchronously via session_created with no id to pair
       // on, so queue this tab to be rekeyed FIFO. The question goes to the
@@ -991,7 +986,6 @@ function WorkspacePanelImpl({
     return createSideChat(
       conversationId,
       useChatStore.getState().sideChatComposers[pendingId]?.settings,
-      ...(usesNativeSideChatFork(sideChatHarness) ? [pendingId] : []),
     ).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
@@ -1007,9 +1001,7 @@ function WorkspacePanelImpl({
       (err) => {
         // The rail path had no failure feedback (unlike the composer entry
         // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error(
-          err instanceof ApiError ? err.message : "Couldn't start a side chat for this session.",
-        );
+        toast.error("Couldn't start a side chat for this session.");
         throw err;
       },
     );

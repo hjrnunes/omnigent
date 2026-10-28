@@ -8,14 +8,11 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
-import json
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import app_server as codex_app_server
@@ -218,6 +215,7 @@ async def test_fork_returns_none_when_response_has_no_thread_id() -> None:
         {"model": "gpt-6-sol", "effort": "max"},
         {"model": "gpt-6-sol", "reset_effort": True},
         {"reset_effort": True},
+        {"effort": "max"},
         {"model": "gpt-5.5", "effort": "max"},
     ],
 )
@@ -226,7 +224,7 @@ async def test_submit_side_turn_targets_child_thread(settings: dict[str, Any]) -
         {
             "turn/start": {"result": {"turn": {"id": "turn_1"}}},
             "model/list": _CATALOG,
-            "thread/read": {"result": {"thread": {"model": "gpt-6-sol"}}},
+            "thread/read": {"result": {"thread": {"model": "gpt-5.5"}}},
         }
     )
 
@@ -245,7 +243,7 @@ async def test_submit_side_turn_targets_child_thread(settings: dict[str, Any]) -
         "medium"
         if settings.get("reset_effort")
         else "xhigh"
-        if settings.get("model") == "gpt-5.5"
+        if settings.get("model") == "gpt-5.5" or settings == {"effort": "max"}
         else settings.get("effort")
     )
 
@@ -684,120 +682,3 @@ async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
     with pytest.raises(ValueError, match="capabilities unavailable"):
         await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
     assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]
-
-
-@pytest.mark.parametrize("lost_response", ["creation", "registration", "settings"])
-async def test_empty_side_chat_creation_recovers_the_same_child(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost_response: str
-) -> None:
-    from tests._helpers.polling import poll_until_async
-
-    request_id = str(uuid.uuid4())
-    codex = _FakeCodexClient(
-        {
-            "model/list": _CATALOG,
-            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
-        }
-    )
-    _write_parent_settings(tmp_path, "gpt-6-sol", "high")
-    state = fwd._CodexForwarderState()
-    register = AsyncMock(
-        side_effect=[None, "conv_side"] if lost_response == "registration" else ["conv_side"]
-    )
-    monkeypatch.setattr(fwd, "_register_child_session", register)
-    server = AsyncMock()
-    ok = httpx.Response(200, request=httpx.Request("PATCH", "http://server"))
-    server.patch.side_effect = (
-        [httpx.ReadTimeout("response lost"), ok] if lost_response == "settings" else [ok]
-    )
-    creation = asyncio.create_task(side_chat.create_side_chat(tmp_path, request_id))
-    path = tmp_path / "side_chat_creations" / f"{request_id}.json"
-    await poll_until_async(path.exists, timeout_s=5)
-    # Lose the caller before the fork completes. A retry still names the same request.
-    creation.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await creation
-
-    async def drain() -> None:
-        await side_chat.drive_side_chat_creations(
-            codex,
-            server,
-            bridge_dir=tmp_path,
-            parent_session_id="conv_parent",
-            parent_thread_id="thread_parent",
-            forwarder_state=state,
-        )
-
-    await drain()
-    await drain()
-    assert await side_chat.create_side_chat(tmp_path, request_id) == "conv_side"
-    assert await side_chat.create_side_chat(tmp_path, request_id) == "conv_side"
-    assert [method for method, _ in codex.calls if method != "model/list"] == ["thread/fork"]
-    assert server.patch.call_args.kwargs["json"] == {
-        "silent": True,
-        "model_override": "gpt-6-sol",
-        "reasoning_effort": "high",
-    }
-    assert json.loads(path.read_text())["child_session_id"] == "conv_side"
-
-
-async def test_ambiguous_native_fork_is_not_repeated(tmp_path: Path) -> None:
-    request_id = str(uuid.uuid4())
-    directory = tmp_path / "side_chat_creations"
-    directory.mkdir()
-    (directory / f"{request_id}.json").write_text(json.dumps({"state": "forking"}))
-    codex = _FakeCodexClient({})
-    await side_chat.drive_side_chat_creations(
-        codex,
-        AsyncMock(),
-        bridge_dir=tmp_path,
-        parent_session_id="parent",
-        parent_thread_id="thread",
-        forwarder_state=fwd._CodexForwarderState(),
-    )
-    with pytest.raises(RuntimeError, match="fork result was lost"):
-        await side_chat.create_side_chat(tmp_path, request_id)
-    assert codex.calls == []
-
-
-async def test_failed_child_registration_does_not_starve_other_creations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    directory = tmp_path / "side_chat_creations"
-    directory.mkdir()
-    for name in ("first", "second"):
-        (directory / f"{name}.json").write_text(
-            json.dumps(
-                {
-                    "state": "registering",
-                    "thread_id": name,
-                    "parent_thread_id": "parent",
-                    "settings": {},
-                }
-            )
-        )
-    monkeypatch.setattr(
-        side_chat,
-        "register_side_fork_child",
-        AsyncMock(
-            side_effect=[httpx.ReadTimeout("registration unavailable"), "second-child"],
-        ),
-    )
-    server = AsyncMock()
-    server.patch.return_value = httpx.Response(
-        200, request=httpx.Request("PATCH", "http://server")
-    )
-    codex = _FakeCodexClient({})
-    await side_chat.drive_side_chat_creations(
-        codex,
-        server,
-        bridge_dir=tmp_path,
-        parent_session_id="session",
-        parent_thread_id="parent",
-        forwarder_state=fwd._CodexForwarderState(),
-    )
-    assert "child_session_id" not in json.loads((directory / "first.json").read_text())
-    assert (
-        json.loads((directory / "second.json").read_text())["child_session_id"] == "second-child"
-    )
-    assert codex.calls == []

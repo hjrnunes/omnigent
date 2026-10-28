@@ -557,7 +557,6 @@ class _CodexForwarderState:
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
-    side_chat_registration_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     synced_item_keys: set[str] = field(default_factory=set)
@@ -2386,11 +2385,7 @@ async def supervise_forwarder(
         )
         side_chat_task = asyncio.create_task(
             _drive_side_chat_requests(
-                client,
-                ap_client=ap_client,
-                bridge_dir=bridge_dir,
-                target=target,
-                forwarder_state=forwarder_state,
+                client, ap_client=ap_client, bridge_dir=bridge_dir, target=target
             ),
             name="codex-native-forwarder-side-chat",
         )
@@ -2482,7 +2477,6 @@ async def _drive_side_chat_requests(
     ap_client: httpx.AsyncClient,
     bridge_dir: Path,
     target: _ForwarderTarget,
-    forwarder_state: _CodexForwarderState | None = None,
 ) -> None:
     """
     Fork the ``/side`` questions the executor recorded, on this connection.
@@ -2515,15 +2509,6 @@ async def _drive_side_chat_requests(
             # Only claim once the parent thread exists — a request read before
             # then can't fork, and consuming it would lose the question (#3).
             if parent_thread_id is not None:
-                if forwarder_state is not None:
-                    await side_chat.drive_side_chat_creations(
-                        codex_client,
-                        ap_client,
-                        bridge_dir=bridge_dir,
-                        parent_session_id=target.session_id,
-                        parent_thread_id=parent_thread_id,
-                        forwarder_state=forwarder_state,
-                    )
                 for request in side_chat.peek_side_chat_requests(bridge_dir):
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(

@@ -1937,13 +1937,6 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     )
     assert created.status_code == 202, created.text
     child_id = created.json()["child_session_id"]
-    from omnigent.runtime import session_stream
-
-    published: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        session_stream, "publish", lambda _session_id, event: published.append(event)
-    )
-
     child = (await client.get(f"/v1/sessions/{child_id}")).json()
     assert child["model_override"] == "gpt-5.5"
     assert child["reasoning_effort"] == ("high" if effort is not None else None)
@@ -2545,12 +2538,14 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     )
 
 
-@pytest.mark.parametrize("runner_status,supported", [(404, False), (200, False), (200, True)])
+@pytest.mark.parametrize(
+    "runner_status,supported", [(404, False), (200, False), (200, True), (None, False)]
+)
 async def test_side_chat_capabilities_probe_current_runner(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    runner_status: int,
+    runner_status: int | None,
     supported: bool,
 ) -> None:
     from unittest.mock import AsyncMock
@@ -2573,25 +2568,12 @@ async def test_side_chat_capabilities_probe_current_runner(
     assert child.status_code == 202, child.text
     child_id = child.json()["child_session_id"]
     runner = AsyncMock()
-    runner.get.return_value = httpx.Response(runner_status, json={"settings": supported})
-    runner.put.return_value = httpx.Response(200, json={"child_session_id": child_id})
+    if runner_status is None:
+        runner.get.side_effect = ConnectionError("tunnel closed")
+    else:
+        runner.get.return_value = httpx.Response(runner_status, json={"settings": supported})
     monkeypatch.setattr(routes_core, "_get_runner_client", AsyncMock(return_value=runner))
-    response = await client.get(f"/v1/sessions/{parent['id']}/side_chat_capabilities")
+    response = await client.get(f"/v1/sessions/{child_id}/side_chat_capabilities")
     assert response.status_code == 200
     assert response.json() == {"settings": supported}
     runner.get.assert_awaited_once_with("/v1/side_chat_capabilities")
-    path = f"/v1/sessions/{parent['id']}/side_chats/36d343b9-3d75-440a-8e02-9967dc43d78a"
-    for _ in range(2):
-        created = await client.put(path)
-        if supported:
-            assert created.status_code == 200, created.text
-            assert created.json() == {"child_session_id": child_id}
-        else:
-            assert created.status_code == 503, created.text
-            runner.put.assert_not_awaited()
-    if supported:
-        assert runner.put.call_count == 2
-        runner.put.assert_awaited_with(path, timeout=25)
-    assert store.list_items(child_id).data == []
-    invalid = await client.put(f"/v1/sessions/{parent['id']}/side_chats/not-a-uuid")
-    assert invalid.status_code == 400

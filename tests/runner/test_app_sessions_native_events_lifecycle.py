@@ -5463,11 +5463,11 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command,inherited",
-    [(False, False), (False, True), (True, False), ("create", False)],
-    ids=["follow-up", "inherited-default", "side-command", "empty-child"],
+    [(False, False), (False, True), (True, False)],
+    ids=["follow-up", "inherited-default", "side-command"],
 )
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool | str, inherited: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5512,16 +5512,6 @@ async def test_events_codex_side_chat_preserves_indentation(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
-        if command == "create":
-            create = AsyncMock(return_value="conv_side")
-            monkeypatch.setattr(side_chat, "create_side_chat", create)
-            request_id = "36d343b9-3d75-440a-8e02-9967dc43d78a"
-            response = await client.put(f"/v1/sessions/{conv_id}/side_chats/{request_id}")
-            assert response.status_code == 200, response.text
-            assert response.json() == {"child_session_id": "conv_side"}
-            create.assert_awaited_once_with(bridge_dir, request_id)
-            assert fake_client.requests == []
-            return
         response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
     assert response.status_code == 202, response.text
     if command:

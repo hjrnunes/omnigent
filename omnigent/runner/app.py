@@ -2331,7 +2331,7 @@ def create_runner_app(
 
     @app.get("/v1/side_chat_capabilities")
     async def side_chat_capabilities() -> dict[str, bool]:
-        """Advertise creation-only native forks and per-child settings."""
+        """Advertise support for per-child native side-chat settings."""
         return {"settings": True}
 
     @app.get("/health")
@@ -6405,32 +6405,6 @@ def create_runner_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    @app.put("/v1/sessions/{conversation_id}/side_chats/{request_id}")
-    async def create_native_side_chat(conversation_id: str, request_id: str) -> Response:
-        """Create an empty child on the forwarder's connection and recover repeated requests."""
-        from omnigent.harnesses.codex_native import side_chat
-
-        try:
-            request_id = str(uuid.UUID(request_id))
-        except ValueError:
-            return JSONResponse(status_code=400, content={"detail": "Invalid creation id."})
-        state = await _codex_native_bridge_state_for_session(
-            conversation_id, action="create side chat"
-        )
-        if state is None:
-            return JSONResponse(
-                status_code=503, content={"detail": "Parent Codex is not running."}
-            )
-        try:
-            child_id = await side_chat.create_side_chat(
-                await _codex_native_bridge_dir_for_session(conversation_id), request_id
-            )
-        except TimeoutError as exc:
-            return JSONResponse(status_code=503, content={"detail": str(exc)})
-        except RuntimeError as exc:
-            return JSONResponse(status_code=409, content={"detail": str(exc)})
-        return JSONResponse(content={"child_session_id": child_id})
 
     @app.post("/v1/sessions/{conversation_id}/events")
     async def post_session_events(

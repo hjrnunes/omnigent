@@ -393,7 +393,8 @@ session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
 and forwards slash text to the vendor TUI.
 
-**Side-chat settings:** open an unsent side chat from the Workspace menu,
+**Side-chat settings:** for harnesses other than native Codex, open an unsent
+side chat from the Workspace menu,
 composer add tray, or Ask in side chat. Before sending, open the model pill
 beside the microphone, open its configuration row, and select a model or effort.
 Switch tabs and return to confirm the draft keeps the choice. Send the first
@@ -407,11 +408,10 @@ If the native session's model list is empty, the picker uses the same host
 catalog as the main composer until the session's list arrives.
 Available choices follow the harness's capabilities; viewers and closed chats
 cannot change them. A failed start keeps the draft and selections for retry
-without changing the parent's settings. Native Codex shows these controls when
-both server and runner support them. It creates an empty ephemeral child, saves
-selections through the session API, then sends the first message normally.
-Retrying a lost creation response recovers the same child. A lost native fork
-RPC result is reported as an error rather than automatically forking again.
+without changing the parent's settings. Native Codex shows these controls only
+once the side-chat child exists, when both server and runner support them.
+The first message uses the existing native fork flow and inherited settings;
+later model and effort changes apply to the child's next turn.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -744,11 +744,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
   inherited context in the model request, isolated follow-ups, and a parent
-  that stays usable after closing its side chat. Desktop/mobile variants select
-  draft model and effort and change follow-up effort; scripted provider requests
-  verify child-only application. The desktop scenario drops the creation HTTP
-  response after the fork succeeds and verifies that retry uses the same child,
-  then exercises the Workspace menu, text selection, and `/side` entry points.
+  that stays usable after closing its side chat. Desktop/mobile variants create
+  a side chat through the Workspace menu or `/side`, then change its model and
+  effort before a follow-up. Scripted provider requests verify the actual model
+  switch, inherited context, effort reset and unchanged parent settings.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,

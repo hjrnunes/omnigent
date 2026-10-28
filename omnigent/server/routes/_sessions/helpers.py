@@ -5737,7 +5737,7 @@ async def _runner_supports_side_chat_settings(client: httpx.AsyncClient | None) 
         response = await asyncio.wait_for(client.get("/v1/side_chat_capabilities"), timeout=3)
         payload = response.json() if response.status_code == 200 else None
         return isinstance(payload, dict) and payload.get("settings") is True
-    except (httpx.HTTPError, TimeoutError, ValueError):
+    except (httpx.HTTPError, ConnectionError, TimeoutError, ValueError):
         return False
 
 

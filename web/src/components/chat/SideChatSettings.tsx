@@ -54,13 +54,15 @@ export function SideChatSettings({
   const queryClient = useQueryClient();
   const state = useConversationEntryState(session.id);
   const nativeSide = session.labels?.["omnigent.codex_native.agent_nickname"] === "Side chat";
-  const settingsSupported = useSideChatSettingsSupport(
-    session.id,
-    nativeSide ||
-      session.harness === "codex-native" ||
-      session.labels?.["omnigent.wrapper"] === "codex-native-ui",
-  );
   const sourceId = session.parentSessionId ?? parentIdFromLabels(session.labels);
+  const nativeSession =
+    nativeSide ||
+    session.harness === "codex-native" ||
+    session.labels?.["omnigent.wrapper"] === "codex-native-ui";
+  const settingsSupported = useSideChatSettingsSupport(
+    nativeSide && !draft ? (sourceId ?? session.id) : null,
+    nativeSession,
+  );
   const { session: parent } = useSession(sourceId);
   const parentState = useConversationEntryState(nativeSide ? sourceId : null);
   const families = useHarnessEffortFamilies();
@@ -133,7 +135,12 @@ export function SideChatSettings({
   const supportsEffort = shouldShowEffortPicker(capabilities, family);
   const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
   const showModels = kind !== null && options.length > 0;
-  if (!settingsSupported || (!showModels && efforts.length === 0)) return null;
+  if (
+    !settingsSupported ||
+    (nativeSession && (!nativeSide || draft)) ||
+    (!showModels && efforts.length === 0)
+  )
+    return null;
   const disabled =
     saving ||
     draft?.disabled ||

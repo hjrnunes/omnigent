@@ -500,6 +500,23 @@ it.each([
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
 
+it.each([false, true])("hides native settings before a child exists (draft=%s)", (draft) => {
+  render(
+    <QueryClientProvider client={cache}>
+      <SideChatSettings
+        session={{
+          ...parent,
+          harness: "codex-native",
+          labels: { "omnigent.wrapper": "codex-native-ui" },
+        }}
+        draft={draft ? { onChange: vi.fn(), disabled: false } : undefined}
+      />
+    </QueryClientProvider>,
+  );
+  expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
+  expect(useSideChatSettingsSupport).toHaveBeenCalledWith(null, true);
+});
+
 it.each([false, true])(
   "preserves unspecified effort when selecting a model (draft=%s)",
   async (draft) => {
@@ -629,4 +646,5 @@ it("uses the parent catalog while targeting a native Codex side thread", async (
     }),
   );
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
+  expect(useSideChatSettingsSupport).toHaveBeenCalledWith("parent", true);
 });

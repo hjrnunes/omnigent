@@ -29,3 +29,14 @@ it.each([
   expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/parent/side_chat_capabilities");
   client.clear();
 });
+
+it.each([true, false])("does not probe without a session (native=%s)", (native) => {
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result } = renderHook(() => useSideChatSettingsSupport(null, native), { wrapper });
+  expect(result.current).toBe(!native);
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  client.clear();
+});

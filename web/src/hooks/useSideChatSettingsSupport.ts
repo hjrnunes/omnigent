@@ -6,7 +6,6 @@ export function useSideChatSettingsSupport(sessionId: string | null, native: boo
     queryKey: ["side-chat-settings-support", sessionId],
     enabled: native && sessionId !== null,
     staleTime: 30_000,
-    refetchInterval: (query) => (query.state.data === true ? false : 10_000),
     queryFn: async () => {
       try {
         const response = await authenticatedFetch(
