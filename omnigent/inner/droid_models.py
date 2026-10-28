@@ -14,6 +14,7 @@ whether the harness can run a turn.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -144,8 +145,9 @@ def parse_droid_session_models(result: object) -> DroidModelListing:
 def list_droid_cli_model_options(*, timeout_s: float = _PROBE_TIMEOUT_S) -> DroidModelListing:
     """Probe the installed droid CLI for its advertised model list.
 
-    Resolves the binary the same way the executor does (``OMNIGENT_DROID_PATH``,
-    then the deprecated ``HARNESS_DROID_PATH``, then ``PATH``), runs the
+    Resolves the binary the way the executor ends up using it
+    (``OMNIGENT_DROID_PATH``, then the deprecated ``HARNESS_DROID_PATH``, then
+    the ``harness.droid.command`` config override, then ``PATH``), runs the
     initialize + ``session/new`` handshake in a scratch directory, and shuts
     droid down. Successful non-empty listings are cached for
     :data:`_CACHE_TTL_S`; failures are not cached, so installing or fixing the
@@ -154,7 +156,7 @@ def list_droid_cli_model_options(*, timeout_s: float = _PROBE_TIMEOUT_S) -> Droi
     :param timeout_s: Total budget for the handshake, in seconds.
     :returns: The live listing, or an empty one on any failure.
     """
-    command = resolve_harness_path("droid") or "droid"
+    command = _resolve_command()
     cached = _cached_listing(command)
     if cached is not None:
         return cached
@@ -166,6 +168,24 @@ def list_droid_cli_model_options(*, timeout_s: float = _PROBE_TIMEOUT_S) -> Droi
     if listing.models:
         _store_listing(command, listing)
     return listing
+
+
+def _resolve_command() -> str:
+    """Return the droid binary to probe, honoring env then config then PATH.
+
+    The executor's spawn env carries the config override as
+    ``OMNIGENT_DROID_PATH``; probes that run outside that env (catalog, host
+    pre-launch picker) read the config directly so both see the same binary.
+
+    :returns: An absolute path from the overrides, or ``"droid"`` for PATH.
+    """
+    resolved = resolve_harness_path("droid")
+    if resolved:
+        return resolved
+    from omnigent.harness_startup_config import config_harness_path_override
+    from omnigent.onboarding.provider_config import load_config
+
+    return config_harness_path_override("droid", load_config()) or "droid"
 
 
 def clear_droid_model_cache() -> None:
@@ -340,7 +360,5 @@ def _shutdown(proc: subprocess.Popen[str]) -> None:
                 _logger.warning("droid model probe process %s did not exit", proc.pid)
     for stream in (proc.stdin, proc.stdout):
         if stream is not None:
-            try:
+            with contextlib.suppress(OSError):
                 stream.close()
-            except OSError:
-                pass

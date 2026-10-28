@@ -283,6 +283,33 @@ def test_list_uses_the_executor_path_override(
     assert any(line.startswith("ARGV ") for line in _log_lines(tmp_path))
 
 
+def test_list_uses_the_config_command_override(
+    fake_droid: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``harness.droid.command`` selects the binary when no env override is set.
+
+    The catalog and host probes run outside the droid spawn env, so they must
+    read the config override themselves to stay in step with the executor.
+
+    :param fake_droid: The fake CLI the config points at.
+    :param tmp_path: Per-test temp dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        f"harness:\n  droid:\n    command: {fake_droid}\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("OMNIGENT_DROID_PATH", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    _install_session_new_reply(tmp_path, CAPTURED_SESSION_NEW_RESULT, monkeypatch)
+
+    listing = list_droid_cli_model_options()
+
+    assert listing.current_model_id == "gpt-6-luna"
+    assert any(line.startswith("ARGV ") for line in _log_lines(tmp_path))
+
+
 def test_list_returns_empty_when_the_binary_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
