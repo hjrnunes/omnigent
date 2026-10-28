@@ -705,6 +705,9 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         system_prompt_mode = data.get("system_prompt_mode")
         if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
             raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
+        autonomy = data.get("autonomy")
+        if "autonomy" in data and not isinstance(autonomy, str):
+            raise ValueError("executor.autonomy must be a string")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
@@ -712,6 +715,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             auth=auth,
             context_files=context_files,
             system_prompt_mode=system_prompt_mode,
+            autonomy=autonomy,
         )
     return None
 

@@ -14,23 +14,27 @@ Omnigent's TOOL_CALL policy + ``ctx.elicit`` bridges the
 
 Auth is Droid's own configuration (a ``FACTORY_API_KEY`` env var, or the
 interactive ``droid`` device-pairing login); Omnigent stores no Droid
-credential. A spec ``executor.model`` is forwarded as ``droid exec -m <model>``.
+credential. A spec ``executor.model`` is applied to the ACP session via
+``session/set_model``.
 
 Env vars read at startup:
 
-- ``HARNESS_DROID_MODEL``: optional model id (``droid exec -m``). ``None`` uses
-  Droid's default.
+- ``HARNESS_DROID_MODEL``: optional model id, applied to the ACP session via
+  ``session/set_model``. ``None`` uses Droid's settings-file model.
 - ``HARNESS_DROID_CWD``: working directory for the droid subprocess. ``None``
   falls back to ``OMNIGENT_RUNNER_WORKSPACE`` then the inherited cwd.
 - ``OMNIGENT_DROID_PATH``: absolute path to a ``droid`` CLI binary.
   ``None`` searches ``PATH``. (Legacy ``HARNESS_DROID_PATH`` still honored,
   deprecated.)
-- ``HARNESS_DROID_AUTO``: Droid autonomy tier (``low`` / ``medium`` / ``high``).
-  ``None`` defaults to ``high`` (enables Droid's write/execute tools, which are
-  blocked in its read-only default; individual calls stay gated via ACP
-  permission → policy/elicitation).
-- ``HARNESS_DROID_REASONING``: optional reasoning-effort level (``droid exec
-  -r``). ``None`` uses Droid's per-model default.
+- ``HARNESS_DROID_AUTO``: autonomy tier applied via
+  ``session/set_config_option``; one of the ``autonomy_level`` values Droid
+  advertises (``normal`` / ``spec`` / ``auto-low`` / ``auto-medium`` /
+  ``auto-high``). Unset or ``inherit`` sends nothing and keeps Droid's
+  ``~/.factory/settings.json`` level. Only calls Droid gates reach Omnigent's
+  policy; whatever the tier auto-approves runs without it.
+- ``HARNESS_DROID_REASONING``: optional reasoning-effort level, carried for
+  harness parity. The ACP session reads ``reasoning_effort`` from Droid's own
+  settings, so this executor does not forward it.
 - ``HARNESS_DROID_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
 """

@@ -209,6 +209,11 @@ def validate_omnigent_executor(
                 "instructions",
                 "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
             )
+    if "autonomy" in spec.executor.config:
+        if not isinstance(spec.executor.config["autonomy"], str):
+            result.add("executor.config.autonomy", "must be a string")
+        if harness not in ("droid",):
+            result.add("executor.config.autonomy", "only supported with harness 'droid'")
     if not harness:
         result.add(
             "executor.config.harness",

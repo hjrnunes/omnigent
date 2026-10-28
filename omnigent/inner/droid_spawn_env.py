@@ -25,7 +25,14 @@ def build_spawn_env(
     """Map an agent spec onto the ``HARNESS_DROID_*`` vars the wrap reads.
 
     Droid owns its own auth (``FACTORY_API_KEY`` / ``droid login``), so this
-    wires no credential — only the model, workspace and os_env/sandbox spec.
+    wires no credential — only the model, autonomy, workspace and os_env/sandbox
+    spec.
+
+    ``executor.autonomy`` (spelled ``executor.config.autonomy`` in a bundle)
+    becomes ``HARNESS_DROID_AUTO``; the wrap applies it to the ACP session via
+    ``session/set_config_option``. Leave it unset or ``inherit`` to keep Droid's
+    ``~/.factory/settings.json`` level, which means actions that level
+    auto-approves run without Omnigent's policy seeing them.
 
     :param spec: The agent spec.
     :param cwd: Session workspace; ``None`` lets the wrap fall back to
@@ -44,6 +51,9 @@ def build_spawn_env(
     model = _resolve_spec_model(spec)
     if model:
         env["HARNESS_DROID_MODEL"] = model
+    autonomy = (spec.executor.config or {}).get("autonomy")
+    if isinstance(autonomy, str) and autonomy.strip() and autonomy.strip() != "inherit":
+        env["HARNESS_DROID_AUTO"] = autonomy.strip()
     if cwd is not None:
         env["HARNESS_DROID_CWD"] = str(cwd)
     os_env_payload = _serialize_os_env(spec.os_env)

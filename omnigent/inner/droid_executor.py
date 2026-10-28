@@ -13,12 +13,13 @@ every per-turn ``session/update`` shape below was reconciled against the wire):
   1. ``initialize``   — handshake; learn ``agentCapabilities`` (image support).
      Droid returns ``protocolVersion: 1`` and advertises ``factory-api-key``
      (``FACTORY_API_KEY``) auth.
-  2. ``session/new``  — create a session; Droid returns the ``sessionId`` (plus
-     ``models`` / ``modes`` / ``configOptions`` blocks we don't need). The
-     session always starts in the ``normal`` (Auto-Off) mode with model
-     ``claude-sonnet-5`` — the ``--auto`` / ``-m`` / ``-r`` CLI flags are
-     *ignored* in acp mode (see :meth:`_launch_argv`). The configured model is
-     applied via ``session/set_model`` right after ``session/new``.
+  2. ``session/new``  — create a session; Droid returns the ``sessionId`` plus
+     ``models`` / ``modes`` / ``configOptions``. The CLI's ``--auto`` / ``-m`` /
+     ``-r`` flags are *ignored* in acp mode (see :meth:`_launch_argv`), so the
+     session boots on Droid's own settings and both overrides go over the wire
+     right after ``session/new``: the configured autonomy tier via
+     ``session/set_config_option`` and the configured model via
+     ``session/set_model``. Both are verified and fail the session loudly.
   3. ``session/prompt`` — send a user turn; consume streaming ``session/update``
      notifications (``agent_message_chunk`` text, ``agent_thought_chunk``
      reasoning, ``tool_call`` / ``tool_call_update``) and answer any
@@ -28,10 +29,14 @@ every per-turn ``session/update`` shape below was reconciled against the wire):
      ``session/update``), so usage surfaces as ``None``.
   4. Re-use the same ``sessionId`` for subsequent turns.
 
-Autonomy note: because the session runs in ``normal`` mode (reads auto-approved;
-writes/executes gated), every write/execute tool call arrives as a
-``session/request_permission`` — which is exactly what routes it through
-Omnigent's TOOL_CALL policy + human-consent elicitation. Droid also does *not*
+Autonomy note: which tool actions Droid runs without confirmation is Droid's own
+autonomy level (``normal`` / ``spec`` / ``auto-low`` / ``auto-medium`` /
+``auto-high`` as advertised in ``session/new`` ``configOptions``). With no spec
+setting, the session uses the level from Droid's settings file. Only calls Droid
+gates arrive as a ``session/request_permission``, which is what routes them
+through Omnigent's TOOL_CALL policy + human-consent elicitation — actions a
+higher tier auto-approves **never reach Omnigent's policy**, so a spec that must
+see every write has to pin ``executor.autonomy: normal``. Droid also does *not*
 use ACP ``fs/*`` delegation (it reads/writes with its own internal tools even
 when we advertise ``clientCapabilities.fs``), so file confinement rests on the
 process-level sandbox, not fs delegation.
@@ -45,8 +50,9 @@ them.
 
 Auth is Droid's own configuration: a ``FACTORY_API_KEY`` env var (or the
 interactive ``droid`` device-pairing login). Omnigent stores no Droid
-credential — this is an OWN_AUTH harness. A spec ``executor.model`` is forwarded
-as ``droid exec -m <model>``.
+credential — this is an OWN_AUTH harness. A spec ``executor.model`` and
+``executor.autonomy`` are applied to the ACP session (``session/set_model`` /
+``session/set_config_option``), not as CLI flags.
 
 Requirements:
     The ``droid`` CLI (Factory CLI) must be installed and on PATH
@@ -107,6 +113,19 @@ class _AcpRequestError(Exception):
         self.message = message
 
 
+def _acp_error_message(reply: dict[str, Any]) -> str:  # type: ignore[explicit-any]
+    """Flatten an ACP error reply into droid's message text.
+
+    :param reply: A JSON-RPC response carrying an ``error`` member, e.g.
+        ``{"error": {"code": -32602, "message": "Invalid params: Model not recognized"}}``.
+    :returns: The agent's message, or the raw error when it is not an object.
+    """
+    error = reply.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message", error))
+    return str(error)
+
+
 def _looks_like_missing_file(message: str) -> bool:
     """Heuristic: does an os_env error message indicate a missing path?
 
@@ -139,6 +158,12 @@ _AGENT_NOTIFICATION_SESSION_CANCEL = "session/cancel"
 # Request sent *to* the agent to select the session model (VERIFIED live: droid
 # accepts ``{sessionId, modelId}`` and the model config option flips to it).
 _AGENT_METHOD_SESSION_SET_MODEL = "session/set_model"
+
+# Request sent *to* the agent to change one session config option. VERIFIED live
+# (droid 0.251.0): the reply repeats the full ``configOptions`` list with the new
+# ``currentValue`` and droid emits no ``config_option_update`` notification, so
+# the reply is the only echo to verify against.
+_AGENT_METHOD_SESSION_SET_CONFIG_OPTION = "session/set_config_option"
 
 # Server-initiated request methods (agent → client).
 _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
@@ -174,16 +199,16 @@ _INIT_TIMEOUT_SECONDS = 120.0
 # ACP protocol version this executor targets (Droid 0.164.0 → 1, VERIFIED).
 _PROTOCOL_VERSION = 1
 
-# Default Droid autonomy tier, passed as ``--auto`` and overridable via
-# ``HARNESS_DROID_AUTO``. VERIFIED live: the ``--auto`` CLI flag is IGNORED in
-# acp mode — the session always starts in ``normal`` (Auto-Off) regardless, so
-# reads are auto-approved and every write/execute arrives as a
-# ``session/request_permission`` that we route through policy/elicitation. That
-# is exactly the gating Omnigent wants; write/execute tools are NOT blocked in
-# normal mode (they run once approved). The flag is kept (harmless, ignored) so
-# a future droid that honors it would raise autonomy — but note that ``high``
-# would auto-approve and *bypass* the elicitation gate, so normal is preferable.
-_DEFAULT_AUTO = "high"
+# ``session/new`` config option that carries droid's autonomy tier. VERIFIED
+# live (0.251.0): the entry is keyed ``id`` and its ``options`` list holds
+# ``{value, name}`` pairs — ``normal`` (Auto off), ``spec``, ``auto-low``,
+# ``auto-medium``, ``auto-high``. The starting value comes from
+# ``sessionDefaultSettings.autonomyMode`` in ``~/.factory/settings.json``.
+_AUTONOMY_CONFIG_ID = "autonomy_level"
+
+# Spec value meaning "keep whatever droid's settings file selects": no
+# ``session/set_config_option`` is sent at all.
+_AUTONOMY_INHERIT = "inherit"
 
 
 def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
@@ -252,16 +277,18 @@ class DroidExecutor(Executor):
             ``"none"``, the whole ``droid`` process tree is wrapped in the
             platform sandbox (bwrap/seatbelt) at spawn — see
             :meth:`_sandbox_launch_path`.
-        :param model: Optional model id, forwarded as ``droid exec -m <model>``
-            (else Droid's default, ``claude-opus-4-8``).
+        :param model: Optional model id applied to the session via
+            ``session/set_model`` (else droid's own default from its settings).
         :param droid_path: Absolute path to the droid CLI binary. Defaults to
             ``"droid"`` (PATH lookup).
-        :param auto: Droid autonomy tier (``low`` / ``medium`` / ``high``),
-            passed as ``--auto``. Defaults to :data:`_DEFAULT_AUTO`.
-        :param reasoning: Optional reasoning-effort level, forwarded as
-            ``droid exec -r <level>`` (``off`` / ``low`` / ``medium`` / ``high``
-            / ``xhigh`` / ``max``; per-model). ``None`` uses Droid's per-model
-            default.
+        :param auto: Autonomy tier applied to the session via
+            ``session/set_config_option``; must be one of the ``autonomy_level``
+            values droid advertises in ``session/new`` (``normal``, ``spec``,
+            ``auto-low``, ``auto-medium``, ``auto-high``). ``None`` / ``"inherit"``
+            leaves droid's settings-file level in place.
+        :param reasoning: Optional reasoning-effort level carried for harness
+            parity. This executor does not forward it: the ACP session reads
+            ``reasoning_effort`` from droid's own settings.
         """
         self._cwd = cwd or os.getcwd()
         self._os_env = os_env
@@ -277,7 +304,9 @@ class DroidExecutor(Executor):
         self._os_environment: OSEnvironment | None = None
         self._model = model
         self._droid_path = droid_path or "droid"
-        self._auto = (auto or _DEFAULT_AUTO).strip() or _DEFAULT_AUTO
+        auto_value = (auto or "").strip()
+        # ``"inherit"`` and unset are the same thing: droid keeps its settings-file level.
+        self._auto = None if auto_value in ("", _AUTONOMY_INHERIT) else auto_value
         self._reasoning = reasoning
 
         self._proc: asyncio.subprocess.Process | None = None  # type: ignore[name-defined]
@@ -292,6 +321,9 @@ class DroidExecutor(Executor):
         # Populated from session/new; drives the web model picker.
         self._available_models: list[dict[str, Any]] = []  # type: ignore[explicit-any]
         self._current_model_id: str | None = None
+        # ``session/new`` / ``session/set_config_option`` ``configOptions``, used
+        # to validate and verify the autonomy tier we ask for.
+        self._config_options: list[dict[str, Any]] = []  # type: ignore[explicit-any]
         # Last model we switched to via session/set_model, so a repeat pick is
         # a no-op and the picker reports what the session actually runs on.
         self._applied_model: str | None = None
@@ -322,24 +354,13 @@ class DroidExecutor(Executor):
         """Build the ``droid exec`` argument vector (after argv[0]).
 
         ``--output-format acp`` selects the ACP JSON-RPC mode (VERIFIED). The
-        autonomy / model / reasoning flags are accepted at launch but VERIFIED
-        live to be *ignored* by the acp session: ``session/new`` always reports
-        ``autonomy_level=normal``, ``model=claude-sonnet-5``,
-        ``reasoning_effort=max`` regardless of ``--auto`` / ``-m`` / ``-r``. The
-        configured model is instead applied over the wire via
-        ``session/set_model`` after ``session/new`` (see :meth:`_ensure_session`).
-        Reasoning effort has no working acp setter in 0.164.0, so ``-r`` stays a
-        no-op and the model's default reasoning effort is used. The flags are
-        left on argv (harmless) for forward-compat / non-acp parity.
+        autonomy / model / reasoning flags are *ignored* by the acp session:
+        ``session/new`` reports droid's settings-file values regardless of
+        ``--auto`` / ``-m`` / ``-r``, so those flags are not passed at all. The
+        model and autonomy are applied over the wire after ``session/new``
+        instead (see :meth:`_apply_model` / :meth:`_apply_autonomy`).
         """
-        argv: list[str] = ["exec", "--output-format", "acp", "--cwd", self._cwd]
-        if self._auto:
-            argv.extend(["--auto", self._auto])
-        if self._model:
-            argv.extend(["-m", self._model])
-        if self._reasoning:
-            argv.extend(["-r", self._reasoning])
-        return argv
+        return ["exec", "--output-format", "acp", "--cwd", self._cwd]
 
     async def _start_process(self) -> None:
         """Start ``droid exec --output-format acp`` as an asyncio subprocess.
@@ -560,10 +581,15 @@ class DroidExecutor(Executor):
 
         Sends only ``cwd`` + ``mcpServers`` and reads back ``sessionId`` (VERIFIED
         live: droid returns ``result.sessionId`` alongside ``models`` / ``modes``
-        / ``configOptions`` blocks we don't consume). When a model is configured,
-        applies it via ``session/set_model`` — the ``-m`` CLI flag is ignored in
-        acp mode, so this over-the-wire select is the only thing that takes
-        effect (VERIFIED live).
+        / ``configOptions``). A configured autonomy tier and model are then
+        applied over the wire — the ``--auto`` / ``-m`` CLI flags are ignored in
+        acp mode, so these setters are the only thing that takes effect
+        (VERIFIED live). Both are verified before the id is cached, so a rejected
+        value fails the session instead of silently running droid's own choice.
+
+        :returns: Droid's ACP session id.
+        :raises RuntimeError: When ``session/new`` fails, or the autonomy /
+            model override is rejected or not echoed back.
         """
         if self._session_id is not None:
             return self._session_id
@@ -583,10 +609,87 @@ class DroidExecutor(Executor):
             raise RuntimeError(
                 "droid ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
-        self._session_id = server_session_id
         self._capture_model_state(result)
+        self._capture_config_options(result)
+        await self._apply_autonomy(server_session_id)
         await self._apply_model(server_session_id, self._model)
+        self._session_id = server_session_id
         return self._session_id
+
+    def _capture_config_options(self, result: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+        """Remember the ``configOptions`` block droid advertised.
+
+        ``session/new`` and every ``session/set_config_option`` reply carry the
+        full list; autonomy validation and verification both read it. A reply
+        without the block leaves the previous list in place.
+
+        :param result: The ACP result object carrying ``configOptions``.
+        """
+        options = result.get("configOptions")
+        if not isinstance(options, list):
+            return
+        entries = [option for option in options if isinstance(option, dict)]
+        if entries:
+            self._config_options = entries
+
+    def _autonomy_config_option(self) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+        """Return the ``autonomy_level`` entry from the last ``configOptions``."""
+        for entry in self._config_options:
+            if entry.get("id") == _AUTONOMY_CONFIG_ID:
+                return entry
+        return None
+
+    def _advertised_autonomy_values(self) -> list[str]:
+        """Return the autonomy tiers droid offers for this session."""
+        options = (self._autonomy_config_option() or {}).get("options")
+        if not isinstance(options, list):
+            return []
+        return [
+            str(option["value"])
+            for option in options
+            if isinstance(option, dict) and "value" in option
+        ]
+
+    async def _apply_autonomy(self, session_id: str) -> None:
+        """Apply the configured autonomy tier to a fresh ACP session, verified.
+
+        No-op when the spec leaves autonomy to droid. Otherwise the requested
+        tier must be one droid advertises, and the ``session/set_config_option``
+        reply must echo it back as ``autonomy_level.currentValue`` — droid emits
+        no ``config_option_update`` notification for this change, so the reply is
+        the only echo (VERIFIED live).
+
+        :param session_id: Droid's ACP session id.
+        :raises RuntimeError: On an unknown tier, a droid error, or a mismatch.
+        """
+        if self._auto is None:
+            return
+        advertised = self._advertised_autonomy_values()
+        if not advertised:
+            raise RuntimeError(
+                "droid did not advertise an autonomy_level session option; "
+                f"cannot apply autonomy {self._auto!r}"
+            )
+        if self._auto not in advertised:
+            raise RuntimeError(
+                f"droid has no autonomy {self._auto!r}; it advertises {', '.join(advertised)}"
+            )
+        resp = await self._rpc(
+            _AGENT_METHOD_SESSION_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": _AUTONOMY_CONFIG_ID, "value": self._auto},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in resp:
+            raise RuntimeError(
+                f"droid rejected autonomy {self._auto!r}: {_acp_error_message(resp)}"
+            )
+        self._capture_config_options(resp.get("result") or {})
+        applied = (self._autonomy_config_option() or {}).get("currentValue")
+        if applied != self._auto:
+            raise RuntimeError(
+                f"droid reported autonomy {applied!r} after requesting {self._auto!r}"
+            )
+        logger.info("droid session autonomy_level=%s applied", self._auto)
 
     def _capture_model_state(self, result: dict[str, Any]) -> None:
         """Remember the model list ``session/new`` advertised, for the picker.
@@ -622,14 +725,16 @@ class DroidExecutor(Executor):
         """Select *model* over the wire (``session/set_model``) when it changes.
 
         No-op when no model is asked for or it already matches the session's
-        current one, so a switch fires only when it will take effect. Failures
-        are logged and swallowed — the session keeps droid's current model
-        rather than failing the turn. VERIFIED live: droid replies
-        ``result: {}`` and the ``model`` config option flips to the requested
-        id; the ``-m`` CLI flag alone does nothing in acp mode.
+        current one, so a switch fires only when it will take effect. VERIFIED
+        live: droid replies ``result: {}`` and the ``model`` config option flips
+        to the requested id; the ``-m`` CLI flag alone does nothing in acp mode.
+
+        A rejection or a hang fails the turn. Falling back would run a different
+        model than the caller asked for, which is worse than a visible error.
 
         :param session_id: Droid's ACP session id.
         :param model: The model id to switch to, or ``None`` to leave it be.
+        :raises RuntimeError: When droid rejects the id or does not answer.
         """
         if not model or model == self.current_model_id():
             return
@@ -639,16 +744,17 @@ class DroidExecutor(Executor):
                 {"sessionId": session_id, "modelId": model},
                 timeout=_INIT_TIMEOUT_SECONDS,
             )
-        except Exception as exc:  # noqa: BLE001 — model select is best-effort
-            logger.warning("droid session/set_model(%s) failed: %s", model, exc)
-            return
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"droid did not answer session/set_model for model {model!r} "
+                f"within {_INIT_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"droid session/set_model for model {model!r} failed: {exc}"
+            ) from exc
         if "error" in resp:
-            logger.warning(
-                "droid session/set_model(%s) rejected: %s",
-                model,
-                resp["error"].get("message", resp["error"]),
-            )
-            return
+            raise RuntimeError(f"droid rejected model {model!r}: {_acp_error_message(resp)}")
         self._applied_model = model
 
     # ------------------------------------------------------------------
