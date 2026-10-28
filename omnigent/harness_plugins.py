@@ -693,6 +693,23 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
+    # Droid is the ACP harness whose sub-agents are executor-emitted: its
+    # ``Task`` tool_call / tool_call_update handling yields
+    # SubAgentStarted/SubAgentCompleted (no native wrapper label, no vendor
+    # sub-agent dialect), which ExecutorAdapter latches into child sessions.
+    # tests/test_harness_capabilities.py names that mechanism explicitly.
+    "droid": _C(
+        _IM.ACP_SUBPROCESS,
+        _EL.SSE_PERMISSION,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=True,
+        interrupt=True,
+        streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
+    ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
@@ -769,6 +786,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor",
             "cursor-native",
             "devin-native",
+            "droid",
             "goose",
             "goose-native",
             "hermes",
@@ -793,6 +811,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
         "devin-native": "omnigent.inner.devin_native_harness",
+        "droid": "omnigent.inner.droid_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -895,11 +914,22 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
     # feeds setup steps and (for npm rows) the one-click install path.
-    install_specs={name: row.install for name, row in ACP_CLI_HARNESSES.items()},
+    install_specs={
+        **{name: row.install for name, row in ACP_CLI_HARNESSES.items()},
+        "droid": HarnessInstallSpec(
+            "Droid",
+            "droid",
+            package=None,
+            install_hint="curl -fsSL https://app.factory.ai/cli | sh",
+        ),
+    },
     harness_install_keys={
-        spelling: name
-        for name, row in ACP_CLI_HARNESSES.items()
-        for spelling in (name, *row.aliases)
+        "droid": "droid",
+        **{
+            spelling: name
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        },
     },
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
@@ -908,6 +938,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
+        "droid": "HARNESS_DROID_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
@@ -937,6 +968,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "Copilot",
         "cursor": "Cursor",
         "devin-native": "Devin",
+        "droid": "Droid",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
@@ -945,6 +977,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,
+    spawn_env_builders={
+        "droid": "omnigent.inner.droid_spawn_env:build_spawn_env",
+    },
 )
 
 _state: HarnessPluginState | None = None
