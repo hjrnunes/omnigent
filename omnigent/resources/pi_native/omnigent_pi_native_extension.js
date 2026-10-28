@@ -846,6 +846,16 @@ const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
 const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 
+function settledWithinBudget(settled) {
+  let timeout;
+  return Promise.race([
+    settled.then(() => true),
+    new Promise(resolve => {
+      timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
+
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
   if (!value) throw new Error("assistant conversation item requires source_id");
@@ -1050,18 +1060,7 @@ function createHistoryQueue(config) {
     },
     async flush() {
       // Later prompts must not extend the ending turn's delivery barrier.
-      const settled = Promise.all([...pending.values()].map(item => item.settled));
-      let timeout;
-      try {
-        return await Promise.race([
-          settled.then(() => true),
-          new Promise(resolve => {
-            timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
-          }),
-        ]);
-      } finally {
-        clearTimeout(timeout);
-      }
+      return settledWithinBudget(Promise.all([...pending.values()].map(item => item.settled)));
     },
     async close() {
       closed = true;
@@ -1593,11 +1592,24 @@ module.exports = function (pi) {
   const history = createHistoryQueue(config);
   pi.on("session_shutdown", () => history.close());
   pi.on("session_compact", async (_event, ctx) => {
-    const projection = ctx.sessionManager.buildSessionProjection();
+    const manager = ctx?.sessionManager;
+    if (typeof manager?.buildSessionProjection !== "function") return;
+    const notifyFailure = () =>
+      ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
+    let projection;
+    let compactedMessages;
+    try {
+      projection = manager.buildSessionProjection();
+      compactedMessages = structuredClone(projection?.messages ?? []);
+    } catch (error) {
+      console.error("[pi-native] Compaction snapshot failed:", error);
+      notifyFailure();
+      return;
+    }
     // Pi 1.3's event can name an older entry when summaries repeat.
-    const checkpoint = projection.entries[0]?.sourceEntry;
-    if (checkpoint?.type !== "compaction") return;
-    const sourceId = `pi:compaction:${ctx.sessionManager.getSessionId()}:${checkpoint.id}`;
+    const checkpoint = projection?.entries?.[0]?.sourceEntry;
+    if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") return;
+    const sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
     const item = history.enqueue(
       {
         item_type: "compaction",
@@ -1607,13 +1619,14 @@ module.exports = function (pi) {
           model: ctx.model?.id || null,
           token_count: Math.ceil(checkpoint.summary.length / 4),
           window_id: checkpoint.id,
-          compacted_messages: structuredClone(projection.messages),
+          compacted_messages: compactedMessages,
         },
       },
       sourceId,
-      { onFailure: () => ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error") },
+      { onFailure: notifyFailure },
     );
-    if (item) await item.settled;
+    // Pi awaits this handler before finishing compaction.
+    if (item) await settledWithinBudget(item.settled);
   });
   let sequence = 0;
   let turnOrdinal = 0;

@@ -1232,6 +1232,9 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(
+    notices, kind === "compaction" ? ["Omnigent could not save the compaction checkpoint."] : [],
+  );
   let items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 5);
   assert.ok(items[0].data.source_id);
@@ -1327,6 +1330,61 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "projection_error", "uncloneable", "stalled"])
+def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const failure = process.argv[3];
+  const projection = {
+    entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+    messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 1 }],
+  };
+  ctx.sessionManager = { getSessionId: () => "native-1" };
+  if (failure !== "unsupported") {
+    ctx.sessionManager.buildSessionProjection = () => {
+      if (failure === "projection_error") throw new Error("projection failed");
+      return projection;
+    };
+  }
+  if (failure === "uncloneable") projection.messages.push({ role: "custom", content: () => {} });
+  let budgetWaits = 0;
+  if (failure === "stalled") {
+    global.fetch = async (_url, request) => {
+      posted.push(JSON.parse(request.body));
+      return new Promise(() => {});
+    };
+    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    const harnessSetTimeout = global.setTimeout;
+    global.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
+      budgetWaits += 1;
+      queueMicrotask(() => callback(...args));
+      return {};
+    };
+  }
+  let guard;
+  await Promise.race([
+    handlers.session_compact({}, ctx),
+    new Promise((_resolve, reject) => {
+      guard = originalSetTimeout(() => reject(new Error("session_compact blocked Pi")), 2000);
+    }),
+  ]).finally(() => clearTimeout(guard));
+  const items = posted.filter((body) => body.type === "external_conversation_item");
+  const itemTypes = items.map((body) => body.data.item_type);
+  assert.deepEqual(itemTypes, failure === "stalled" ? ["message"] : []);
+  assert.equal(budgetWaits, failure === "stalled" ? 1 : 0);
+  const failed = failure === "projection_error" || failure === "uncloneable";
+  assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
+  if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), failure)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

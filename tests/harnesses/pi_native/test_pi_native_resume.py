@@ -195,6 +195,7 @@ def test_compaction_replays_stored_images_as_text_placeholders() -> None:
         last_item_id="before",
         token_count=1,
         compacted_messages=[
+            {"role": "compactionSummary", "summary": "checkpoint", "tokensBefore": 1},
             {"role": "user", "content": [{"type": "text", "text": "see this"}, image]},
             {
                 "role": "assistant",
@@ -223,20 +224,79 @@ def test_compaction_replays_stored_images_as_text_placeholders() -> None:
     assert all("image/png image omitted" in block["text"] for block in placeholders)
 
 
-def test_legacy_summary_only_compaction_does_not_restore_old_transcript() -> None:
+@pytest.mark.parametrize(
+    "compacted_messages",
+    [
+        None,
+        # Claude-native snapshot.
+        [
+            {"role": "user", "content": [{"type": "text", "text": "foreign retained"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+            },
+        ],
+        # Codex-native and Pi executor snapshots use Omnigent-style message items.
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "foreign retained"}],
+            },
+            {"role": "assistant", "content": [{"type": "output_text", "text": "foreign"}]},
+        ],
+    ],
+    ids=["legacy", "claude", "omnigent-items"],
+)
+def test_non_pi_compaction_snapshot_restores_only_summary(
+    compacted_messages: list[dict[str, Any]] | None,
+) -> None:
+    compaction: dict[str, Any] = {"id": "compact", "type": "compaction", "summary": "summary"}
+    if compacted_messages is not None:
+        compaction["compacted_messages"] = compacted_messages
     records = pi_session_records_from_session_items(
         [
             _user_item("old raw transcript"),
-            {"id": "compact", "type": "compaction", "summary": "legacy summary"},
+            compaction,
+            _user_item("after checkpoint", item_id="later", response_id="later"),
         ],
-        session_id="conv_legacy",
+        session_id="conv_foreign",
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
-    assert len(records) == 2
-    assert records[1]["type"] == "compaction"
-    assert records[1]["summary"] == "legacy summary"
+    assert [record["type"] for record in records] == ["session", "compaction", "message"]
+    assert records[1]["summary"] == "summary"
     assert records[1]["firstKeptEntryId"] == records[1]["id"]
+    assert records[2]["message"]["content"][0]["text"] == "after checkpoint"
+    assert "old raw transcript" not in json.dumps(records)
+    assert "foreign" not in json.dumps(records)
+
+
+def test_late_result_for_retained_compaction_call_keeps_tool_name() -> None:
+    compaction = {
+        "id": "compact",
+        "type": "compaction",
+        "summary": "checkpoint",
+        "compacted_messages": [
+            {"role": "compactionSummary", "summary": "checkpoint", "tokensBefore": 1},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "toolCall", "id": "call_late", "name": "read", "arguments": {}}
+                ],
+            },
+        ],
+    }
+    records = pi_session_records_from_session_items(
+        [compaction, _function_output_item(call_id="call_late", output="late result")],
+        session_id="conv_late",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    result = records[-1]["message"]
+    assert result["role"] == "toolResult"
+    assert result["toolCallId"] == "call_late"
+    assert result["toolName"] == "read"
 
 
 def test_records_header_first_and_well_formed() -> None:

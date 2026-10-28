@@ -245,9 +245,10 @@ def pi_session_records_from_session_items(
       rejects a replayed result whose name is empty. Only the first output
       committed for a ``call_id`` is replayed: Anthropic rejects a history with
       two ``tool_result`` blocks for one ``tool_use``.
-    - latest ``compaction`` -> Pi checkpoint with the actual summary and
-      projected native messages retained by Pi. It replaces earlier history;
-      subsequent items still use the normal tool-pairing conversion.
+    - latest ``compaction`` -> Pi checkpoint with the actual summary and, for
+      Pi's own snapshots, the projected native messages Pi retained. It
+      replaces earlier history; subsequent items still use the normal
+      tool-pairing conversion.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -301,6 +302,13 @@ def pi_session_records_from_session_items(
     kept_ids = {entry["id"] for entry in entries}
     skip_response_ids = _interrupted_response_ids(items)
     tool_names = _function_call_names(items)
+    for entry in entries:
+        content = cast(_JsonObject, entry["message"]).get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "toolCall":
+                call_id, name = block.get("id"), block.get("name")
+                if isinstance(call_id, str) and isinstance(name, str) and name:
+                    tool_names.setdefault(call_id, name)
     replayed_call_ids: set[str] = {
         cast(str, message["toolCallId"])
         for entry in entries
@@ -400,11 +408,12 @@ def _pi_compaction_records(
 ) -> tuple[_JsonObject, list[_JsonObject]]:
     """Restore Pi's projected messages from the shared compaction snapshot.
 
-    :param item: A shared compaction item containing Pi's canonical projection.
+    :param item: A shared compaction item, possibly written by another harness.
     :param session_id: Omnigent conversation identity for generated entry ids.
     :param external_session_id: Destination native identity, distinct for forks.
     :param timestamp: Timestamp for the rebuilt entries.
-    :returns: Native checkpoint and retained messages; legacy summaries have no tail.
+    :returns: Native checkpoint and retained messages. Only Pi's own projection
+        has a retained tail; legacy and other harnesses' snapshots keep the summary.
     """
 
     def entry_id(index: int) -> str:
@@ -425,7 +434,12 @@ def _pi_compaction_records(
     }
     entries: list[_JsonObject] = []
     messages = item.get("compacted_messages")
-    for index, message in enumerate(messages if isinstance(messages, list) else []):
+    if not isinstance(messages, list) or not any(
+        isinstance(message, dict) and message.get("role") == "compactionSummary"
+        for message in messages
+    ):
+        return checkpoint, entries
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         role = message.get("role")
