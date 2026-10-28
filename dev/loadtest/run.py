@@ -24,11 +24,24 @@ Writes a timestamped result set:
       report.html             locust's own HTML report
       console.log             full locust stdout/stderr
       summary.md              human-readable latency write-up (this tool)
+      t6_report.json          T6 relay health report (machine-readable)
+      t6_report.md            T6 relay health report (human-readable)
+      server-process.log      the isolated server's own process log
+
+T6 runs with every invocation: while locust drives load, the runner probes
+``GET /health`` every 250 ms and ``POST /v1/sessions/{id}/policies/evaluate``
+every 1 s, reads the Phase 0 relay counters out of the server's process log,
+counts event-loop watchdog stalls, fuse trips, persistence failures, and
+subscriber overflows, and measures server CPU per 1,000 events/s. The spawned
+server gets its own ``HOME``/data/config dir and process log inside the bench
+temp dir, so it never writes into your real ``~/.omnigent``.
 
 Runs from a repo checkout only (imports ``dev.benchmarks`` + ``tests``), with
 the ``loadtest`` and ``agents-sdk`` extras. Knobs: ``--users`` (N hosts),
 ``--spawn-rate``, ``--run-time``, ``--sessions-per-user``, ``--turns-per-session``,
-``--reply-words``, ``--out-dir``.
+``--reply-words``, ``--out-dir``, ``--server-ref`` (baseline vs candidate),
+``--health-probe-interval``, ``--policy-probe-interval``,
+``--relay-stats-interval``.
 """
 
 from __future__ import annotations
@@ -38,9 +51,16 @@ import asyncio
 import csv
 import datetime
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dev.loadtest.t6 import ServerSource
 
 # Repo root so ``dev.benchmarks`` and ``tests`` import when run as a script.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -87,6 +107,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out-dir",
         default=None,
         help="Result directory. Default: dev/loadtest/results/omnigent_load_test-<timestamp>.",
+    )
+    parser.add_argument(
+        "--server-ref",
+        default=None,
+        help=(
+            "Run the server (and the hosts/runners that drive it) from another checkout: "
+            "a git ref like v0.20.0 or a directory path. Default: this checkout."
+        ),
+    )
+    parser.add_argument(
+        "--health-probe-interval",
+        type=float,
+        default=0.25,
+        help="Seconds between GET /health probes.",
+    )
+    parser.add_argument(
+        "--policy-probe-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between POST /policies/evaluate probes.",
+    )
+    parser.add_argument(
+        "--relay-stats-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between the server's relay_stats log records.",
     )
     return parser
 
@@ -187,6 +233,11 @@ def _write_run_config(
         "sessions_per_user": args.sessions_per_user,
         "turns_per_session": args.turns_per_session,
         "reply_words": args.reply_words,
+        "server_ref": args.server_ref,
+        "health_probe_interval_s": args.health_probe_interval,
+        "policy_probe_interval_s": args.policy_probe_interval,
+        "relay_stats_interval_s": args.relay_stats_interval,
+        "t6_report": "t6_report.json",
         "harness": "openai-agents",
         "model": "mock (zero-latency)",
         "locust_argv": argv,
@@ -289,69 +340,218 @@ def _write_summary(
         "mean the load box (not the server) is saturated."
     )
     lines.append("")
+    lines.append(
+        "T6 relay health: see `t6_report.md` for probe percentiles, the "
+        "watchdog/fuse/persistence/overflow counters, the event-source mix, and "
+        "CPU per 1,000 events/s."
+    )
     lines.append("Raw data: `report_stats.csv`, `report_stats_history.csv`, `report.html`.")
     lines.append("")
     (out_dir / "summary.md").write_text("\n".join(lines))
 
 
 async def _boot_and_run(args: argparse.Namespace, out_dir: Path) -> int:
-    """Boot the stack, register the agent + mock reply, run locust, write results."""
-    from dev.benchmarks.omnigent.environment import BenchEnvironment
+    """Resolve the server source, then boot, load, and report."""
+    from dev.loadtest import t6
+
+    worktree_root = Path(tempfile.mkdtemp(prefix="omni-t6-worktrees-"))
+    source: t6.ServerSource | None = None
+    try:
+        if args.server_ref:
+            source = t6.resolve_server_ref(
+                args.server_ref, repo_root=_REPO_ROOT, worktree_root=worktree_root
+            )
+            print(
+                f"Server source: {source.path} (commit {source.commit})",
+                flush=True,
+            )
+        return await _run_with_environment(args, out_dir, source)
+    finally:
+        if source is not None:
+            t6.release_server_source(source, repo_root=_REPO_ROOT)
+        shutil.rmtree(worktree_root, ignore_errors=True)
+
+
+async def _run_with_environment(
+    args: argparse.Namespace, out_dir: Path, source: ServerSource | None
+) -> int:
+    """Boot the isolated stack, probe it under locust load, and write the reports."""
+    from dev.loadtest import t6
 
     print(
         f"Booting local stack (server + mock LLM) for {args.users} hosts × "
         f"{args.sessions_per_user} sessions × {args.turns_per_session} turns …",
         flush=True,
     )
-    async with BenchEnvironment(with_runner=True) as env:
+    async with t6.T6BenchEnvironment(
+        with_runner=True,
+        relay_stats_interval_s=args.relay_stats_interval,
+        server_source=source,
+    ) as env:
         # Every host-bound session's turn hits the mock; a streamed multi-sentence
         # reply makes each turn do real streaming-pipeline work at zero model latency.
         await env.set_mock_fallback(_mock_reply(args.reply_words), stream=True)
         agent_name = await env.ensure_agent("loadtest-agent")
         agent_id = await env.agent_id(agent_name)
-        print(f"  stack up: {env.base_url}  (agent {agent_id})", flush=True)
+        # Dedicated unbound session for the 1 s policy-evaluate probe, so the
+        # probe never races a turn's session state.
+        probe_session_id = await env.create_session(agent_id)
+        print(
+            f"  stack up: {env.base_url}  (agent {agent_id}, probe session {probe_session_id})",
+            flush=True,
+        )
 
-        argv = _build_locust_argv(args, env.base_url, out_dir)
-        child_env = {
-            **_os_environ(),
-            "LOADTEST_SERVER_URL": env.base_url,
-            "LOADTEST_AGENT_ID": agent_id,
-            "LOADTEST_MOCK_URL": env.mock_url,
-            "LOADTEST_WORKSPACE_ROOT": str(out_dir / "host-workspaces"),
-            "SESSIONS_PER_USER": str(args.sessions_per_user),
-            "TURNS_PER_SESSION": str(args.turns_per_session),
-        }
-        print(f"$ {' '.join(argv)}\n  results → {out_dir}", flush=True)
-
-        console_log = out_dir / "console.log"
-        # Locust is gevent-based; run it as a subprocess (not in this asyncio
-        # loop) and stream its output to the console + console.log.
-        with console_log.open("w") as log_fh:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                env=child_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+        monitor = t6.T6Monitor(
+            base_url=env.base_url,
+            policy_session_id=probe_session_id,
+            server_log_path=env.server_process_log,
+            config=t6.ProbeConfig(
+                health_interval_s=args.health_probe_interval,
+                policy_interval_s=args.policy_probe_interval,
+            ),
+        )
+        cpu_sampler = t6.ServerCpuSampler(env.server_pid)
+        await monitor.start()
+        await cpu_sampler.start()
+        try:
+            exit_code, argv = await _run_locust(
+                args,
+                base_url=env.base_url,
+                mock_url=env.mock_url,
+                agent_id=agent_id,
+                out_dir=out_dir,
+                server_source=source,
             )
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace")
-                sys.stdout.write(line)
-                log_fh.write(line)
-            exit_code = await proc.wait()
+        finally:
+            # The server logs relay_stats every interval; wait one interval plus
+            # a second so the final record covers the whole load.
+            await monitor.stop(drain_seconds=args.relay_stats_interval + 1.0)
+            await cpu_sampler.stop()
+
+        sections = monitor.report_sections()
+        relay_counters = sections["relay_counters"]
+        server_log_copy = t6.copy_server_log(env.server_process_log, out_dir)
+        report = t6.build_report(
+            config={
+                "users": args.users,
+                "spawn_rate": args.spawn_rate,
+                "sessions_per_user": args.sessions_per_user,
+                "turns_per_session": args.turns_per_session,
+                "reply_words": args.reply_words,
+                "run_time": args.run_time,
+                "health_probe_interval_s": args.health_probe_interval,
+                "policy_probe_interval_s": args.policy_probe_interval,
+                "relay_stats_interval_s": args.relay_stats_interval,
+                "measured_seconds": monitor.elapsed_seconds,
+            },
+            server={
+                "ref": args.server_ref,
+                "commit": source.commit if source is not None else t6.git_head(_REPO_ROOT),
+                "base_url": env.base_url,
+                "log_file": str(server_log_copy) if server_log_copy else "unavailable",
+                "isolated_log_path": str(env.server_process_log),
+                "isolated_home_at_run": str(env.run_root / "server-home"),
+            },
+            locust_exit_code=exit_code,
+            health=sections["health"],
+            policy=sections["policy_evaluate"],
+            event_loop=sections["event_loop"],
+            relay_counters=relay_counters,
+            server_cpu=cpu_sampler.summary(events_total=relay_counters.get("events_total")),
+            policy_session_id=probe_session_id,
+            artifacts={
+                "server_log": str(server_log_copy) if server_log_copy else "unavailable",
+                "locust_console": str(out_dir / "console.log"),
+                "locust_stats_csv": str(out_dir / f"{_CSV_PREFIX}_stats.csv"),
+            },
+        )
+        _, t6_markdown = t6.write_t6_report(out_dir, report)
+        gate = report["gate"]
+        print(
+            f"\nT6 gate: {'PASS' if gate['pass'] else 'FAIL'} — report: {t6_markdown}",
+            flush=True,
+        )
 
     _write_run_config(out_dir, args, argv, exit_code)
     rows = _read_stats(out_dir / f"{_CSV_PREFIX}_stats.csv")
     _write_summary(out_dir, args, rows, exit_code)
-    print(f"\nResults written to {out_dir}\n  summary: {out_dir / 'summary.md'}", flush=True)
+    print(
+        f"\nResults written to {out_dir}\n  summary: {out_dir / 'summary.md'}\n"
+        f"  T6 report: {out_dir / 't6_report.md'}",
+        flush=True,
+    )
     return exit_code
 
 
-def _os_environ() -> dict[str, str]:
-    """Return a copy of the current environment (import kept local to helper)."""
-    import os
+async def _run_locust(
+    args: argparse.Namespace,
+    *,
+    base_url: str,
+    mock_url: str,
+    agent_id: str,
+    out_dir: Path,
+    server_source: ServerSource | None,
+) -> tuple[int, list[str]]:
+    """Run locust against *base_url*, stream its output, and return its exit code."""
+    argv = _build_locust_argv(args, base_url, out_dir)
+    child_env = {
+        **_locust_child_env(server_source),
+        "LOADTEST_SERVER_URL": base_url,
+        "LOADTEST_AGENT_ID": agent_id,
+        "LOADTEST_MOCK_URL": mock_url,
+        "LOADTEST_WORKSPACE_ROOT": str(out_dir / "host-workspaces"),
+        "SESSIONS_PER_USER": str(args.sessions_per_user),
+        "TURNS_PER_SESSION": str(args.turns_per_session),
+    }
+    print(f"$ {' '.join(argv)}\n  results → {out_dir}", flush=True)
 
-    return dict(os.environ)
+    # Locust is gevent-based; run it as a subprocess (not in this asyncio loop)
+    # and stream its output to the console + console.log.
+    with (out_dir / "console.log").open("w") as log_fh:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace")
+            sys.stdout.write(line)
+            log_fh.write(line)
+        return await proc.wait(), argv
+
+
+# Caller vars that would point the locust hosts at the developer's real state.
+_ISOLATED_ENV_VARS = frozenset(
+    {
+        "OMNIGENT_DATA_DIR",
+        "OMNIGENT_CONFIG_HOME",
+        "OMNIGENT_PROCESS_LOG_FILE",
+        "OMNIGENT_ADMIN_CREDENTIALS_PATH",
+        "OMNIGENT_SERVER",
+        "OMNIGENT_SERVER_URL",
+        "OMNIGENT_DATABASE_URI",
+    }
+)
+
+
+def _locust_child_env(server_source: ServerSource | None) -> dict[str, str]:
+    """Locust's environment: caller state stripped, target checkout pinned.
+
+    Each simulated host already gets its own ``HOME`` (see the locust file), so
+    stripping the caller's Omnigent data/config vars keeps hosts out of the
+    developer's real ``~/.omnigent``. When ``--server-ref`` selects another
+    checkout, pin ``PYTHONPATH`` so the hosts and runners they spawn import that
+    checkout too — the relay path spans both processes.
+    """
+    from dev.loadtest import t6
+
+    env = {key: value for key, value in os.environ.items() if key not in _ISOLATED_ENV_VARS}
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
+    if server_source is not None:
+        env = t6.pin_pythonpath(env, server_source.path)
+    return env
 
 
 def main() -> int:

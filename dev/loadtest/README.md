@@ -54,6 +54,10 @@ python dev/loadtest/run.py --users 8 --sessions-per-user 2 --turns-per-session 4
 | `--turns-per-session` | 4 | Turns per session — history grows across them. |
 | `--reply-words` | 60 | Word count of the mocked (streamed) reply per turn. |
 | `--out-dir` | — | Result directory (default `results/omnigent_load_test-<timestamp>/`). |
+| `--server-ref` | — | Run the server (and the hosts/runners driving it) from another checkout: a git ref like `v0.20.0`, or a directory path. |
+| `--health-probe-interval` | 0.25 | Seconds between `GET /health` probes. |
+| `--policy-probe-interval` | 1.0 | Seconds between `POST /v1/sessions/{id}/policies/evaluate` probes. |
+| `--relay-stats-interval` | 5.0 | Seconds between the server's `relay_stats` log records. |
 
 Start small to confirm the stack boots on your machine — `--users 2
 --sessions-per-user 1 --turns-per-session 2 --run-time 40s` — then ramp.
@@ -65,12 +69,15 @@ Writes a timestamped `results/` directory (git-ignored):
 | File | What it is |
 |---|---|
 | `summary.md` | Human-readable latency write-up — read this first. |
+| `t6_report.md` | T6 relay health report — probe percentiles, relay counters, server CPU. |
+| `t6_report.json` | Same report, machine-readable (used to compare runs). |
 | `run_config.json` | Inputs + resolved locust argv + exit code. |
 | `report_stats.csv` | Per-operation stats (raw). |
 | `report_stats_history.csv` | Per-10s time series (raw). |
 | `report_failures.csv` | Failure breakdown (raw). |
 | `report.html` | Locust's own HTML report. |
 | `console.log` | Full locust stdout/stderr. |
+| `server-process.log` | Copy of the isolated server's process log (relay counters, watchdog reports). |
 
 `summary.md` reports, per operation, count / failures / latency
 (avg / median / p95 / p99 / max) + throughput. Key operations:
@@ -92,3 +99,46 @@ the test owns, and the whole point is real turns without token cost. To load a
 different server you would need real runners + a real (or separately-mocked) LLM
 on that side — out of scope here; use this to profile the host↔server↔runner
 path locally.
+
+To compare **checkouts** of this repo instead, pass `--server-ref`: the harness
+creates a detached `git worktree` for the ref (or uses the directory you name),
+pins `PYTHONPATH` so the server, the locust hosts, and the runners they spawn
+import that checkout, and removes the worktree afterwards:
+
+```bash
+python dev/loadtest/run.py --users 2 --run-time 45s --server-ref v0.20.0 --out-dir /tmp/t6-baseline
+```
+
+`t6_report.json` records the ref and its commit, so two runs are comparable
+side by side.
+
+## T6 relay health
+
+Every run is also a T6 run (`dev/loadtest/t6.py`). While locust drives load, the
+harness probes the server and reads its Phase 0 relay counters:
+
+- **Probes:** `GET /health` every 250 ms and
+  `POST /v1/sessions/{id}/policies/evaluate` every 1 s against a dedicated
+  unbound session. The report carries p50 / p99 / max latency and the non-200
+  count for each.
+- **Counters:** the server logs `relay_stats {json}` every
+  `--relay-stats-interval` seconds. The harness tails that log record by record
+  (it never imports `relay_stats`, which would read its own empty process) and
+  reports the event-source mix, body-queue depth and byte peaks, subscriber
+  serialization, relay stretch, and persistence failures.
+- **Health signals:** event-loop watchdog stall reports (`Server event loop has
+  not advanced for …`), body-queue fuse trips, and subscriber-stream overflow
+  closes. Fuse and overflow counts come from the `relay_stats` payload when the
+  build reports them, and from matching server-log lines otherwise.
+- **CPU:** `psutil` samples the server PID; the report normalises measured CPU
+  time to `cpu_seconds_per_1k_events`, the comparable figure across load levels
+  and refs.
+- **Gate:** pass requires health p99 < 250 ms, health max < 1 s, and zero
+  watchdog stalls, fuse trips, persistence failures, and subscriber overflows.
+  A signal the build does not report shows `unknown`, which fails the gate.
+
+The server under test is fully isolated: `T6BenchEnvironment` gives it its own
+`HOME`, `OMNIGENT_DATA_DIR`, `OMNIGENT_CONFIG_HOME`, and
+`OMNIGENT_PROCESS_LOG_FILE` inside the run's temp dir, so no bench server writes
+into `~/.omnigent/logs/server/`.
+
