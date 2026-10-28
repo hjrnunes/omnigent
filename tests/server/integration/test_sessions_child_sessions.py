@@ -1911,9 +1911,14 @@ async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str
 async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, effort: str | None
 ) -> None:
+    from unittest.mock import AsyncMock
+
     from omnigent.server.routes._sessions.orchestration import _forward_codex_side_chat_turn
     from omnigent.server.routes.sessions import routes_core
     from omnigent.server.schemas import SessionEventInput
+
+    support = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes_core, "_runner_supports_side_chat_settings", support)
 
     parent = await _create_parent_session(client, agent_name="side-settings")
     store = SqlAlchemyConversationStore(db_uri)
@@ -1939,49 +1944,6 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
         session_stream, "publish", lambda _session_id, event: published.append(event)
     )
 
-    # The live result may have been lost; a reconnect must replay the durable outcome.
-    async def snapshot_only(_request: Any, _session_id: str, snapshot: Any, **_kwargs: Any) -> Any:
-        for event in await snapshot():
-            yield "data: " + json.dumps(event) + "\n\n"
-
-    monkeypatch.setattr(routes_events_module, "_stream_live_events", snapshot_only)
-    for result_child in (None, child_id):
-        result = await client.post(
-            f"/v1/sessions/{parent['id']}/events",
-            json={
-                "type": "external_side_chat_result",
-                "data": {"draft_id": "pending:test", "child_session_id": result_child},
-            },
-        )
-        assert result.status_code == 202, result.text
-        assert published[-1] == {
-            "type": "session.side_chat_result",
-            "conversation_id": parent["id"],
-            "draft_id": "pending:test",
-            "child_session_id": result_child,
-        }
-        replay = await client.get(f"/v1/sessions/{parent['id']}/stream")
-        assert replay.status_code == 200, replay.text
-        replayed = [
-            json.loads(line.removeprefix("data: "))
-            for line in replay.text.splitlines()
-            if line.startswith("data: ")
-        ]
-        assert {
-            "type": "session.side_chat_result",
-            "conversation_id": parent["id"],
-            "draft_id": "pending:test",
-            "child_session_id": result_child,
-        } in replayed
-    invalid = await client.post(
-        f"/v1/sessions/{parent['id']}/events",
-        json={
-            "type": "external_side_chat_result",
-            "data": {"draft_id": "pending:test", "child_session_id": parent["id"]},
-        },
-    )
-    assert invalid.status_code == 400, invalid.text
-
     child = (await client.get(f"/v1/sessions/{child_id}")).json()
     assert child["model_override"] == "gpt-5.5"
     assert child["reasoning_effort"] == ("high" if effort is not None else None)
@@ -2004,6 +1966,11 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     assert response.status_code == 200, response.text
     assert response.json()["model_override"] == "gpt-6-sol"
     assert response.json()["reasoning_effort"] == saved_effort
+    support.return_value = False
+    refused = await client.patch(f"/v1/sessions/{child['id']}", json={"reasoning_effort": "low"})
+    assert refused.status_code == 503, refused.text
+    assert store.get_conversation(child["id"]).reasoning_effort == saved_effort
+    support.return_value = True
     repeated = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={
@@ -2580,17 +2547,51 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
 
 @pytest.mark.parametrize("runner_status,supported", [(404, False), (200, False), (200, True)])
 async def test_side_chat_capabilities_probe_current_runner(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, runner_status: int, supported: bool
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int,
+    supported: bool,
 ) -> None:
     from unittest.mock import AsyncMock
 
     from omnigent.server.routes.sessions import routes_core
 
     parent = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    child = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {
+                "thread_id": "side-thread",
+                "agent_nickname": "Side chat",
+            },
+        },
+    )
+    assert child.status_code == 202, child.text
+    child_id = child.json()["child_session_id"]
     runner = AsyncMock()
     runner.get.return_value = httpx.Response(runner_status, json={"settings": supported})
+    runner.put.return_value = httpx.Response(200, json={"child_session_id": child_id})
     monkeypatch.setattr(routes_core, "_get_runner_client", AsyncMock(return_value=runner))
     response = await client.get(f"/v1/sessions/{parent['id']}/side_chat_capabilities")
     assert response.status_code == 200
     assert response.json() == {"settings": supported}
     runner.get.assert_awaited_once_with("/v1/side_chat_capabilities")
+    path = f"/v1/sessions/{parent['id']}/side_chats/36d343b9-3d75-440a-8e02-9967dc43d78a"
+    for _ in range(2):
+        created = await client.put(path)
+        if supported:
+            assert created.status_code == 200, created.text
+            assert created.json() == {"child_session_id": child_id}
+        else:
+            assert created.status_code == 503, created.text
+            runner.put.assert_not_awaited()
+    if supported:
+        assert runner.put.call_count == 2
+        runner.put.assert_awaited_with(path, timeout=25)
+    assert store.list_items(child_id).data == []
+    invalid = await client.put(f"/v1/sessions/{parent['id']}/side_chats/not-a-uuid")
+    assert invalid.status_code == 400

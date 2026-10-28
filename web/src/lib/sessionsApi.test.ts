@@ -582,6 +582,31 @@ describe("createSideChat", () => {
     labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
+  it("recovers a native child after a lost response and saves picks before any message", async () => {
+    const requestId = "pending:36d343b9-3d75-440a-8e02-9967dc43d78a";
+    const native = { ...source, harness: "codex-native" };
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse(native))
+      .mockRejectedValueOnce(new Error("Response lost"))
+      .mockResolvedValueOnce(mockJsonResponse(native))
+      .mockResolvedValueOnce(mockJsonResponse({ child_session_id: fork.id }))
+      .mockResolvedValueOnce(mockJsonResponse(fork));
+    const settings = { modelOverride: "gpt-6-sol", reasoningEffort: "high" };
+    await expect(createSideChat(source.id, settings, requestId)).rejects.toThrow("Response lost");
+    await expect(createSideChat(source.id, settings, requestId)).resolves.toEqual({
+      childSessionId: fork.id,
+    });
+    const path = `/v1/sessions/${source.id}/side_chats/${requestId.slice(8)}`;
+    expect(fetchMock.mock.calls[1]).toEqual([path, expect.objectContaining({ method: "PUT" })]);
+    expect(fetchMock.mock.calls[3]).toEqual([path, expect.objectContaining({ method: "PUT" })]);
+    expect(fetchMock.mock.calls[4][0]).toBe(`/v1/sessions/${fork.id}`);
+    expect(JSON.parse(fetchMock.mock.calls[4][1].body)).toEqual({
+      model_override: "gpt-6-sol",
+      reasoning_effort: "high",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
   it.each(["max", null])(
     "passes draft effort %s into the fork before binding its runner",
     async (reasoningEffort) => {

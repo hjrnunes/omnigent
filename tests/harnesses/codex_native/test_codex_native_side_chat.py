@@ -8,6 +8,8 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -270,42 +272,22 @@ async def test_interrupt_side_turn_propagates_unrelated_errors(error: Exception)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reset", [False, True])
-async def test_open_side_chat_forks_then_submits_first_turn(reset: bool) -> None:
+async def test_open_side_chat_forks_then_submits_first_turn() -> None:
     client = _FakeCodexClient(
         {
-            "thread/read": {"result": {"thread": {"model": "gpt-6-sol"}}},
-            "model/list": _CATALOG,
             "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
             "turn/start": {"result": {"turn": {"id": "turn_1"}}},
         }
     )
 
     child = await side_chat.open_side_chat_on_client(
-        client,
-        parent_thread_id="thread_parent",
-        question="what does this repo do?",
-        settings_override={"effort": None} if reset else None,
+        client, parent_thread_id="thread_parent", question="what does this repo do?"
     )
 
     assert child == "thread_side"
     # order: fork first, then the first turn on the CHILD (not the main thread)
-    assert [m for m, _ in client.calls] == (["thread/read", "model/list"] if reset else []) + [
-        "thread/fork",
-        "turn/start",
-    ]
-    assert client.calls[-1][1]["threadId"] == "thread_side"
-    assert "model" not in client.calls[-1][1]
-    if reset:
-        assert client.calls[-2][1]["config"] == {"model_reasoning_effort": "medium"}
-
-
-@pytest.mark.asyncio
-async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
-    client = _FakeCodexClient({"thread/read": {"result": {"thread": {}}}})
-    with pytest.raises(ValueError, match="capabilities unavailable"):
-        await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
-    assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]
+    assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
+    assert client.calls[1][1]["threadId"] == "thread_side"
 
 
 @pytest.mark.asyncio
@@ -536,19 +518,9 @@ def test_side_chat_requests_peek_does_not_consume_until_discarded(tmp_path: Path
     assert side_chat.peek_side_chat_requests(tmp_path) == []
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "{not json",
-        '{"question":"q","settings":[]}',
-        '{"question":"q","settings":{"effort":42}}',
-        '{"question":"q","settings":{"unexpected":"x"}}',
-        '{"question":"q","draft_id":12}',
-    ],
-)
-def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path, payload: str) -> None:
+def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> None:
     (tmp_path / "side_chat_requests").mkdir()
-    (tmp_path / "side_chat_requests" / "bad.json").write_text(payload, encoding="utf-8")
+    (tmp_path / "side_chat_requests" / "bad.json").write_text("{not json", encoding="utf-8")
     side_chat.request_side_chat(tmp_path, "good one")
 
     pending = side_chat.peek_side_chat_requests(tmp_path)
@@ -558,12 +530,8 @@ def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path, paylo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "settings",
-    [None, {"model": "gpt-6-sol", "effort": "max"}, {"model": "gpt-6-sol", "effort": None}],
-)
 async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: dict[str, str | None] | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The drain loop must fork on the connection it was handed.
 
@@ -572,26 +540,11 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     """
     client = _FakeCodexClient(
         {
-            "model/list": _CATALOG,
             "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
             "turn/start": {"result": {"turn": {"id": "turn_1"}}},
         }
     )
-    side_chat.request_side_chat(
-        tmp_path, "what does this repo do?", settings=settings, draft_id="pending:test"
-    )
-    result = AsyncMock()
-    monkeypatch.setattr(fwd, "_post_session_event", result)
-    ap_client = AsyncMock()
-    ap_client.patch.return_value = httpx.Response(
-        200, request=httpx.Request("PATCH", "http://server")
-    )
-
-    async def register(*_args: Any, **_kwargs: Any) -> str:
-        assert [method for method, _ in client.calls if method != "model/list"] == ["thread/fork"]
-        return "conv_side"
-
-    monkeypatch.setattr(fwd, "_register_child_session", register)
+    side_chat.request_side_chat(tmp_path, "what does this repo do?")
 
     async def _stop(_seconds: float) -> None:
         raise asyncio.CancelledError
@@ -600,40 +553,16 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
             client,
-            ap_client=ap_client,
+            ap_client=AsyncMock(),
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
 
-    result.assert_awaited_once_with(
-        ap_client,
-        "conv_parent",
-        event_type="external_side_chat_result",
-        data={"draft_id": "pending:test", "child_session_id": "conv_side"},
-    )
-    turns = [(method, params) for method, params in client.calls if method != "model/list"]
-    assert [method for method, _ in turns] == ["thread/fork", "turn/start"]
-    assert turns[0][1]["threadId"] == "thread_parent"
-    assert turns[0][1]["ephemeral"] is True
-    assert turns[1][1]["threadId"] == "thread_side"  # first turn on the fork
+    assert [m for m, _ in client.calls] == ["thread/fork", "turn/start"]
+    assert client.calls[0][1]["threadId"] == "thread_parent"
+    assert client.calls[0][1]["ephemeral"] is True
+    assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
-
-    if settings:
-        expected_effort = settings["effort"] or "medium"
-        assert turns[0][1]["model"] == settings["model"]
-        assert turns[0][1]["config"] == {"model_reasoning_effort": expected_effort}
-        assert "effort" not in turns[1][1]
-        assert [method for method, _ in client.calls].count("model/list") == 1
-        ap_client.patch.assert_awaited_once_with(
-            "/v1/sessions/conv_side",
-            json={
-                "silent": True,
-                "model_override": "gpt-6-sol",
-                "reasoning_effort": settings["effort"] or "default",
-            },
-        )
-    else:
-        ap_client.patch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -669,7 +598,6 @@ async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings
     assert forks[0]["config"] == {"model_reasoning_effort": "max"}
     assert "side conversation" in forks[0]["developerInstructions"]
     assert [method for method, _ in client.calls][-1] == "turn/start"
-    assert [method for method, _ in client.calls].count("model/list") == 1
 
 
 @pytest.mark.asyncio
@@ -699,35 +627,13 @@ async def test_drive_side_chat_requests_keeps_the_request_until_the_parent_threa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["fork", "settings", "turn"])
 async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A fork that fails must not vanish silently: surface a visible notice, then
     # discard the request so the same failure isn't retried forever.
-    client = _FakeCodexClient(
-        {
-            "thread/fork": {
-                "result": {} if failure == "fork" else {"thread": {"id": "thread_side"}}
-            },
-            "model/list": _CATALOG,
-        }
-    )
-    side_chat.request_side_chat(
-        tmp_path, "doomed", settings={"model": "gpt-6-sol"}, draft_id="pending:test"
-    )
-    register = AsyncMock(return_value="conv_side")
-    monkeypatch.setattr(fwd, "_register_child_session", register)
-    ap_client = AsyncMock()
-    ap_client.patch.return_value = httpx.Response(
-        500 if failure == "settings" else 200, request=httpx.Request("PATCH", "http://server")
-    )
-    result = AsyncMock()
-    monkeypatch.setattr(fwd, "_post_session_event", result)
-    if failure == "turn":
-        monkeypatch.setattr(
-            side_chat, "submit_side_turn", AsyncMock(side_effect=RuntimeError("turn rejected"))
-        )
+    client = _FakeCodexClient({"thread/fork": {"result": {}}})  # no thread id -> failure
+    side_chat.request_side_chat(tmp_path, "doomed")
 
     notices: list[tuple[str, str]] = []
 
@@ -742,21 +648,11 @@ async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failur
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
             client,
-            ap_client=ap_client,
+            ap_client=AsyncMock(),
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
 
-    result.assert_awaited_once_with(
-        ap_client,
-        "conv_parent",
-        event_type="external_side_chat_result",
-        data={"draft_id": "pending:test", "child_session_id": None},
-    )
-    assert not any(method == "turn/start" for method, _ in client.calls)
-    if failure != "fork":
-        register.assert_awaited_once()
-        ap_client.patch.assert_awaited_once()
     assert notices and notices[0][0] == "conv_parent"  # user-visible failure notice
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # discarded, not retried forever
 
@@ -783,16 +679,125 @@ def test_codex_native_subagent_wrapper_is_recognized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_side_turn_waits_for_saved_draft_settings() -> None:
-    client = _FakeCodexClient({"thread/fork": {"result": {"thread": {"id": "thread_side"}}}})
-    before_turn = AsyncMock(side_effect=RuntimeError("settings save failed"))
-    with pytest.raises(RuntimeError, match="settings save failed"):
-        await side_chat.open_side_chat_on_client(
-            client,
-            parent_thread_id="parent",
-            question="hello",
-            settings_override={"model": "gpt-6-sol"},
-            before_turn=before_turn,
+async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
+    client = _FakeCodexClient({"thread/read": {"result": {"thread": {}}}})
+    with pytest.raises(ValueError, match="capabilities unavailable"):
+        await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
+    assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]
+
+
+@pytest.mark.parametrize("lost_response", ["creation", "registration", "settings"])
+async def test_empty_side_chat_creation_recovers_the_same_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost_response: str
+) -> None:
+    from tests._helpers.polling import poll_until_async
+
+    request_id = str(uuid.uuid4())
+    codex = _FakeCodexClient(
+        {
+            "model/list": _CATALOG,
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+        }
+    )
+    _write_parent_settings(tmp_path, "gpt-6-sol", "high")
+    state = fwd._CodexForwarderState()
+    register = AsyncMock(
+        side_effect=[None, "conv_side"] if lost_response == "registration" else ["conv_side"]
+    )
+    monkeypatch.setattr(fwd, "_register_child_session", register)
+    server = AsyncMock()
+    ok = httpx.Response(200, request=httpx.Request("PATCH", "http://server"))
+    server.patch.side_effect = (
+        [httpx.ReadTimeout("response lost"), ok] if lost_response == "settings" else [ok]
+    )
+    creation = asyncio.create_task(side_chat.create_side_chat(tmp_path, request_id))
+    path = tmp_path / "side_chat_creations" / f"{request_id}.json"
+    await poll_until_async(path.exists, timeout_s=5)
+    # Lose the caller before the fork completes. A retry still names the same request.
+    creation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    async def drain() -> None:
+        await side_chat.drive_side_chat_creations(
+            codex,
+            server,
+            bridge_dir=tmp_path,
+            parent_session_id="conv_parent",
+            parent_thread_id="thread_parent",
+            forwarder_state=state,
         )
-    before_turn.assert_awaited_once_with("thread_side")
-    assert [method for method, _ in client.calls] == ["thread/fork"]
+
+    await drain()
+    await drain()
+    assert await side_chat.create_side_chat(tmp_path, request_id) == "conv_side"
+    assert await side_chat.create_side_chat(tmp_path, request_id) == "conv_side"
+    assert [method for method, _ in codex.calls if method != "model/list"] == ["thread/fork"]
+    assert server.patch.call_args.kwargs["json"] == {
+        "silent": True,
+        "model_override": "gpt-6-sol",
+        "reasoning_effort": "high",
+    }
+    assert json.loads(path.read_text())["child_session_id"] == "conv_side"
+
+
+async def test_ambiguous_native_fork_is_not_repeated(tmp_path: Path) -> None:
+    request_id = str(uuid.uuid4())
+    directory = tmp_path / "side_chat_creations"
+    directory.mkdir()
+    (directory / f"{request_id}.json").write_text(json.dumps({"state": "forking"}))
+    codex = _FakeCodexClient({})
+    await side_chat.drive_side_chat_creations(
+        codex,
+        AsyncMock(),
+        bridge_dir=tmp_path,
+        parent_session_id="parent",
+        parent_thread_id="thread",
+        forwarder_state=fwd._CodexForwarderState(),
+    )
+    with pytest.raises(RuntimeError, match="fork result was lost"):
+        await side_chat.create_side_chat(tmp_path, request_id)
+    assert codex.calls == []
+
+
+async def test_failed_child_registration_does_not_starve_other_creations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "side_chat_creations"
+    directory.mkdir()
+    for name in ("first", "second"):
+        (directory / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "state": "registering",
+                    "thread_id": name,
+                    "parent_thread_id": "parent",
+                    "settings": {},
+                }
+            )
+        )
+    monkeypatch.setattr(
+        side_chat,
+        "register_side_fork_child",
+        AsyncMock(
+            side_effect=[httpx.ReadTimeout("registration unavailable"), "second-child"],
+        ),
+    )
+    server = AsyncMock()
+    server.patch.return_value = httpx.Response(
+        200, request=httpx.Request("PATCH", "http://server")
+    )
+    codex = _FakeCodexClient({})
+    await side_chat.drive_side_chat_creations(
+        codex,
+        server,
+        bridge_dir=tmp_path,
+        parent_session_id="session",
+        parent_thread_id="parent",
+        forwarder_state=fwd._CodexForwarderState(),
+    )
+    assert "child_session_id" not in json.loads((directory / "first.json").read_text())
+    assert (
+        json.loads((directory / "second.json").read_text())["child_session_id"] == "second-child"
+    )
+    assert codex.calls == []

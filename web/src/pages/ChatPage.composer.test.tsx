@@ -1,3 +1,5 @@
+import * as sessionsApi from "@/lib/sessionsApi";
+import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import { create } from "zustand";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -47,6 +49,10 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
+vi.mock("@/hooks/useSideChatSettingsSupport", () => ({
+  useSideChatSettingsSupport: vi.fn(() => false),
+}));
+
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -5546,7 +5552,7 @@ describe("Composer reply quotes", () => {
   });
 });
 
-describe("Composer side-chat drafts", () => {
+describe("Composer startSideChat (text-select → Ask in side chat)", () => {
   beforeEach(() => {
     clearSessionDrafts();
     localStorage.clear();
@@ -5570,17 +5576,38 @@ describe("Composer side-chat drafts", () => {
     vi.restoreAllMocks();
   });
 
-  it("opens an empty Codex side-chat draft from the add tray without replacing the main draft", async () => {
+  it("deduplicates native slash creation and reuses its id after a lost response", async () => {
+    vi.mocked(useSideChatSettingsSupport).mockReturnValue(true);
+    onTestFinished(() => {
+      vi.mocked(useSideChatSettingsSupport).mockReturnValue(false);
+    });
+    let rejectCreation!: (cause: Error) => void;
+    const createSideChatMock = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectCreation = reject;
+          }),
+      )
+      .mockResolvedValueOnce({ childSessionId: "native_child" });
     render(<Composer {...composerProps()} />);
-    const user = userEvent.setup();
-    await user.type(textarea(), "Keep this parent draft");
-    await user.click(screen.getByTestId("composer-attach"));
-    await user.click(screen.getByRole("menuitem", { name: /Start a new side chat/ }));
-    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
-    expect(sideChatToOpen?.parentId).toBe("conv_test");
-    expect(sideChatToOpen?.childId).toMatch(/^pending:/);
-    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
-    expect(textarea()).toHaveValue("Keep this parent draft");
+    const input = screen.getByPlaceholderText("Send a message…");
+    fireEvent.change(input, { target: { value: "/side why?" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(createSideChatMock).toHaveBeenCalledTimes(1);
+    const requestId = createSideChatMock.mock.calls[0][2];
+    expect(requestId).toBeTruthy();
+    await act(async () => rejectCreation(new Error("response lost")));
+    expect(input).toHaveValue("/side why?");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(useChatStore.getState().sideChatToOpen?.childId).toBe("native_child"),
+    );
+    expect(createSideChatMock).toHaveBeenCalledTimes(2);
+    expect(createSideChatMock.mock.calls[1]).toEqual(["conv_test", undefined, requestId]);
+    expect(useChatStore.getState().sideChatDrafts.native_child).toBe("why?");
   });
 
   it("opens a pending side-chat tab quoting the selection, leaving the main composer empty", () => {

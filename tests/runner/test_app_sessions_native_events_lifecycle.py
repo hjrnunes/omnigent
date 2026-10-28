@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -5462,11 +5463,11 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command,inherited",
-    [(False, False), (False, True), (True, False)],
-    ids=["follow-up", "inherited-default", "side-command"],
+    [(False, False), (False, True), (True, False), ("create", False)],
+    ids=["follow-up", "inherited-default", "side-command", "empty-child"],
 )
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool | str, inherited: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5501,9 +5502,6 @@ async def test_events_codex_side_chat_preserves_indentation(
             {"type": "input_text", "text": f" \n /side {question}" if command else question}
         ],
     }
-    if command:
-        payload["side_chat_settings"] = {"model": "gpt-6-sol", "effort": "max"}
-        payload["side_chat_draft_id"] = "pending:test"
     if not command:
         payload["codex_side_thread_id"] = "thread_side"
         payload["model_override"] = "gpt-6-sol"
@@ -5514,17 +5512,22 @@ async def test_events_codex_side_chat_preserves_indentation(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
+        if command == "create":
+            create = AsyncMock(return_value="conv_side")
+            monkeypatch.setattr(side_chat, "create_side_chat", create)
+            request_id = "36d343b9-3d75-440a-8e02-9967dc43d78a"
+            response = await client.put(f"/v1/sessions/{conv_id}/side_chats/{request_id}")
+            assert response.status_code == 200, response.text
+            assert response.json() == {"child_session_id": "conv_side"}
+            create.assert_awaited_once_with(bridge_dir, request_id)
+            assert fake_client.requests == []
+            return
         response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
     assert response.status_code == 202, response.text
     if command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
             question
         ]
-        assert side_chat.peek_side_chat_requests(bridge_dir)[0].draft_id == "pending:test"
-        assert side_chat.peek_side_chat_requests(bridge_dir)[0].settings == {
-            "model": "gpt-6-sol",
-            "effort": "max",
-        }
         assert fake_client.requests == []
     else:
         assert [call for call in fake_client.requests if call[0] != "model/list"] == [
@@ -5646,7 +5649,7 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
         ),
         (ConnectionError("websocket closed 1011"), 503, "codex_side_chat_unavailable", None),
         (
-            ValueError("Codex model capabilities unavailable for None"),
+            SideChatEffortUnavailable("No model default"),
             409,
             "codex_side_chat_settings_unavailable",
             (

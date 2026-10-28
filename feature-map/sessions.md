@@ -407,10 +407,11 @@ If the native session's model list is empty, the picker uses the same host
 catalog as the main composer until the session's list arrives.
 Available choices follow the harness's capabilities; viewers and closed chats
 cannot change them. A failed start keeps the draft and selections for retry
-without changing the parent's settings. Native Codex advertises these controls only when the server and runner support
-side-thread settings. Its first message carries the draft choices through the
-parent runner to the ephemeral child thread. Creation-result recovery is still
-incomplete: a lost completion delivery or executor fallback can strand a draft.
+without changing the parent's settings. Native Codex shows these controls when
+both server and runner support them. It creates an empty ephemeral child, saves
+selections through the session API, then sends the first message normally.
+Retrying a lost creation response recovers the same child. A lost native fork
+RPC result is reported as an error rather than automatically forking again.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -745,8 +746,9 @@ plain `uv run pytest`, which starts a private server for the test.
   inherited context in the model request, isolated follow-ups, and a parent
   that stays usable after closing its side chat. Desktop/mobile variants select
   draft model and effort and change follow-up effort; scripted provider requests
-  verify child-only application. These scenarios do not cover lost completion
-  delivery or the executor fallback.
+  verify child-only application. The desktop scenario drops the creation HTTP
+  response after the fork succeeds and verifies that retry uses the same child,
+  then exercises the Workspace menu, text selection, and `/side` entry points.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,

@@ -49,7 +49,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   and capability rules. Draft selections apply when the child is created;
   live selections update that child's session. A live Claude picker follows
   the runner's reported model if a requested change is refused. Native Codex
-  side chats do not expose these controls.
+  side-thread selections apply to the next turn without changing the parent;
+  older runners hide these controls.
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with

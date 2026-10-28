@@ -70,13 +70,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
-import {
-  newPendingSideChatId,
-  SIDE_CHAT_COMMAND_PREFIX,
-  supportsSideChat,
-  usesNativeSideChatFork,
-} from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
+import { ApiError, createSideChat, stopSession } from "@/lib/sessionsApi";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import {
@@ -896,20 +891,25 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const activeHarness = useChatStore((s) => s.sessionHarness);
   const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
-  const nativeSettingsSupported = useSideChatSettingsSupport(
-    conversationId,
-    usesNativeSideChatFork(sideChatHarness),
-  );
-  const legacyPendingIdsRef = useRef<string[]>([]);
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     activeSideChatRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [sideChats.selected, rightRailTab]);
+  // Pending tabs awaiting a real child id, in submit order. Only Codex uses this
+  // queue — its child arrives asynchronously via session_created with no id to
+  // pair on, so a signal rekeys the OLDEST awaiting tab (FIFO). A single ref
+  // would cross-assign when two launches overlap; the generic path skips the
+  // queue entirely and rekeys its own tab directly (see startPendingSideChat).
+  const nativeSettingsSupported = useSideChatSettingsSupport(
+    conversationId,
+    usesNativeSideChatFork(sideChatHarness),
+  );
+  const awaitingPendingIdsRef = useRef<string[]>([]);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
-  // rekey it after first-turn acceptance; otherwise open a fresh tab.
+  // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
   useEffect(() => {
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
@@ -925,7 +925,7 @@ function WorkspacePanelImpl({
     } else {
       // Started this session → live (not a dead restored Codex fork).
       sideChatsStartedThisSession.add(childId);
-      const awaiting = sideChatToOpen.pendingId ?? legacyPendingIdsRef.current.shift();
+      const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
         useChatStore.getState().clearSideChatComposer(awaiting);
@@ -953,41 +953,32 @@ function WorkspacePanelImpl({
         onRightRailTabChange("sidechat");
       }
     : undefined;
-  // First message sent in a pending side-chat tab: create the fork now. The
-  // pending tab stays put and is rekeyed to the real child once it arrives (via
-  // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
-  // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side and reuses
-  // the parent's live runner. Rejects so the composer re-enables and keeps
-  // the typed text for a retry.
+  // Create the child before sending. Stable draft IDs recover native forks
+  // after a lost response; old runners retain their plaintext /side path.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    const settings = useChatStore.getState().sideChatComposers[pendingId]?.settings;
-    if (usesNativeSideChatFork(sideChatHarness)) {
-      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
-      if (!nativeSettingsSupported) {
-        if (settings && Object.keys(settings).length > 0) {
-          toast.error("Update the host and restart the session to apply these side-chat settings.");
-          return Promise.reject(new Error("side chat settings unsupported"));
-        }
-        legacyPendingIdsRef.current.push(pendingId);
+    if (usesNativeSideChatFork(sideChatHarness) && !nativeSettingsSupported) {
+      const settings = useChatStore.getState().sideChatComposers[pendingId]?.settings;
+      if (settings && Object.keys(settings).length) {
+        toast.error("Update the host and restart the session to apply these side-chat settings.");
+        return Promise.reject(new Error("Side-chat settings unavailable"));
       }
-      const requestId = nativeSettingsSupported ? newPendingSideChatId() : undefined;
-      if (requestId)
-        useChatStore.getState().updateSideChatComposer(pendingId, (current) => ({
-          ...current,
-          startRequestId: requestId,
-        }));
-      // Older backends settle through session.created; capable runners acknowledge the turn.
+      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
+      // The child arrives asynchronously via session_created with no id to pair
+      // on, so queue this tab to be rekeyed FIFO. The question goes to the
+      // PARENT as `/side`; the native fork seeds the child's first turn. `send`
+      // resolves after its internal catch, so a failure (e.g. the host is too
+      // old to fork — the server refuses) has set `sendFailed` by the time the
+      // await returns; reject then so the pending pane resets and drop the
+      // queued tab so it never waits for a child that isn't coming.
+      awaitingPendingIdsRef.current.push(pendingId);
       let sendFailed = false;
       return useChatStore
         .getState()
         .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
           pinnedConversationId: conversationId,
-          sideChatSettings: nativeSettingsSupported ? settings : undefined,
-          sideChatDraftId: requestId,
           onError: (message) => {
             sendFailed = true;
-            legacyPendingIdsRef.current = legacyPendingIdsRef.current.filter(
+            awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
               (id) => id !== pendingId,
             );
             toast.error(message);
@@ -997,7 +988,11 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
-    return createSideChat(conversationId, settings).then(
+    return createSideChat(
+      conversationId,
+      useChatStore.getState().sideChatComposers[pendingId]?.settings,
+      ...(usesNativeSideChatFork(sideChatHarness) ? [pendingId] : []),
+    ).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
@@ -1012,7 +1007,9 @@ function WorkspacePanelImpl({
       (err) => {
         // The rail path had no failure feedback (unlike the composer entry
         // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error("Couldn't start a side chat for this session.");
+        toast.error(
+          err instanceof ApiError ? err.message : "Couldn't start a side chat for this session.",
+        );
         throw err;
       },
     );

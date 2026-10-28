@@ -557,6 +557,7 @@ class _CodexForwarderState:
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
+    side_chat_registration_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     synced_item_keys: set[str] = field(default_factory=set)
@@ -2385,7 +2386,11 @@ async def supervise_forwarder(
         )
         side_chat_task = asyncio.create_task(
             _drive_side_chat_requests(
-                client, ap_client=ap_client, bridge_dir=bridge_dir, target=target
+                client,
+                ap_client=ap_client,
+                bridge_dir=bridge_dir,
+                target=target,
+                forwarder_state=forwarder_state,
             ),
             name="codex-native-forwarder-side-chat",
         )
@@ -2477,6 +2482,7 @@ async def _drive_side_chat_requests(
     ap_client: httpx.AsyncClient,
     bridge_dir: Path,
     target: _ForwarderTarget,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> None:
     """
     Fork the ``/side`` questions the executor recorded, on this connection.
@@ -2509,75 +2515,31 @@ async def _drive_side_chat_requests(
             # Only claim once the parent thread exists — a request read before
             # then can't fork, and consuming it would lose the question (#3).
             if parent_thread_id is not None:
+                if forwarder_state is not None:
+                    await side_chat.drive_side_chat_creations(
+                        codex_client,
+                        ap_client,
+                        bridge_dir=bridge_dir,
+                        parent_session_id=target.session_id,
+                        parent_thread_id=parent_thread_id,
+                        forwarder_state=forwarder_state,
+                    )
                 for request in side_chat.peek_side_chat_requests(bridge_dir):
-                    child_session_id: str | None = None
-                    succeeded = False
-
-                    async def configure_child(
-                        child_thread_id: str,
-                        parent_thread_id: str = parent_thread_id,
-                        settings: dict[str, str | None] = request.settings or {},
-                    ) -> None:
-                        nonlocal child_session_id
-                        child_session_id = await _register_child_session(
-                            ap_client,
-                            parent_session_id=target.session_id,
-                            parent_thread_id=parent_thread_id,
-                            child_thread_id=child_thread_id,
-                            item={"agent_nickname": side_chat.SIDE_CHAT_DISPLAY_NAME},
-                        )
-                        if child_session_id is None:
-                            raise RuntimeError("Could not register side chat")
-                        if not settings:
-                            return
-                        response = await ap_client.patch(
-                            f"/v1/sessions/{child_session_id}",
-                            json={
-                                "silent": True,
-                                **(
-                                    {"model_override": settings["model"]}
-                                    if "model" in settings
-                                    else {}
-                                ),
-                                **(
-                                    {"reasoning_effort": settings["effort"] or "default"}
-                                    if "effort" in settings
-                                    else {}
-                                ),
-                            },
-                        )
-                        response.raise_for_status()
-
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
                             bridge_dir=bridge_dir,
-                            settings_override=request.settings,
-                            before_turn=configure_child
-                            if request.settings or request.draft_id
-                            else None,
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                        succeeded = True
                     except Exception:  # one bad request must not drop the rest.
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
                         await _post_side_chat_failed_notice(
                             ap_client, target.session_id, request.path.stem
-                        )
-                    if request.draft_id is not None:
-                        await _post_session_event(
-                            ap_client,
-                            target.session_id,
-                            event_type="external_side_chat_result",
-                            data={
-                                "draft_id": request.draft_id,
-                                "child_session_id": child_session_id if succeeded else None,
-                            },
                         )
                     # Remove whether it forked or failed: a forked request is
                     # done, and a failed one has surfaced a notice — keeping it

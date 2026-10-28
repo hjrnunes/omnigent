@@ -1,5 +1,4 @@
-import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -29,8 +28,9 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
 vi.mock("@/hooks/useSideChatSettingsSupport", () => ({
-  useSideChatSettingsSupport: vi.fn(() => true),
+  useSideChatSettingsSupport: vi.fn(() => false),
 }));
+
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
@@ -92,21 +92,8 @@ vi.mock("@/hooks/useAgents", () => ({
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 // A side chat's pane is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({
-    childId,
-    onStart,
-  }: {
-    childId: string;
-    onStart?: (text: string) => Promise<void>;
-  }) => (
-    <div data-testid="side-chat-pane-stub">
-      {childId}
-      {childId.startsWith("pending:") && onStart && (
-        <button type="button" onClick={() => void onStart("hello")}>
-          Start side chat
-        </button>
-      )}
-    </div>
+  SideChatPane: ({ childId }: { childId: string }) => (
+    <div data-testid="side-chat-pane-stub">{childId}</div>
   ),
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
@@ -121,7 +108,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.mocked(useSideChatSettingsSupport).mockReturnValue(true);
   cleanup();
   localStorage.clear();
   vi.clearAllMocks();
@@ -1542,30 +1528,4 @@ it("keeps a contained workspace inline on narrow viewports and scopes its file b
     "flex",
   );
   expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-session", "conv_ws");
-});
-
-it("settles an older backend's pending native tab through session.created", async () => {
-  vi.mocked(useSideChatSettingsSupport).mockReturnValue(false);
-  useChatStore.setState({
-    sessionHarness: "codex-native",
-    boundAgentId: "agent",
-    sideChatComposers: { "pending:legacy": { text: "hello", files: [], starting: true } },
-  });
-  writeSessionWorkspaceState("conv_ws", {
-    openSideChats: ["pending:legacy"],
-    selectedSideChatId: "pending:legacy",
-  });
-  const send = vi.spyOn(useChatStore.getState(), "send").mockResolvedValue(undefined);
-  renderWorkspace({ rightRailTab: "sidechat" });
-  fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
-  await waitFor(() => expect(send).toHaveBeenCalled());
-  expect(send.mock.calls[0][3]?.sideChatDraftId).toBeUndefined();
-  expect(send.mock.calls[0][3]?.sideChatSettings).toBeUndefined();
-  act(() =>
-    useChatStore.setState({ sideChatToOpen: { childId: "legacy-child", parentId: "conv_ws" } }),
-  );
-  await waitFor(() =>
-    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("legacy-child"),
-  );
-  expect(useChatStore.getState().sideChatComposers["pending:legacy"]).toBeUndefined();
 });

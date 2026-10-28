@@ -625,7 +625,7 @@ it("uses the parent catalog while targeting a native Codex side thread", async (
   await waitFor(() =>
     expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
       modelOverride: "model-b",
-      reasoningEffort: "low",
+      reasoningEffort: null,
     }),
   );
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);

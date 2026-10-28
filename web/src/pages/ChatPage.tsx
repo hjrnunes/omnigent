@@ -1,3 +1,4 @@
+import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -2567,6 +2568,13 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  const nativeSideSettingsSupported = useSideChatSettingsSupport(
+    composerSessionId,
+    usesNativeSideChatFork(sessionHarness),
+  );
+  const sideChatRequestRef = useRef<{ sourceId: string; id: string; creating: boolean } | null>(
+    null,
+  );
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
@@ -3598,17 +3606,24 @@ function ComposerImpl(
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
-    // A generic (non-Codex) side chat forks the conversation and runs it on the
-    // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
-    // tab; the typed text seeds the new side chat's composer so it isn't fired
-    // at a still-launching runner. Codex forks in-process instead (its /side
-    // reaches the runner as plaintext).
-    const openGenericSideChat = (question: string) => {
+    // Create the child first, then send through its normal composer lifecycle.
+    const openSideChat = (question: string) => {
       const sourceId = useChatStore.getState().conversationId;
       if (sourceId === null) return;
       setCommandError(null);
-      createSideChat(sourceId).then(
+      if (sideChatRequestRef.current?.sourceId !== sourceId) {
+        sideChatRequestRef.current = { sourceId, id: crypto.randomUUID(), creating: false };
+      }
+      const request = sideChatRequestRef.current;
+      if (request.creating) return;
+      request.creating = true;
+      const creation = usesNativeSideChatFork(sessionHarness)
+        ? createSideChat(sourceId, undefined, request.id)
+        : createSideChat(sourceId);
+      creation.then(
         ({ childSessionId }) => {
+          request.creating = false;
+          if (sideChatRequestRef.current === request) sideChatRequestRef.current = null;
           // Clear the composer only once the side chat exists, so a failed
           // create keeps the user's typed question instead of dropping it.
           dirtyRef.current = true;
@@ -3617,7 +3632,14 @@ function ComposerImpl(
         },
         // Surface the failure as a toast, not an inline composer error; the
         // composer text is left intact for a retry.
-        () => toast.error("Couldn't start a side chat for this session."),
+        (cause) => {
+          request.creating = false;
+          toast.error(
+            cause instanceof ApiError
+              ? cause.message
+              : "Couldn't start a side chat for this session.",
+          );
+        },
       );
     };
 
@@ -3694,11 +3716,13 @@ function ComposerImpl(
         );
         return;
       }
-      // /side opens a side chat. Codex forks in-process (falls through to the
-      // plaintext path so its runner forks); every other harness forks
-      // server-side here into an empty side chat, carrying the typed question.
-      if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
-        runCommand(() => openGenericSideChat(trimmed.slice(cmd.length).trim()));
+      // Older Codex runners accept plaintext /side; current runners create an
+      // empty child through the session API before receiving the question.
+      if (
+        cmd === "/side" &&
+        (!usesNativeSideChatFork(sessionHarness) || nativeSideSettingsSupported)
+      ) {
+        runCommand(() => openSideChat(trimmed.slice(cmd.length).trim()));
         return;
       }
       // Known skill on an in-process session: send a `slash_command` event so

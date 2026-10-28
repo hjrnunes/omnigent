@@ -41,37 +41,6 @@ def _message_event() -> SessionEventInput:
     )
 
 
-async def test_native_side_chat_rejects_settings_if_runner_lost_support() -> None:
-    from unittest.mock import AsyncMock, Mock
-
-    from omnigent.errors import OmnigentError
-    from omnigent.server.routes._sessions.orchestration import (
-        _dispatch_session_event_to_runner_impl,
-    )
-
-    conv = _conversation_with_wrapper("codex-native-ui")
-    body = _message_event()
-    body.data.update(
-        content=[{"type": "input_text", "text": "/side question"}],
-        side_chat_draft_id="pending:test",
-    )
-    runner = AsyncMock()
-    runner.get.return_value = httpx.Response(404)
-    with pytest.raises(OmnigentError, match="cannot apply side-chat settings"):
-        await _dispatch_session_event_to_runner_impl(
-            conv.id,
-            conv,
-            body,
-            Mock(),
-            runner,
-            agent_name=None,
-            file_store=None,
-            artifact_store=None,
-            native_terminal_ready=True,
-        )
-    runner.post.assert_not_awaited()
-
-
 def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
     """
     Codex-native sessions use the native bypass and dispatch web
@@ -318,52 +287,3 @@ def test_wrapper_label_session_is_native_without_resolving_harness(
 
     monkeypatch.setattr(sessions_routes, "_resolve_harness", _must_not_run)
     assert sessions_routes._is_native_terminal_session(conv) is True
-
-
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {"model": "gpt-6-sol", "effort": "max"},
-        {"effort": "high"},
-        {"model": "gpt-6-sol", "effort": None},
-    ],
-)
-def test_native_side_chat_settings_are_forwarded_without_changing_parent(
-    settings: dict[str, str | None],
-) -> None:
-    from omnigent.server.routes import sessions as routes
-
-    conv = _conversation_with_wrapper("codex-native-ui")
-    message = _message_event()
-    message.data["content"] = [{"type": "input_text", "text": "/side hello"}]
-    message.data["side_chat_settings"] = settings
-    message.data["side_chat_draft_id"] = "pending:test"
-    event = routes._build_native_terminal_message_event(conv, message)
-    assert event["side_chat_settings"] == settings
-    assert event["side_chat_draft_id"] == "pending:test"
-    assert "model_override" not in event
-    assert conv.model_override is None
-    assert conv.reasoning_effort is None
-
-
-@pytest.mark.parametrize(
-    "settings,wrapper,text",
-    [
-        ("high", "codex-native-ui", "/side hello"),
-        ({"effort": "invalid"}, "codex-native-ui", "/side hello"),
-        ({"model": 10}, "codex-native-ui", "/side hello"),
-        ({"effort": "high"}, "claude-code-native-ui", "/side hello"),
-        ({"effort": "high"}, "codex-native-ui", "hello"),
-    ],
-)
-def test_native_side_chat_rejects_invalid_settings(
-    settings: object, wrapper: str, text: str
-) -> None:
-    from omnigent.errors import OmnigentError
-    from omnigent.server.routes import sessions as routes
-
-    message = _message_event()
-    message.data["content"] = [{"type": "input_text", "text": text}]
-    message.data["side_chat_settings"] = settings
-    with pytest.raises(OmnigentError):
-        routes._build_native_terminal_message_event(_conversation_with_wrapper(wrapper), message)

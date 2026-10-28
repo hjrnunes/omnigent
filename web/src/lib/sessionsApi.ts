@@ -11,7 +11,7 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
-import type { SideChatModelSettings } from "./sideChat";
+import { usesNativeSideChatFork, type SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
@@ -897,8 +897,8 @@ export async function forkSession(
 /**
  * Fork a generic side chat in the parent's current working directory.
  * Reuse the parent's live runner, relaunching the parent first if it has
- * stopped. In-process sessions use normal server dispatch. Codex uses its
- * native `/side` fork instead.
+ * stopped. Native Codex creates an empty thread on that runner; other harnesses
+ * use the ordinary session fork. Both return before the first message.
  *
  * Like native Codex side chats, these share the parent's workspace. A saved
  * branch may belong to a previous host and must not be required to send.
@@ -910,6 +910,7 @@ export async function forkSession(
 export async function createSideChat(
   sourceId: string,
   settings?: SideChatModelSettings,
+  requestId?: string,
 ): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
   if (
@@ -925,6 +926,18 @@ export async function createSideChat(
     source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
   if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
+  }
+  if (usesNativeSideChatFork(source.harness)) {
+    const id = (requestId ?? crypto.randomUUID()).replace(/^pending:/, "");
+    const response = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sourceId)}/side_chats/${encodeURIComponent(id)}`,
+      { method: "PUT" },
+    );
+    const { child_session_id: childSessionId } = await readJsonOrThrow<{
+      child_session_id: string;
+    }>(response);
+    if (settings && Object.keys(settings).length) await updateSession(childSessionId, settings);
+    return { childSessionId };
   }
   const fork = await forkSession(sourceId, {
     title: "Side chat",
