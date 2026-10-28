@@ -25,6 +25,7 @@ from omnigent.inner.executor import (
     SubAgentCompleted,
     SubAgentStarted,
     ToolCallRequest,
+    TurnCancelled,
     TurnComplete,
 )
 
@@ -299,6 +300,55 @@ async def test_dangling_children_complete_before_a_timeout_error(
     error_idx = next(idx for idx, event in enumerate(events) if isinstance(event, ExecutorError))
     assert completion_idx < error_idx
     assert events[completion_idx].ok is False
+
+
+async def test_interrupted_approval_wait_completes_the_open_child_once() -> None:
+    """A cancel during a parked approval must close the Task child before unwinding.
+
+    The scaffold's interrupt handler cancels the policy / elicitation Future the
+    permission decision awaits, so ``run_turn`` resumes with ``CancelledError``.
+    That exit must still deliver one failed completion per open child and end
+    the stream with ``TurnCancelled`` — not leave the child running or raise.
+    """
+    executor = _ready_executor()
+
+    async def cancelling_permission(params: dict[str, Any]) -> bool:
+        raise asyncio.CancelledError()
+
+    executor._decide_permission = cancelling_permission  # type: ignore[method-assign]
+
+    async def fake_send(msg: dict[str, Any]) -> None:
+        if msg.get("method") != "session/prompt":
+            return
+        await executor._queue.put(_notification(_task_tool_call()))
+        await executor._queue.put(
+            {
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess-1",
+                    "toolCall": {
+                        "toolCallId": "tc-shell-1",
+                        "title": "Write probe.txt",
+                        "kind": "edit",
+                    },
+                    "options": [],
+                },
+            }
+        )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = await _collect(executor)
+
+    completions = [event for event in events if isinstance(event, SubAgentCompleted)]
+    assert len(completions) == 1
+    assert completions[0].child_key == "tc-task-1"
+    assert completions[0].ok is False
+    assert "interrupt" in completions[0].summary
+    assert isinstance(events[-1], TurnCancelled)
+    assert executor._open_task_children == {}
 
 
 async def test_open_children_do_not_leak_across_turns() -> None:

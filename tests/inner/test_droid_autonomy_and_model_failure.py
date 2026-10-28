@@ -30,6 +30,7 @@ import sys
 record_path = os.environ["FAKE_DROID_RECORD"]
 set_autonomy_mode = os.environ.get("FAKE_DROID_SET_AUTONOMY", "ok")
 set_model_mode = os.environ.get("FAKE_DROID_SET_MODEL", "ok")
+notify_value = os.environ.get("FAKE_DROID_NOTIFY_VALUE", "normal")
 autonomy_options = ["normal", "spec", "auto-low", "auto-medium", "auto-high"]
 state = {
     "session": "fake-session-1",
@@ -43,12 +44,12 @@ def send(value):
     print(json.dumps(value), flush=True)
 
 
-def config_options():
+def config_options(autonomy=None):
     return [
         {
             "id": "autonomy_level",
             "type": "select",
-            "currentValue": state["autonomy"],
+            "currentValue": autonomy or state["autonomy"],
             "options": [{"value": value, "name": value} for value in autonomy_options],
         },
         {
@@ -58,6 +59,22 @@ def config_options():
             "options": [{"value": state["model"], "name": state["model"]}],
         },
     ]
+
+
+def send_config_option_update(value, session):
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session,
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": config_options(autonomy=value),
+                },
+            },
+        }
+    )
 
 
 for line in sys.stdin:
@@ -79,6 +96,10 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": 1, "agentCapabilities": {}}
     elif method == "session/new":
+        if set_autonomy_mode == "notify-before-setter":
+            # Report the tier the spec will ask for before the setter is sent:
+            # this is starting state, not an echo of our request.
+            send_config_option_update(notify_value, state["session"])
         result = {"sessionId": state["session"], "configOptions": config_options()}
     elif method == "session/set_config_option":
         if set_autonomy_mode == "silent":
@@ -98,23 +119,15 @@ for line in sys.stdin:
             continue
         if set_autonomy_mode != "mismatch":
             state["autonomy"] = value
-        if set_autonomy_mode in ("empty-result", "notify"):
+        if set_autonomy_mode == "notify-wrong-session":
+            # Post-setter, but reported for a different session: not our echo.
+            send_config_option_update(value, "some-other-session")
+            result = {}
+        elif set_autonomy_mode in ("empty-result", "notify", "notify-before-setter"):
             # No echo in the reply: either nothing at all, or a
             # config_option_update notification carrying the new value first.
             if set_autonomy_mode == "notify":
-                send(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": state["session"],
-                            "update": {
-                                "sessionUpdate": "config_option_update",
-                                "configOptions": config_options(),
-                            },
-                        },
-                    }
-                )
+                send_config_option_update(value, state["session"])
             result = {}
         elif set_autonomy_mode == "empty-options":
             result = {"configOptions": []}
@@ -342,6 +355,42 @@ async def test_autonomy_is_accepted_from_a_correlated_config_option_update(
     assert not [event for event in events if isinstance(event, ExecutorError)]
     assert [event for event in events if isinstance(event, TurnComplete)]
     assert "session/prompt" in _methods(tmp_path)
+
+
+async def test_autonomy_is_rejected_from_a_notification_queued_before_the_setter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``config_option_update`` from before the setter is starting state.
+
+    The peer reports the requested tier during ``session/new`` and then answers
+    the setter with an empty result. Only a notification that arrives after the
+    setter was sent can be its echo; accepting the earlier one turns a silent
+    setter into an apparent success.
+    """
+    peer = _install_peer(tmp_path, monkeypatch, set_autonomy="notify-before-setter")
+
+    events = await _turn(_executor(peer, tmp_path, auto="normal"))
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert "'normal'" in errors[0].message
+    assert "echo" in errors[0].message
+    assert "session/prompt" not in _methods(tmp_path)
+
+
+async def test_autonomy_is_rejected_from_a_notification_for_another_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``config_option_update`` for a different session is not our echo."""
+    peer = _install_peer(tmp_path, monkeypatch, set_autonomy="notify-wrong-session")
+
+    events = await _turn(_executor(peer, tmp_path, auto="normal"))
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert "'normal'" in errors[0].message
+    assert "echo" in errors[0].message
+    assert "session/prompt" not in _methods(tmp_path)
 
 
 async def test_silent_autonomy_setter_fails_with_a_contextual_timeout(
