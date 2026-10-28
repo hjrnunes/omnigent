@@ -215,9 +215,9 @@ _AUTONOMY_CONFIG_ID = "autonomy_level"
 # ``session/set_config_option`` is sent at all.
 _AUTONOMY_INHERIT = "inherit"
 
-# ``tool_call`` title droid's sub-agent spawn tool reports. VERIFIED live: the
-# parent stream carries no sub-agent messages, only this call and its terminal
-# ``tool_call_update``.
+# Title droid 0.228 gave its sub-agent spawn tool. Droid 0.251 titles the call
+# ``<subagent_type>: <description>`` instead, so detection also keys on
+# ``rawInput.subagent_type`` (the stable marker across both).
 _TASK_TOOL_TITLE = "Task"
 
 # Summary recorded on a Task child that the turn ended without an outcome for.
@@ -1085,36 +1085,42 @@ class DroidExecutor(Executor):
         )
 
     # ------------------------------------------------------------------
-    # Task sub-agent lifecycle (session/update tool_call titled "Task")
+    # Task sub-agent lifecycle (session/update tool_call spawning a child)
     # ------------------------------------------------------------------
 
     def _task_start_event(self, update: dict[str, Any]) -> SubAgentStarted | None:  # type: ignore[explicit-any]
-        """Map a ``Task`` tool-call update onto a :class:`SubAgentStarted`.
+        """Map a droid sub-agent spawn call onto a :class:`SubAgentStarted`.
 
-        Droid reports its sub-agent spawn as an ordinary ``tool_call`` titled
-        ``Task``; ``rawInput`` carries the delegated ``prompt`` and the row
-        ``description``. Returns ``None`` for every other tool, for a Task
-        update without input, and for a repeated update for a child already
+        Droid reports its sub-agent spawn as an ordinary ``tool_call``;
+        ``rawInput`` carries the delegated ``prompt`` and the row
+        ``description``. Returns ``None`` for every other tool, for a spawn
+        call without input, and for a repeated update for a child already
         started.
 
         VERIFIED live: the parent stream carries no sub-agent messages, so this
         edge and the terminal update are the only account of the child's work.
+        Droid 0.228 titled the call ``Task``; 0.251 titles it
+        ``<subagent_type>: <description>``, so the ``subagent_type`` input is the
+        marker detection relies on.
         """
-        if str(update.get("title") or "") != _TASK_TOOL_TITLE:
-            return None
         raw_input = update.get("rawInput")
         if not isinstance(raw_input, dict):
+            return None
+        subagent_type = raw_input.get("subagent_type")
+        has_subagent_type = isinstance(subagent_type, str) and bool(subagent_type)
+        if str(update.get("title") or "") != _TASK_TOOL_TITLE and not has_subagent_type:
             return None
         call_id = update.get("toolCallId") or update.get("id")
         key = str(call_id) if call_id is not None else ""
         if not key or key in self._open_task_children:
             return None
         description = raw_input.get("description")
-        title = (
-            description
-            if isinstance(description, str) and description
-            else str(raw_input.get("subagent_type") or "") or _TASK_TOOL_TITLE
-        )
+        if isinstance(description, str) and description:
+            title = description
+        elif has_subagent_type:
+            title = str(subagent_type)
+        else:
+            title = _TASK_TOOL_TITLE
         prompt = raw_input.get("prompt")
         self._open_task_children[key] = title
         return SubAgentStarted(

@@ -145,6 +145,32 @@ async def test_task_tool_call_starts_a_child_and_terminal_update_completes_it() 
     assert [event for event in events if isinstance(event, TurnComplete)]
 
 
+async def test_droid_251_title_shape_starts_a_child() -> None:
+    """Droid 0.251 titles the Task call ``<subagent_type>: <description>``.
+
+    VERIFIED live against droid 0.251.0: the call is titled
+    ``"Worker: Compute 2 plus 2"``, not ``"Task"``, so detection keys on the
+    ``subagent_type`` input.
+    """
+    executor = _ready_executor()
+    _drive(
+        executor,
+        _task_tool_call(title=f"Worker: {TASK_DESCRIPTION}"),
+        _task_tool_call_update(raw_output={"text": "4"}),
+    )
+
+    events = await _collect(executor)
+
+    starts = [event for event in events if isinstance(event, SubAgentStarted)]
+    assert starts == [
+        SubAgentStarted(
+            child_key="tc-task-1",
+            title=TASK_DESCRIPTION,
+            task=TASK_PROMPT,
+        )
+    ]
+
+
 async def test_repeated_tool_call_for_the_same_id_starts_one_child() -> None:
     """Droid can re-send ``tool_call`` as the call's status advances."""
     executor = _ready_executor()
