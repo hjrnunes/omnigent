@@ -74,6 +74,12 @@ interface FilesPanelProps {
    */
   onClose?: () => void;
   /**
+   * False while the panel is kept mounted but hidden behind a file or shell
+   * tab. Hiding drops the list's scroll offset, so showing it again re-arms
+   * the saved-offset restore.
+   */
+  active?: boolean;
+  /**
    * Frameless mode: drops the rounded card chrome and fills the parent
    * container's height (like the `onClose` drawer) — but without a close
    * button. Used by the inline right panel where the panel is embedded in a
@@ -220,12 +226,9 @@ function SearchFilterInput({
 
 /**
  * Browse location per conversation, surviving unmount/remount within a JS
- * session. Opening a file swaps this panel for the FileViewer (see
- * WorkspacePanel's content slot), which unmounts it — with plain state,
- * closing the viewer snapped the tree back to the workspace root instead of
- * the directory the file was opened from. Same pattern as FolderTree's
- * expandedPathsCache. Keyed by conversation, so a session switch still lands
- * on that session's own last location (or its root), never another's.
+ * session (e.g. a session switch, or the mobile drawer closing). Same pattern
+ * as FolderTree's expandedPathsCache. Keyed by conversation, so a session
+ * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
 
@@ -248,6 +251,7 @@ export function FilesPanel({
   onSortChange,
   onClose,
   frameless,
+  active = true,
 }: FilesPanelProps) {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const conversationId = sessionId ?? routeId;
@@ -301,8 +305,7 @@ export function FilesPanel({
   // workspace chip uses.
   const { session } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
-  // from the per-conversation cache so the location survives the panel
-  // unmounting while a file is open in the viewer.
+  // from the per-conversation cache so the location survives a remount.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );
@@ -459,9 +462,8 @@ export function FilesPanel({
   // `isLoading` — the files queries are disabled (not loading) until the
   // environment query resolves.
   const scrollRef = useRef<HTMLElement>(null);
-  const scrollKey = conversationId
-    ? `files:${conversationId}:${flatView ? "changed" : "all"}`
-    : null;
+  const scrollKey =
+    active && conversationId ? `files:${conversationId}:${flatView ? "changed" : "all"}` : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
   // An idle-stopped managed sandbox is asleep, not failed: its status stays

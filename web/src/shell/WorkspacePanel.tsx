@@ -1362,6 +1362,18 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
+  // FilesPanel is the slot's default view. A file or shell tab overlays it, so
+  // it stays mounted (hidden) to keep its tree expansion, listing and scroll.
+  const filesPanelMounted =
+    showFilesPanel &&
+    !pending &&
+    !(sideChatSelected && !isMobile) &&
+    !(browserSelected && showBrowserTab) &&
+    !(rightRailTab === "github" && showGithubTab) &&
+    !(rightRailTab === "subagents" && rootSessionId) &&
+    rightRailTab !== null &&
+    !(rightRailTab === "content-search" && showContentSearch);
+  const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1698,8 +1710,8 @@ function WorkspacePanelImpl({
         </div>
         {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list); Subagents lists the root's children +
-          a "main" link back to the parent. */}
+          (tree vs changed-only list), kept mounted behind a file or shell;
+          Subagents lists the root's children + a "main" link back. */}
         <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {showContentSearch && showFilesPanel && !pending && (
             <div
@@ -1715,6 +1727,21 @@ function WorkspacePanelImpl({
                 key={conversationId}
                 conversationId={conversationId}
                 onFileSelect={openFileViewer}
+              />
+            </div>
+          )}
+          {filesPanelMounted && (
+            <div className={cn("min-h-0 flex-1 flex-col", filesPanelActive ? "flex" : "hidden")}>
+              <FilesPanel
+                conversationId={contained ? conversationId : undefined}
+                frameless
+                active={filesPanelActive}
+                onFileSelect={openFileViewer}
+                flatView={rightRailTab === "changes"}
+                showHidden={filesPanelShowHidden}
+                onShowHiddenChange={onShowHiddenChange}
+                sort={filesPanelSort}
+                onSortChange={onSortChange}
               />
             </div>
           )}
@@ -1778,20 +1805,7 @@ function WorkspacePanelImpl({
               <PlusIcon className="size-6" />
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
             </div>
-          ) : rightRailTab === "content-search" && showContentSearch ? null : (
-            showFilesPanel && (
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
-            )
-          )}
+          ) : null}
         </div>
       </div>
     </aside>

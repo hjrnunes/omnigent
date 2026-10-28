@@ -44,11 +44,20 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+  FilesPanel: ({
+    flatView,
+    conversationId,
+    active,
+  }: {
+    flatView: boolean;
+    conversationId: string;
+    active?: boolean;
+  }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
+      data-active={String(active)}
     />
   ),
 }));
@@ -631,16 +640,26 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-media-active", "false");
   });
 
-  it("renders the FileViewer for the active path (not the scope panel)", () => {
-    renderWorkspace({
+  it("keeps the FilesPanel mounted but hidden behind the active file", () => {
+    const { rerender } = renderWorkspace({
       openFiles: ["src/App.tsx"],
-      selectedFilePath: "src/App.tsx",
+      selectedFilePath: null,
     });
+    const panel = screen.getByTestId("files-panel-stub");
+    expect(panel).toHaveAttribute("data-active", "true");
 
-    // A selected file shows its viewer in the content slot; the scope panel
-    // must not also mount. The stub echoes the path it received.
+    rerender({ selectedFilePath: "src/App.tsx" });
+    // The viewer owns the slot; the scope panel stays mounted (same node, so
+    // tree state survives) inside a hidden wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
-    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel).toHaveAttribute("data-active", "false");
+    expect(panel.parentElement).toHaveClass("hidden");
+
+    rerender({ selectedFilePath: null });
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel).toHaveAttribute("data-active", "true");
+    expect(panel.parentElement).toHaveClass("flex");
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -719,6 +738,18 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ openTerminals: [termKey] });
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+  });
+
+  it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
+    const panel = screen.getByTestId("files-panel-stub");
+
+    rerender({ selectedTerminalKey: termKey });
+    expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel).toHaveAttribute("data-active", "false");
+    expect(panel.parentElement).toHaveClass("hidden");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {

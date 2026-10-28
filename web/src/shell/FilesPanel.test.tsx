@@ -1448,6 +1448,42 @@ describe("FilesPanel scroll position persistence", () => {
     expect(back.section.scrollTop).toBe(120);
   });
 
+  it("restores the saved scroll position when shown again after being hidden", () => {
+    const conversationId = "conv_scroll_hidden";
+    const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
+    const { result, section } = renderAndGetScrollSection(conversationId, files);
+    section.scrollTop = 120;
+    fireEvent.scroll(section);
+    const panel = (active: boolean) => (
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+                active={active}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    // Hidden behind a file/shell: the browser drops the offset without firing
+    // a scroll event, so showing the panel again must re-apply the saved one.
+    result.rerender(panel(false));
+    section.scrollTop = 0;
+    result.rerender(panel(true));
+    expect(result.container.querySelector("section")).toBe(section);
+    expect(section.scrollTop).toBe(120);
+  });
+
   it("does not let the loading clamp overwrite the saved position", async () => {
     const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));
     const conversationId = "conv_scroll_clamp";
