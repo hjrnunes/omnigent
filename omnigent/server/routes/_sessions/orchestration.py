@@ -124,7 +124,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import relay_stats, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -9008,6 +9008,7 @@ async def _relay_runner_stream_once(
             )
             buffer = ""
             async for chunk in resp.aiter_text():
+                chunk_started_at = time.perf_counter()
                 buffer += chunk
                 while "\n\n" in buffer:
                     frame, _, buffer = buffer.partition("\n\n")
@@ -9025,6 +9026,12 @@ async def _relay_runner_stream_once(
                     except json.JSONDecodeError:
                         continue
                     evt_type = event.get("type", "")
+                    if isinstance(evt_type, str) and evt_type:
+                        relay_stats.record_event(
+                            session_id,
+                            evt_type,
+                            source=relay_stats.SOURCE_RELAY_SSE,
+                        )
                     # The runner emits session.status events
                     # directly.
                     # Re-publish via _publish_status so the event
@@ -9696,6 +9703,9 @@ async def _relay_runner_stream_once(
                             )
                         continue
                     session_stream.publish(session_id, event)
+                relay_stats.record_relay_stretch(
+                    session_id, time.perf_counter() - chunk_started_at
+                )
 
             # Treat a bare EOF without ``[DONE]`` as a tunnel drop.
             # Route it through the existing bounded recovery path.

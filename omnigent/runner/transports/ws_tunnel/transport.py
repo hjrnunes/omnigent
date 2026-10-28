@@ -36,6 +36,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+from omnigent.server import relay_stats
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -65,6 +66,7 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     break
                 # Mypy/runtime: item must be a ResponseBodyFrame here.
                 if isinstance(item, ResponseBodyFrame):
+                    relay_stats.record_body_queue_dequeue(state.req_id, len(item.body))
                     yield decode_body(item.body, item.encoding)
         finally:
             self._registry.close_request(

@@ -78,7 +78,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, relay_stats
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -898,20 +898,37 @@ def register_events_routes(
                                     else None,
                                 )
                             )
+                            relay_stats.record_event(
+                                session_id,
+                                event.type,
+                                source=relay_stats.SOURCE_HTTP_POST,
+                            )
                         continue
                     await _authorized_conversation(request, session_id, external_transcript=True)
                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
                     item_ids = await _persist_external_conversation_items(
                         session_id, list(run), conversation_store
                     )
-                    acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+                    for item_id in item_ids:
+                        relay_stats.record_event(
+                            session_id,
+                            _EXTERNAL_CONVERSATION_ITEM_TYPE,
+                            source=relay_stats.SOURCE_HTTP_POST,
+                        )
+                        acks.append({"queued": False, "item_id": item_id})
                 return acks
-            return await _post_event_impl(
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type in {"message", "session_message"} else None,
             )
+            relay_stats.record_event(
+                session_id,
+                body.type,
+                source=relay_stats.SOURCE_HTTP_POST,
+            )
+            return ack
 
     router.include_router(event_router)
 
@@ -938,6 +955,11 @@ def register_events_routes(
             try:
                 body = SessionEventInput.model_validate(payload)
                 await _post_event_impl(request, batch.session_id, body)
+                relay_stats.record_event(
+                    batch.session_id,
+                    body.type,
+                    source=relay_stats.SOURCE_EVENT_BATCH,
+                )
             except _RunnerNotBoundError:
                 # The session moved to another runner, which mirrors its own
                 # transcript. Acknowledge this runner's late events as handled:

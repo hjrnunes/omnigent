@@ -104,6 +104,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.relay_stats import log_relay_stats_periodically
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1833,6 +1834,9 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Phase 0 relay diagnostics: one bounded ``relay_stats`` record per
+        # interval; returns immediately when the interval is disabled.
+        relay_stats_publish_task = asyncio.create_task(log_relay_stats_periodically())
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1980,6 +1984,9 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            relay_stats_publish_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await relay_stats_publish_task
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown, after giving
             # unbound ones the deployment's drain to bind their host (see the

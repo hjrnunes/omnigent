@@ -54,6 +54,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     WSCloseFrame,
     WSFrame,
 )
+from omnigent.server import relay_stats
 
 _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
@@ -173,6 +174,8 @@ class RequestState:
     :param end_event: Event set when the response end frame arrives.
     :param aborted_with: Error to raise from the body iterator after
         a tunnel disconnect or registry abort.
+    :param req_id: Tunnel request id, used as the relay body-queue
+        counter key.
     """
 
     loop: asyncio.AbstractEventLoop
@@ -181,6 +184,7 @@ class RequestState:
     body_queue: asyncio.Queue[ResponseBodyFrame | None]
     end_event: asyncio.Event = field(default_factory=asyncio.Event)
     aborted_with: BaseException | None = None
+    req_id: str = ""
 
 
 # Inbound channel-queue item shape:
@@ -629,6 +633,7 @@ class TunnelRegistry:
                 session=session,
                 head_future=loop.create_future(),
                 body_queue=asyncio.Queue(),
+                req_id=req_id,
             )
             session.in_flight[req_id] = state
             return state
@@ -655,6 +660,7 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
+            relay_stats.record_body_queue_released(req_id)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -929,6 +935,7 @@ def _abort_request_state(state: RequestState, error: BaseException) -> None:
     state.end_event.set()
     # Sentinel-push to unblock any pending get().
     state.body_queue.put_nowait(None)
+    relay_stats.record_body_queue_released(state.req_id)
 
 
 def _set_response_head(state: RequestState, frame: ResponseHeadFrame) -> None:
@@ -990,6 +997,7 @@ def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> Non
     :returns: None.
     """
     state.body_queue.put_nowait(frame)
+    relay_stats.record_body_queue_enqueue(state.req_id, len(frame.body))
 
 
 def _end_response_body(state: RequestState) -> None:
