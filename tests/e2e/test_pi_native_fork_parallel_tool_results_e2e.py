@@ -47,6 +47,9 @@ _RESPONSES_MODEL = "gpt-mock-resume"
 _CONTEXT_BYTE_LIMIT = 16_384
 _RETAINED_CALL_IDS = ["toolu_tail_a", "toolu_tail_b"]
 _RECOVERED_OUTPUT = "Contents recovered from the missing call."
+_CHECKPOINT_SUMMARY = (
+    "RECOVERY-CHECKPOINT: read alpha-contents and beta-contents; do not repeat tools."
+)
 PiForkRig = tuple[httpx.Client, ServerRunner, list[dict[str, Any]], list[str]]
 
 
@@ -74,6 +77,10 @@ def _parallel_response(workspace: Path) -> str:
         if event.startswith("event: content_block_")
     )
     return stream.replace("event: message_delta", f"{text_events}\n\nevent: message_delta")
+
+
+def _is_summarizer_request(body: dict[str, Any]) -> bool:
+    return "context summarization assistant" in json.dumps(body.get("system", ""))
 
 
 @pytest.fixture
@@ -176,6 +183,9 @@ def pi_fork_rig(
                 payload = sse_text_response(
                     f"RESPONSES-RESUME-{len(requests)}", model=_RESPONSES_MODEL, stream=True
                 ).encode()
+            elif _is_summarizer_request(body):
+                # Pi may summarize a split turn with a second request.
+                payload = anthropic_sse_text_response(_CHECKPOINT_SUMMARY, model=_MODEL).encode()
             else:
                 payload = replies.pop(0).encode()
             self.send_response(200)
@@ -429,22 +439,20 @@ def test_pi_native_compacted_restart_then_fork(
                 for number in range(60)
             )
         )
-    summary = "RECOVERY-CHECKPOINT: read alpha-contents and beta-contents; do not repeat tools."
+    summary = _CHECKPOINT_SUMMARY
     replies[2:] = [
         anthropic_sse_text_response(text, model=_MODEL)
         for text in (
             "READY-TO-COMPACT",
-            summary,
             "SECOND-TOOLS-DONE",
             "TAIL-TOOLS-DONE",
-            summary,
             "COMPACT-CONTINUED",
             "RESTART-CONTINUED",
             "FORK-CONTINUED",
         )
     ]
-    replies.insert(4, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_next_"))
-    replies.insert(6, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_tail_"))
+    replies.insert(3, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_next_"))
+    replies.insert(5, _parallel_response(stack.workspace).replace("toolu_par_", "toolu_tail_"))
     settings = stack.runner_home / ".pi/agent/settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"compaction": {"keepRecentTokens": 100}}))
@@ -555,7 +563,10 @@ def test_pi_native_compacted_restart_then_fork(
             == _RETAINED_CALL_IDS
         )
         (tmp_path / "before-restart.jsonl").write_bytes(compacted)
-        assert all(f"{name}-contents" in json.dumps(requests[3]) for name in ("alpha", "beta"))
+        first_summarizer = next(request for request in requests if _is_summarizer_request(request))
+        assert all(
+            f"{name}-contents" in json.dumps(first_summarizer) for name in ("alpha", "beta")
+        )
         _wait(lambda: client.get(f"/v1/sessions/{session_id}").json()["status"] == "idle")
         before = client.get(f"/v1/sessions/{session_id}").json()
         terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
@@ -665,7 +676,7 @@ def test_pi_native_compacted_restart_then_fork(
                     item["call_id"] for item in transcript if item["type"] == kind
                 ) == sorted([*_CALL_IDS, "toolu_next_a", "toolu_next_b", *_RETAINED_CALL_IDS])
             (tmp_path / f"{target}-items.json").write_text(json.dumps(transcript, indent=2))
-        assert len(requests) == 12
+        assert len([request for request in requests if not _is_summarizer_request(request)]) == 10
         sizes = [len(json.dumps(request["messages"]).encode()) for request in requests]
         assert max(sizes) <= _CONTEXT_BYTE_LIMIT
         print(f"Constant context limit {_CONTEXT_BYTE_LIMIT} bytes; request sizes: {sizes}")
