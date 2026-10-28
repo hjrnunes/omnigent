@@ -1245,6 +1245,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
+  if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
   if (kind !== "user" && kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
@@ -1279,6 +1280,8 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     ] },
     { role: "toolResult", toolCallId: "read-1", toolName: "read",
       content: [{type: "text", text: "retained result"}] },
+    { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
+    { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
   ];
   ctx.sessionManager = {
     getSessionId: () => "native-1",
@@ -1305,7 +1308,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     return response;
   };
   await handlers.input({text: "covered input", source: "extension"}, ctx);
-  const expectedSnapshot = structuredClone(messages);
+  const expectedSnapshot = structuredClone(messages.slice(0, -1));
   // Repeated summary text can make Pi's event point at an older checkpoint.
   const compacting = handlers.session_compact(
     {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
@@ -1326,7 +1329,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
   assert.deepEqual(retryDelays, []);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(notices, []);
-})().catch((error) => { console.error(error); process.exit(1); });
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)

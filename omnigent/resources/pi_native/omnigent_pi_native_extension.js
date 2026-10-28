@@ -1600,7 +1600,12 @@ module.exports = function (pi) {
     let compactedMessages;
     try {
       projection = manager.buildSessionProjection();
-      compactedMessages = structuredClone(projection?.messages ?? []);
+      // `!!` shell output never reaches the model, so recovery does not need it.
+      compactedMessages = structuredClone(
+        (projection?.messages ?? []).filter(
+          message => !(message?.role === "bashExecution" && message.excludeFromContext),
+        ),
+      );
     } catch (error) {
       console.error("[pi-native] Compaction snapshot failed:", error);
       notifyFailure();
