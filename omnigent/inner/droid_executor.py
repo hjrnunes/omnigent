@@ -88,6 +88,7 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
 )
@@ -247,6 +248,11 @@ _TASK_TOOL_TITLE = "Task"
 # Droid's ``await: false`` Tasks keep working after ``session/prompt`` resolves
 # and droid reports no later completion on the parent stream.
 _UNFINISHED_TASK_SUMMARY = "The parent turn ended before droid reported this Task's result."
+
+# Same, for a turn the user interrupted while droid waited on an approval.
+_INTERRUPTED_TASK_SUMMARY = (
+    "The parent turn was interrupted before droid reported this Task's result."
+)
 
 
 def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
@@ -700,8 +706,10 @@ class DroidExecutor(Executor):
         fresh echo carrying it back: droid 0.251 repeats the full
         ``configOptions`` list in the ``session/set_config_option`` reply
         (VERIFIED live), while an agent may instead report the new value in a
-        ``config_option_update`` notification. The ``session/new`` list is the
-        starting state, never an echo — accepting it would report a silent
+        ``config_option_update`` notification. Only a notification that arrived
+        after the setter was sent and names this session counts. The
+        ``session/new`` list and anything queued before the setter are the
+        starting state, never an echo — accepting them would report a silent
         setter as applied.
 
         :param session_id: Droid's ACP session id.
@@ -720,79 +728,116 @@ class DroidExecutor(Executor):
             raise RuntimeError(
                 f"droid has no autonomy {self._auto!r}; it advertises {', '.join(advertised)}"
             )
+        # Notifications already queued describe the session's starting state
+        # (droid emits some during session/new). Only what arrives while the
+        # setter is in flight can be its echo.
+        notifications_before = self._drain_queued_items()
+        notifications_after: list[dict[str, Any]] = []  # type: ignore[explicit-any]
         try:
-            resp = await self._rpc(
-                _AGENT_METHOD_SESSION_SET_CONFIG_OPTION,
-                {"sessionId": session_id, "configId": _AUTONOMY_CONFIG_ID, "value": self._auto},
-                timeout=_INIT_TIMEOUT_SECONDS,
-            )
-        except TimeoutError as exc:
-            raise RuntimeError(
-                "droid did not answer session/set_config_option for autonomy "
-                f"{self._auto!r} within {_INIT_TIMEOUT_SECONDS:.0f}s"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"droid session/set_config_option for autonomy {self._auto!r} failed: {exc}"
-            ) from exc
-        if "error" in resp:
-            raise RuntimeError(
-                f"droid rejected autonomy {self._auto!r}: {_acp_error_message(resp)}"
-            )
-        raw_result = resp.get("result")
-        result = raw_result if isinstance(raw_result, dict) else {}
-        echoed, applied = _config_option_echo(result, _AUTONOMY_CONFIG_ID)
-        if echoed:
-            self._capture_config_options(result)
-        elif self._queued_config_option_echo(_AUTONOMY_CONFIG_ID, self._auto):
-            applied = self._auto
-        else:
-            raise RuntimeError(
-                f"droid did not confirm autonomy {self._auto!r}: its "
-                "session/set_config_option reply carried no autonomy_level echo"
-            )
-        if applied != self._auto:
-            raise RuntimeError(
-                f"droid reported autonomy {applied!r} after requesting {self._auto!r}"
-            )
+            try:
+                resp = await self._rpc(
+                    _AGENT_METHOD_SESSION_SET_CONFIG_OPTION,
+                    {
+                        "sessionId": session_id,
+                        "configId": _AUTONOMY_CONFIG_ID,
+                        "value": self._auto,
+                    },
+                    timeout=_INIT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "droid did not answer session/set_config_option for autonomy "
+                    f"{self._auto!r} within {_INIT_TIMEOUT_SECONDS:.0f}s"
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"droid session/set_config_option for autonomy {self._auto!r} failed: {exc}"
+                ) from exc
+            notifications_after = self._drain_queued_items()
+            if "error" in resp:
+                raise RuntimeError(
+                    f"droid rejected autonomy {self._auto!r}: {_acp_error_message(resp)}"
+                )
+            raw_result = resp.get("result")
+            result = raw_result if isinstance(raw_result, dict) else {}
+            echoed, applied = _config_option_echo(result, _AUTONOMY_CONFIG_ID)
+            if echoed:
+                self._capture_config_options(result)
+            elif self._correlated_config_option_echo(
+                notifications_after, session_id, _AUTONOMY_CONFIG_ID, self._auto
+            ):
+                applied = self._auto
+            else:
+                raise RuntimeError(
+                    f"droid did not confirm autonomy {self._auto!r}: its "
+                    "session/set_config_option reply carried no autonomy_level echo"
+                )
+            if applied != self._auto:
+                raise RuntimeError(
+                    f"droid reported autonomy {applied!r} after requesting {self._auto!r}"
+                )
+        finally:
+            # Anything queued since the last drain keeps its chronological place
+            # after the pre-setter items for the turn loop.
+            notifications_after.extend(self._drain_queued_items())
+            self._requeue_items([*notifications_before, *notifications_after])
         logger.info("droid session autonomy_level=%s applied", self._auto)
 
-    def _queued_config_option_echo(self, config_id: str, value: str) -> bool:
-        """Look for a ``config_option_update`` carrying *value* already queued.
+    def _drain_queued_items(self) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+        """Remove and return every message currently waiting on ``_queue``."""
+        items: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        while not self._queue.empty():
+            try:
+                items.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:  # pragma: no cover - single consumer
+                break
+        return items
+
+    def _requeue_items(self, items: Sequence[dict[str, Any]]) -> None:  # type: ignore[explicit-any]
+        """Put *items* back on ``_queue`` in the order given."""
+        for item in items:
+            self._queue.put_nowait(item)
+
+    def _correlated_config_option_echo(
+        self,
+        notifications: Sequence[dict[str, Any]],  # type: ignore[explicit-any]
+        session_id: str,
+        config_id: str,
+        value: str,
+    ) -> bool:
+        """Find a ``config_option_update`` that echoes *value* for *session_id*.
 
         ACP agents that answer ``session/set_config_option`` with an empty result
         report the change in a ``config_option_update`` notification instead.
-        The reader task queues notifications, so the echo is already waiting by
-        the time the reply resolves. Non-matching items stay queued for the turn
-        loop, which ignores this benign variant.
+        Only notifications queued while the setter was in flight are passed in,
+        and one naming a different session is ignored — either would let a
+        silent setter look applied.
 
+        :param notifications: Messages queued while the setter was in flight.
+        :param session_id: The session the setter targeted.
         :param config_id: The config option id to match, e.g. ``"autonomy_level"``.
         :param value: The value the notification must report.
         :returns: True when a notification confirms *config_id* is on *value*.
         """
-        retained: list[dict[str, Any]] = []  # type: ignore[explicit-any]
         confirmed = False
-        try:
-            while not self._queue.empty():
-                try:
-                    item = self._queue.get_nowait()
-                except asyncio.QueueEmpty:  # pragma: no cover - single consumer
-                    break
-                if isinstance(item, dict):
-                    params = item.get("params")
-                    update = params.get("update") if isinstance(params, dict) else None
-                    if (
-                        item.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE
-                        and isinstance(update, dict)
-                        and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
-                    ):
-                        self._capture_config_options(update)
-                        found, current = _config_option_echo(update, config_id)
-                        confirmed = found and str(current) == value
-                retained.append(item)
-        finally:
-            for item in retained:
-                self._queue.put_nowait(item)
+        for item in notifications:
+            if not isinstance(item, dict):
+                continue
+            if item.get("method") != _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                continue
+            params = item.get("params")
+            if not isinstance(params, dict) or params.get("sessionId") != session_id:
+                continue
+            update = params.get("update")
+            if (
+                not isinstance(update, dict)
+                or update.get("sessionUpdate") != _UPDATE_CONFIG_OPTION
+            ):
+                continue
+            found, current = _config_option_echo(update, config_id)
+            if found:
+                self._capture_config_options(update)
+                confirmed = confirmed or str(current) == value
         return confirmed
 
     def _capture_model_state(self, result: dict[str, Any]) -> None:
@@ -1236,18 +1281,24 @@ class DroidExecutor(Executor):
             summary=self._raw_output_text(update.get("rawOutput")),
         )
 
-    def _drain_open_task_children(self) -> list[SubAgentCompleted]:
+    def _drain_open_task_children(
+        self, summary: str = _UNFINISHED_TASK_SUMMARY
+    ) -> list[SubAgentCompleted]:
         """Complete every Task child still open when the turn ends.
 
         Droid's ``await: false`` Tasks keep working after ``session/prompt``
         resolves, and droid reports no later outcome on the parent stream, so an
-        unfinished child is closed as failed rather than left running.
+        unfinished child is closed as failed rather than left running. Clearing
+        the map first guarantees one completion per child across the normal,
+        timeout, error, and interrupted exit paths.
+
+        :param summary: Why the child is being closed.
         """
         completions = [
             SubAgentCompleted(
                 child_key=key,
                 ok=False,
-                summary=_UNFINISHED_TASK_SUMMARY,
+                summary=summary,
             )
             for key in self._open_task_children
         ]
@@ -1497,6 +1548,36 @@ class DroidExecutor(Executor):
                 break
             if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
+
+        try:
+            async for event in self._prompt_events(session_id, prompt_blocks):
+                yield event
+        except asyncio.CancelledError:
+            # An interrupt during a policy / approval / elicitation wait cancels
+            # the parked future, so the turn resumes with CancelledError instead
+            # of yielding another event. Finish the tracked Task children before
+            # unwinding, exactly like every other terminal path.
+            for completion in self._drain_open_task_children(summary=_INTERRUPTED_TASK_SUMMARY):
+                yield completion
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            yield TurnCancelled(reason="user_cancelled", phase="model")
+
+    async def _prompt_events(
+        self,
+        session_id: str,
+        prompt_blocks: list[dict[str, Any]],
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Stream a single ``session/prompt`` turn until droid reports an outcome.
+
+        Yields text / reasoning / tool events as droid reports them and ends
+        with ``TurnComplete`` or ``ExecutorError``. Task children still open at
+        any terminal path complete with ``ok=False`` before that terminal event.
+
+        :param session_id: Droid's ACP session id.
+        :param prompt_blocks: ACP prompt content blocks for the user turn.
+        """
 
         self._rpc_id += 1
         req_id = self._rpc_id
