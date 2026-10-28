@@ -499,8 +499,12 @@ describe("ToolCard registered views", () => {
 
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
-    // The Diff tab names the view, so a single file's panel carries no second "Diff" title.
+    // The Diff tab names the view; the panel is titled with the file and its counts instead.
     expect(screen.getAllByText("Diff")).toHaveLength(1);
+    const added = screen.getByText("+1");
+    expect(added).toHaveClass("text-green-600");
+    expect(screen.getByText("-2")).toHaveClass("text-red-600");
+    expect(added.parentElement?.textContent).toBe("/repo/config.py+1-2");
     expect(container.textContent).toContain("-TIMEOUT = 30");
     expect(container.textContent).toContain("+TIMEOUT = 60");
     expect(screen.queryByText("Input")).toBeNull();

@@ -52,7 +52,7 @@ export function FileEditBody({ call }: { call: ToolCall }) {
           )}
           {diff.files.map((file) => (
             // A patch lists each file once, so its path names its panel.
-            <FileDiffPanel key={file.path} file={file} titled={diff.files.length > 1} />
+            <FileDiffPanel key={file.path} file={file} />
           ))}
         </>
       )}
@@ -60,24 +60,26 @@ export function FileEditBody({ call }: { call: ToolCall }) {
   );
 }
 
-/** One file's diff. A multi-file patch names each file and its counts; one file needs no title. */
-function FileDiffPanel({ file, titled }: { file: FileDiffSection; titled: boolean }) {
+/** One file's diff, titled with its path, whether it is new, deleted or renamed, and its counts. */
+function FileDiffPanel({ file }: { file: FileDiffSection }) {
   const { root, home } = useWorkspacePaths();
   const shown = (path: string) => resolveChatFilePath(path, root, home)?.path ?? path;
-  const title: ReactNode = titled ? (
-    <>
-      {shown(file.path)}
-      {file.newPath !== undefined && ` renamed to ${shown(file.newPath)}`}
-      {file.kind === "add" && " (new file)"}
-      {file.kind === "delete" && " (deleted)"}
-      {file.additions > 0 && (
-        <span className={cn("ml-2", DIFF_TONE_CLASS.added)}>+{file.additions}</span>
-      )}
-      {file.removals > 0 && (
-        <span className={cn("ml-1", DIFF_TONE_CLASS.removed)}>-{file.removals}</span>
-      )}
-    </>
-  ) : undefined;
+  // An edit call that names no file gets an untitled panel.
+  const title: ReactNode =
+    file.path !== "" ? (
+      <>
+        {shown(file.path)}
+        {file.newPath !== undefined && ` renamed to ${shown(file.newPath)}`}
+        {file.kind === "add" && " (new file)"}
+        {file.kind === "delete" && " (deleted)"}
+        {file.additions > 0 && (
+          <span className={cn("ml-2", DIFF_TONE_CLASS.added)}>+{file.additions}</span>
+        )}
+        {file.removals > 0 && (
+          <span className={cn("ml-1", DIFF_TONE_CLASS.removed)}>-{file.removals}</span>
+        )}
+      </>
+    ) : undefined;
   if (file.text === "") {
     // An empty file added or deleted, or a rename that changes no lines.
     return (
