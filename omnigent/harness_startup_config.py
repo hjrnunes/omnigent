@@ -55,6 +55,7 @@ _LEGACY_PATH_VARS: dict[str, str] = {
     "HARNESS_GOOSE_PATH": "OMNIGENT_GOOSE_PATH",
     "HARNESS_QWEN_PATH": "OMNIGENT_QWEN_PATH",
     "HARNESS_HERMES_PATH": "OMNIGENT_HERMES_PATH",
+    "HARNESS_DROID_PATH": "OMNIGENT_DROID_PATH",
 }
 
 # Legacy ``HARNESS_*_PATH`` vars we have already warned about in this process,
@@ -127,10 +128,12 @@ def resolve_harness_path(canonical: str) -> str | None:
         return value
     base = _HARNESS_BINARY_BASE.get(canonical) or canonical.removesuffix("-native")
     legacy_env = f"HARNESS_{base.upper().replace('-', '_')}_PATH"
-    # Only honor the legacy fallback for the 6 harnesses that historically
-    # documented a ``HARNESS_*_PATH`` var. Other harnesses (cursor, kiro,
-    # opencode, antigravity, …) never had one — honoring a speculative
-    # ``HARNESS_CURSOR_PATH`` would invent a new knob under a deprecated name.
+    # Only honor the legacy fallback for the 7 harnesses that historically
+    # documented a ``HARNESS_*_PATH`` var (codex, pi, kimi, goose, qwen,
+    # hermes, droid — the latter via its community plugin). Other harnesses
+    # (cursor, kiro, opencode, antigravity, …) never had one — honoring a
+    # speculative ``HARNESS_CURSOR_PATH`` would invent a new knob under a
+    # deprecated name.
     if legacy_env not in _LEGACY_PATH_VARS:
         return None
     legacy = os.environ.get(legacy_env, "").strip()

@@ -35,6 +35,7 @@ import pytest
 import yaml as _yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.droid_spawn_env import build_spawn_env as _build_droid_spawn_env
 from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
@@ -2104,6 +2105,7 @@ def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: 
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
         ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
+        ("droid", _build_droid_spawn_env, "OMNIGENT_DROID_PATH"),
     ],
 )
 def test_spawn_env_threads_config_command_to_path(
@@ -2132,6 +2134,7 @@ def test_spawn_env_threads_config_command_to_path(
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
         ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
+        ("droid", _build_droid_spawn_env, "OMNIGENT_DROID_PATH"),
     ],
 )
 def test_spawn_env_ambient_env_wins_over_config_command(
@@ -2162,6 +2165,7 @@ def test_spawn_env_ambient_env_wins_over_config_command(
         ("kimi", _build_kimi_spawn_env),
         ("goose", _build_goose_spawn_env),
         ("qwen", _build_qwen_spawn_env),
+        ("droid", _build_droid_spawn_env),
     ],
 )
 def test_spawn_env_no_command_emits_no_path(
@@ -2189,6 +2193,7 @@ def test_spawn_env_no_command_emits_no_path(
         ("kimi", _build_kimi_spawn_env),
         ("goose", _build_goose_spawn_env),
         ("qwen", _build_qwen_spawn_env),
+        ("droid", _build_droid_spawn_env),
     ],
 )
 def test_spawn_env_legacy_env_wins_over_config_command(

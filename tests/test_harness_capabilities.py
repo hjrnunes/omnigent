@@ -37,6 +37,12 @@ from omnigent.models.model_override import (
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
 
+# Harnesses whose executor itself emits the sub-agent lifecycle events
+# (SubAgentStarted / SubAgentCompleted) for vendor-side sub-agents, so no
+# native wrapper label or ACP extension dialect implements them. Declared
+# explicitly: ``subagents=True`` must still name a mechanism.
+_EXECUTOR_EMITTED_SUBAGENT_HARNESSES = frozenset({"droid"})
+
 
 def test_every_builtin_harness_declares_capabilities() -> None:
     caps = harness_capabilities()
@@ -73,7 +79,7 @@ def test_model_family_matches_model_override_sets() -> None:
 
 
 def test_subagents_matches_its_implementing_mechanism() -> None:
-    """``subagents`` is derivable — from the two mechanisms that implement it.
+    """``subagents`` is derivable — from the mechanisms that implement it.
 
     1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
        the vendor's own spawn and mints the child session.
@@ -81,6 +87,10 @@ def test_subagents_matches_its_implementing_mechanism() -> None:
        reports its sub-agent lifecycle in its own ``_meta`` and the runner mints
        the child from that. No built-in row uses this today — the mechanism
        stays for a community ACP plugin — so nothing is added below.
+    3. An **executor-emitted lifecycle**: the harness adapter's own executor
+       yields ``SubAgentStarted`` / ``SubAgentCompleted``, which the runner turns
+       into child sessions without any vendor-specific interception. Rows using
+       it are listed in ``_EXECUTOR_EMITTED_SUBAGENT_HARNESSES``.
 
     Keeping the derivation here means a harness cannot publish a ``subagents``
     capability on ``/v1/harnesses`` that nothing implements, or implement one it
@@ -88,7 +98,7 @@ def test_subagents_matches_its_implementing_mechanism() -> None:
     """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
     for harness, capability in harness_capabilities().items():
-        expected = harness in subagent_capable
+        expected = harness in subagent_capable or (harness in _EXECUTOR_EMITTED_SUBAGENT_HARNESSES)
         assert capability.subagents == expected, harness
 
 
@@ -365,6 +375,26 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
     caps = harness_capabilities()
     assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
     assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_droid_declares_acp_permission_profile() -> None:
+    """The in-tree droid harness is a cold-resume, own-auth ACP subprocess.
+
+    Its executor folds the system prompt into the first user turn and reports
+    Task sub-agents itself, so both axes must say so.
+    """
+    caps = harness_capabilities()["droid"]
+
+    assert caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+    assert caps.elicitation is Elicitation.SSE_PERMISSION
+    assert caps.resume is Resume.COLD_ONLY
+    assert caps.effort is EffortFamily.NONE
+    assert caps.model_family is ModelFamily.MULTI
+    assert caps.auth is AuthModel.OWN_AUTH
+    assert caps.subagents is True
+    assert caps.interrupt is True
+    assert caps.streaming is True
+    assert caps.instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
 
 
 def test_native_startup_additive_instruction_delivery() -> None:

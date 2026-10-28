@@ -233,6 +233,30 @@ def test_builtin_background_title_generators_are_registered() -> None:
     assert generators["codex-native"].resolver_harness is None
 
 
+def test_droid_is_registered_in_core() -> None:
+    """The droid harness ships in the builtin contribution, with no plugin.
+
+    Every registry surface ``/v1/harnesses``, harness resolution, readiness and
+    the per-session model override read must name droid.
+    """
+    assert "droid" in hp.valid_harnesses()
+    assert hp.harness_modules()["droid"] == "omnigent.inner.droid_harness"
+    assert hp.model_env_keys()["droid"] == "HARNESS_DROID_MODEL"
+    assert hp.harness_labels()["droid"] == "Droid"
+    assert hp.harness_install_keys()["droid"] == "droid"
+    assert hp.spawn_env_builders()["droid"] == "omnigent.inner.droid_spawn_env:build_spawn_env"
+
+    install = hp.install_specs()["droid"]
+    assert install.display == "Droid"
+    assert install.binary == "droid"
+    assert install.package is None
+    assert install.install_hint == "curl -fsSL https://app.factory.ai/cli | sh"
+
+    droid_rows = [row for row in hp.harness_catalog() if row["id"] == "droid"]
+    assert len(droid_rows) == 1
+    assert "capabilities" in droid_rows[0]
+
+
 def test_community_harness_can_register_background_title_generator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

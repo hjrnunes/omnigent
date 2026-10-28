@@ -270,10 +270,11 @@ def test_resolve_harness_path_ignores_non_registry_legacy_var(
 ) -> None:
     """A speculative ``HARNESS_*_PATH`` for a harness that never had one is ignored.
 
-    Only the 6 headless harnesses (codex/pi/kimi/goose/qwen/hermes) historically
-    documented a ``HARNESS_*_PATH``. Other harnesses (e.g. cursor) never did —
-    honoring ``HARNESS_CURSOR_PATH`` would invent a new knob under a deprecated
-    name, so it's ignored (only the canonical ``OMNIGENT_CURSOR_PATH`` works).
+    Only the 7 headless harnesses (codex/pi/kimi/goose/qwen/hermes/droid)
+    historically documented a ``HARNESS_*_PATH``. Other harnesses (e.g. cursor)
+    never did — honoring ``HARNESS_CURSOR_PATH`` would invent a new knob under a
+    deprecated name, so it's ignored (only the canonical ``OMNIGENT_CURSOR_PATH``
+    works).
     """
     monkeypatch.delenv("OMNIGENT_CURSOR_PATH", raising=False)
     monkeypatch.setenv("HARNESS_CURSOR_PATH", "/speculative/cursor")
