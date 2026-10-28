@@ -53,6 +53,10 @@ def test_harness_kind(executor: ExecutorSpec, expected: str) -> None:
             {"CLAUDE_CODE_MAX_RETRIES": "0", "API_TIMEOUT_MS": "1250"},
         ),
         (
+            RetryPolicy(timeout_per_request_s=1.001),
+            {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1001"},
+        ),
+        (
             RetryPolicy(timeout_per_request_s=0.0001),
             {"CLAUDE_CODE_MAX_RETRIES": "7", "API_TIMEOUT_MS": "1"},
         ),

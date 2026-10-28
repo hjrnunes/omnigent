@@ -328,7 +328,7 @@ class _ClaudeCliRetryAdapter:
             "CLAUDE_CODE_MAX_RETRIES": str(self.policy.max_retries),
         }
         if self.policy.timeout_per_request_s is not None:
-            env["API_TIMEOUT_MS"] = str(max(1, int(self.policy.timeout_per_request_s * 1000)))
+            env["API_TIMEOUT_MS"] = str(max(1, round(self.policy.timeout_per_request_s * 1000)))
         return env
 
 
