@@ -1327,8 +1327,8 @@ def _listing_for_provider(
     """Enumerate (or replay from cache) one provider's unfiltered listing.
 
     Live fetches are cached for :data:`_CATALOG_TTL_S` keyed by provider
-    identity; failures are returned (not cached) so a transient outage
-    retries on the next call.
+    identity; failures and other unverified results are returned (not cached)
+    so a transient outage or an empty probe retries on the next call.
 
     :param provider: The resolved provider descriptor.
     :param transport: Optional httpx transport override for tests.
@@ -1383,21 +1383,12 @@ def _listing_for_provider(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
         if provider.kind == SUBSCRIPTION_KIND:
-            # A failed cursor-agent listing probe says nothing about
-            # dispatchability: the CLI brings its own stored login, so the
-            # worker still runs. Degrade to the usable pre-launch shape the
-            # other subscription CLI logins report, not the dead-worker
-            # "none" that tells orchestrators the worker cannot run here.
-            return ModelListing(
-                source="static",
-                verified=False,
-                models=(),
-                note=(
-                    f"model listing failed for {provider.detail or provider.kind} "
-                    f"({_redacted_failure_reason(exc)}); the CLI launches with its "
-                    "own stored login, so dispatches to this worker can still run"
-                ),
-            )
+            # A failed CLI listing probe says nothing about dispatchability:
+            # the CLI brings its own stored login, so the worker still runs.
+            # Degrade to the usable pre-launch shape the other subscription
+            # CLI logins report, not the dead-worker "none" that tells
+            # orchestrators the worker cannot run here.
+            return _usable_subscription_listing(provider, _redacted_failure_reason(exc))
         return ModelListing(
             source=NONE_KIND,
             verified=False,
@@ -1407,9 +1398,34 @@ def _listing_for_provider(
                 f"{_redacted_failure_reason(exc)}"
             ),
         )
-    with _listing_cache_lock:
-        _listing_cache[cache_key] = listing
+    if listing.verified:
+        with _listing_cache_lock:
+            _listing_cache[cache_key] = listing
     return listing
+
+
+def _usable_subscription_listing(provider: ResolvedModelProvider, reason: str) -> ModelListing:
+    """Build the usable, unverified row for a subscription CLI that cannot list.
+
+    The CLI carries its own stored login, so a failed probe says nothing about
+    dispatchability — reporting the dead-worker shape would wrongly tell
+    orchestrators the worker cannot run here. Unverified keeps the row out of
+    the cache so the next request retries.
+
+    :param provider: The ``kind="subscription"`` provider that failed to list.
+    :param reason: A short, redacted description of why the probe came back empty.
+    :returns: A ``source="static"`` listing with no models and ``verified=False``.
+    """
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=(),
+        note=(
+            f"model listing failed for {provider.detail or provider.kind} ({reason}); "
+            "the CLI launches with its own stored login, so dispatches to this "
+            "worker can still run"
+        ),
+    )
 
 
 def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
@@ -1460,6 +1476,11 @@ def _fetch_droid_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
     from omnigent.inner.droid_models import list_droid_cli_model_options
 
     probed = list_droid_cli_model_options()
+    if not probed.models:
+        # A failed handshake or a missing binary comes back as an empty
+        # listing rather than a raise, so treat it as the soft miss it is:
+        # usable but unverified, and left uncached so the next request retries.
+        return _usable_subscription_listing(provider, "the CLI reported no models")
     return ModelListing(
         source="cli",
         verified=True,

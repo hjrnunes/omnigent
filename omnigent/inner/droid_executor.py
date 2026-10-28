@@ -131,6 +131,28 @@ def _acp_error_message(reply: dict[str, Any]) -> str:  # type: ignore[explicit-a
     return str(error)
 
 
+def _config_option_echo(
+    result: dict[str, Any],  # type: ignore[explicit-any]
+    config_id: str,
+) -> tuple[bool, Any]:  # type: ignore[explicit-any]
+    """Read one config option's ``currentValue`` out of an ACP result.
+
+    :param result: A result object that may carry a ``configOptions`` list,
+        e.g. a ``session/set_config_option`` reply.
+    :param config_id: The option id to look for, e.g. ``"autonomy_level"``.
+    :returns: ``(found, currentValue)``; ``found`` is False when the result
+        carries no entry for *config_id*, so a missing echo is distinguishable
+        from an option whose value happens to be ``None``.
+    """
+    options = result.get("configOptions")
+    if not isinstance(options, list):
+        return (False, None)
+    for entry in options:
+        if isinstance(entry, dict) and entry.get("id") == config_id:
+            return (True, entry.get("currentValue"))
+    return (False, None)
+
+
 def _looks_like_missing_file(message: str) -> bool:
     """Heuristic: does an os_env error message indicate a missing path?
 
@@ -181,12 +203,13 @@ _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
 _UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
+_UPDATE_CONFIG_OPTION = "config_option_update"
 _UPDATE_USAGE = "usage_update"  # UNVERIFIED for droid: no usage stream observed
 
 # session/update variants droid emits that carry only session metadata (not
 # turn content) — silently ignored so they don't trip the unknown-variant log.
 _BENIGN_UPDATE_TYPES = frozenset(
-    {"current_mode_update", "config_option_update", "available_commands_update"}
+    {_UPDATE_CONFIG_OPTION, "current_mode_update", "available_commands_update"}
 )
 
 # Idle (time-without-progress) timeouts in seconds. The ACP handshake budget
@@ -673,13 +696,17 @@ class DroidExecutor(Executor):
         """Apply the configured autonomy tier to a fresh ACP session, verified.
 
         No-op when the spec leaves autonomy to droid. Otherwise the requested
-        tier must be one droid advertises, and the ``session/set_config_option``
-        reply must echo it back as ``autonomy_level.currentValue`` — droid emits
-        no ``config_option_update`` notification for this change, so the reply is
-        the only echo (VERIFIED live).
+        tier must be one droid advertises, and the change must be confirmed by a
+        fresh echo carrying it back: droid 0.251 repeats the full
+        ``configOptions`` list in the ``session/set_config_option`` reply
+        (VERIFIED live), while an agent may instead report the new value in a
+        ``config_option_update`` notification. The ``session/new`` list is the
+        starting state, never an echo — accepting it would report a silent
+        setter as applied.
 
         :param session_id: Droid's ACP session id.
-        :raises RuntimeError: On an unknown tier, a droid error, or a mismatch.
+        :raises RuntimeError: On an unknown tier, a droid error, a missing echo,
+            or a value that does not match the request.
         """
         if self._auto is None:
             return
@@ -693,22 +720,80 @@ class DroidExecutor(Executor):
             raise RuntimeError(
                 f"droid has no autonomy {self._auto!r}; it advertises {', '.join(advertised)}"
             )
-        resp = await self._rpc(
-            _AGENT_METHOD_SESSION_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _AUTONOMY_CONFIG_ID, "value": self._auto},
-            timeout=_INIT_TIMEOUT_SECONDS,
-        )
+        try:
+            resp = await self._rpc(
+                _AGENT_METHOD_SESSION_SET_CONFIG_OPTION,
+                {"sessionId": session_id, "configId": _AUTONOMY_CONFIG_ID, "value": self._auto},
+                timeout=_INIT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "droid did not answer session/set_config_option for autonomy "
+                f"{self._auto!r} within {_INIT_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"droid session/set_config_option for autonomy {self._auto!r} failed: {exc}"
+            ) from exc
         if "error" in resp:
             raise RuntimeError(
                 f"droid rejected autonomy {self._auto!r}: {_acp_error_message(resp)}"
             )
-        self._capture_config_options(resp.get("result") or {})
-        applied = (self._autonomy_config_option() or {}).get("currentValue")
+        raw_result = resp.get("result")
+        result = raw_result if isinstance(raw_result, dict) else {}
+        echoed, applied = _config_option_echo(result, _AUTONOMY_CONFIG_ID)
+        if echoed:
+            self._capture_config_options(result)
+        elif self._queued_config_option_echo(_AUTONOMY_CONFIG_ID, self._auto):
+            applied = self._auto
+        else:
+            raise RuntimeError(
+                f"droid did not confirm autonomy {self._auto!r}: its "
+                "session/set_config_option reply carried no autonomy_level echo"
+            )
         if applied != self._auto:
             raise RuntimeError(
                 f"droid reported autonomy {applied!r} after requesting {self._auto!r}"
             )
         logger.info("droid session autonomy_level=%s applied", self._auto)
+
+    def _queued_config_option_echo(self, config_id: str, value: str) -> bool:
+        """Look for a ``config_option_update`` carrying *value* already queued.
+
+        ACP agents that answer ``session/set_config_option`` with an empty result
+        report the change in a ``config_option_update`` notification instead.
+        The reader task queues notifications, so the echo is already waiting by
+        the time the reply resolves. Non-matching items stay queued for the turn
+        loop, which ignores this benign variant.
+
+        :param config_id: The config option id to match, e.g. ``"autonomy_level"``.
+        :param value: The value the notification must report.
+        :returns: True when a notification confirms *config_id* is on *value*.
+        """
+        retained: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        confirmed = False
+        try:
+            while not self._queue.empty():
+                try:
+                    item = self._queue.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - single consumer
+                    break
+                if isinstance(item, dict):
+                    params = item.get("params")
+                    update = params.get("update") if isinstance(params, dict) else None
+                    if (
+                        item.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE
+                        and isinstance(update, dict)
+                        and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                    ):
+                        self._capture_config_options(update)
+                        found, current = _config_option_echo(update, config_id)
+                        confirmed = found and str(current) == value
+                retained.append(item)
+        finally:
+            for item in retained:
+                self._queue.put_nowait(item)
+        return confirmed
 
     def _capture_model_state(self, result: dict[str, Any]) -> None:
         """Remember the model list ``session/new`` advertised, for the picker.

@@ -98,7 +98,28 @@ for line in sys.stdin:
             continue
         if set_autonomy_mode != "mismatch":
             state["autonomy"] = value
-        result = {"configOptions": config_options()}
+        if set_autonomy_mode in ("empty-result", "notify"):
+            # No echo in the reply: either nothing at all, or a
+            # config_option_update notification carrying the new value first.
+            if set_autonomy_mode == "notify":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": state["session"],
+                            "update": {
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": config_options(),
+                            },
+                        },
+                    }
+                )
+            result = {}
+        elif set_autonomy_mode == "empty-options":
+            result = {"configOptions": []}
+        else:
+            result = {"configOptions": config_options()}
     elif method == "session/set_model":
         if set_model_mode == "silent":
             continue
@@ -283,6 +304,59 @@ async def test_autonomy_that_droid_does_not_echo_back_fails_session_start(
     assert len(errors) == 1
     assert "'normal'" in errors[0].message
     assert "auto-medium" in errors[0].message
+    assert "session/prompt" not in _methods(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["empty-result", "empty-options"])
+async def test_autonomy_is_rejected_without_a_fresh_setter_echo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """The session/new value is not an echo of the setter.
+
+    Droid 0.251 repeats the full ``configOptions`` list in the setter reply.
+    A reply without it leaves the ``session/new`` list retained, so a request
+    that already matches droid's starting tier would otherwise be reported as
+    applied while the setter said nothing at all.
+    """
+    peer = _install_peer(tmp_path, monkeypatch, set_autonomy=mode)
+
+    # The peer starts on auto-medium, so ordering it to auto-medium matches
+    # the retained session/new value.
+    events = await _turn(_executor(peer, tmp_path, auto="auto-medium"))
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert "auto-medium" in errors[0].message
+    assert "echo" in errors[0].message
+    assert "session/prompt" not in _methods(tmp_path)
+
+
+async def test_autonomy_is_accepted_from_a_correlated_config_option_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty setter reply is fine when a ``config_option_update`` confirms it."""
+    peer = _install_peer(tmp_path, monkeypatch, set_autonomy="notify")
+
+    events = await _turn(_executor(peer, tmp_path, auto="normal"))
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    assert [event for event in events if isinstance(event, TurnComplete)]
+    assert "session/prompt" in _methods(tmp_path)
+
+
+async def test_silent_autonomy_setter_fails_with_a_contextual_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer that never answers the setter fails loudly, not with a bare timeout."""
+    monkeypatch.setattr(droid_executor, "_INIT_TIMEOUT_SECONDS", 0.3)
+    peer = _install_peer(tmp_path, monkeypatch, set_autonomy="silent")
+
+    events = await _turn(_executor(peer, tmp_path, auto="normal"))
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert "set_config_option" in errors[0].message
+    assert "'normal'" in errors[0].message
     assert "session/prompt" not in _methods(tmp_path)
 
 
