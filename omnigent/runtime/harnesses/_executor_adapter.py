@@ -18,7 +18,7 @@ import secrets
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import Response
@@ -97,6 +97,11 @@ _HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
 _ORPHAN_RESYNC_THRESHOLD = 3
+
+# A cancelled turn keeps reading its executor for this long so sub-agent lifecycle
+# completions the executor reports while winding down still reach the runner, which
+# only marks a child finished on ``subagent.completed``. Content events are dropped.
+_CANCEL_COMPLETION_GRACE_S = 5.0
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -358,12 +363,13 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
-                async for event in executor.run_turn(
+                turn_events = executor.run_turn(
                     messages=messages,
                     tools=tools,
                     system_prompt=system_prompt,
                     config=config,
-                ):
+                )
+                async for event in turn_events:
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,
@@ -383,6 +389,9 @@ class ExecutorAdapter(HarnessApp):
                         await executor.interrupt_session(self._session_key)
                         _turn_outcome = "cancelled"
                         clean_exit = True
+                        await self._forward_cancelled_subagent_completions(
+                            turn_events, ctx, pending=event
+                        )
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
@@ -593,6 +602,44 @@ class ExecutorAdapter(HarnessApp):
                 self._abandoned_executor_cleanup = interrupt_task
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
+
+    async def _forward_cancelled_subagent_completions(
+        self,
+        events: AsyncIterator[ExecutorEvent],
+        ctx: TurnContext,
+        pending: ExecutorEvent | None = None,
+    ) -> None:
+        """Forward sub-agent completions an interrupted executor still reports.
+
+        A cancelled executor winds down on its own: droid resolves the prompt with
+        ``stopReason: cancelled`` and drains the Task children it left open with
+        ``ok=False``. The runner marks a child finished only when it receives
+        ``subagent.completed``, so this bounded drain keeps those lifecycle events
+        (and nothing else) while dropping the turn's remaining content. The event
+        that revealed the cancellation can itself be a completion, so *pending*
+        goes through the same filter.
+
+        :param events: The turn's executor event stream, already interrupted.
+        :param ctx: The cancelled turn's context, used to emit the completions.
+        :param pending: The event already pulled from *events*, if any.
+        """
+        if isinstance(pending, SubAgentCompleted):
+            self._translate_event(pending, ctx)
+        elif isinstance(pending, (TurnComplete, TurnCancelled)):
+            return
+        deadline = time.monotonic() + _CANCEL_COMPLETION_GRACE_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                event = await asyncio.wait_for(anext(events), timeout=remaining)
+            except (StopAsyncIteration, TimeoutError):
+                return
+            if isinstance(event, SubAgentCompleted):
+                self._translate_event(event, ctx)
+            elif isinstance(event, (TurnComplete, TurnCancelled)):
+                return
 
     async def _handle_interrupt_event(self) -> Response:
         """Cancel the turn and drop the inner executor session synchronously.
