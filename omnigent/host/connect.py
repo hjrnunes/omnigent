@@ -3634,6 +3634,29 @@ class HostProcess:
                 models=with_source(devin_models),
             )
 
+        if harness == "droid":
+            # Droid authenticates through its own CLI login and reports the
+            # account's models in the ACP ``session/new`` handshake. The probe
+            # sends no prompt, so previewing the picker spends no tokens, and a
+            # failed probe arrives as an empty listing: the login still runs, so
+            # the picker degrades to free-text ids instead of blocking launch.
+            try:
+                from omnigent.inner.droid_models import list_droid_cli_model_options
+
+                droid_listing = await asyncio.to_thread(list_droid_cli_model_options)
+            except Exception:  # no catalog, never a crash
+                _logger.warning("Droid model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Droid model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source([option.to_picker_row() for option in droid_listing.models]),
+            )
+
         if is_claude_sdk_harness_name(harness):
             # SDK-mode Claude is a pass-through client with no model catalog
             # of its own, so the endpoint listing IS the harness truth — the

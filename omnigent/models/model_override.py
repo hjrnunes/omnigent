@@ -22,8 +22,9 @@ MODEL_OVERRIDE_MAX_LEN = 256
 # First char alphanumeric so the value can never read as a CLI flag
 # (``--model --evil``); the tail covers real id shapes: dots
 # ("gpt-5.4-mini"), slashes ("openai/gpt-4o"), colons ("vendor:tag"),
-# and bracket suffixes ("claude-opus-4-8[1m]").
-_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
+# bracket suffixes ("claude-opus-4-8[1m]"), and Droid's parenthesized
+# BYOK suffixes ("custom:OpenAI-GPT-5.6-Luna-(BYOK)-4").
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]()\-]*$")
 
 # SDK harnesses whose model override lands in the spawn env — must stay
 # in sync with ``_HARNESS_MODEL_ENV_KEY`` in ``omnigent/runner/app.py``.
@@ -61,7 +62,7 @@ def validate_model_override(value: str) -> str:
     if not _MODEL_ID_RE.fullmatch(stripped):
         raise ValueError(
             "model must start with a letter or digit and contain only "
-            "letters, digits, and the characters . _ : / [ ] -"
+            "letters, digits, and the characters . _ : / [ ] ( ) -"
         )
     return stripped
 
