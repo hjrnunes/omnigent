@@ -923,6 +923,9 @@ class _ForwardDedupeState:
     # prevents the limiter from recovering.
     cost_retry_not_before: float = 0.0
     cost_retry_failures: int = 0
+    # Consecutive transcript-usage post failures. An unchanged sample is
+    # abandoned at ``_TELEMETRY_POST_MAX_FAILURES`` so it stops retrying.
+    usage_retry_failures: int = 0
     # The ``PreCompact`` ``seq`` to dismiss when the transcript phase sees a
     # ``/compact`` refusal (``is_compact_noop``), else ``None``. The dismissal
     # is DEFERRED until after the hook phase, because the ``PreCompact`` hook
@@ -3096,6 +3099,12 @@ def _session_cost_estimate(
     return max(candidates)
 
 
+# Cap consecutive telemetry post failures so an unchanged sample cannot
+# retry forever: each retry counts as runner activity that resets the idle
+# watchdog, leaving a dead session's runner unable to be reaped.
+_TELEMETRY_POST_MAX_FAILURES = 20
+
+
 async def _forward_session_cost(
     *,
     client: httpx.AsyncClient,
@@ -3214,6 +3223,22 @@ async def _forward_session_cost(
         )
     except httpx.HTTPError as exc:
         dedupe.cost_retry_failures += 1
+        # Abandon the sample once retries are exhausted so a dead session
+        # stops posting; retries resume when the value next advances.
+        if dedupe.cost_retry_failures >= _TELEMETRY_POST_MAX_FAILURES:
+            if "cumulative_cost_usd" in payload:
+                dedupe.posted_cost = display_cost
+            if "policy_cost_usd" in payload:
+                dedupe.posted_policy_cost = policy_cost
+            dedupe.cost_retry_failures = 0
+            dedupe.cost_retry_not_before = 0.0
+            _logger.warning(
+                "Abandoned Claude session cost sample after %d failed forwards; session=%s",
+                _TELEMETRY_POST_MAX_FAILURES,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return
         delay = min(30.0, float(2 ** min(dedupe.cost_retry_failures - 1, 5)))
         if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
             raw_retry_after = exc.response.headers.get("retry-after")
@@ -5444,14 +5469,33 @@ async def _forward_available_items(
                 dedupe.context_window = resolved_context_window
             if record_token_usage is not None:
                 dedupe.recorded_token_usage = record_token_usage
+            dedupe.usage_retry_failures = 0
         except httpx.HTTPError as exc:
-            _logger.warning(
-                "Failed to forward Claude transcript usage; session=%s http_status=%s",
-                session_id,
-                _http_status_for_log(exc),
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
+            dedupe.usage_retry_failures += 1
+            # Same abandon-on-cap policy as the cost loop: commit the pending
+            # usage so ``usage_changed`` goes quiet instead of retrying.
+            if dedupe.usage_retry_failures >= _TELEMETRY_POST_MAX_FAILURES:
+                if usage_changed:
+                    dedupe.usage = posted_usage
+                if window_changed:
+                    dedupe.context_window = resolved_context_window
+                if record_token_usage is not None:
+                    dedupe.recorded_token_usage = record_token_usage
+                dedupe.usage_retry_failures = 0
+                _logger.warning(
+                    "Abandoned Claude transcript usage post after %d failures; session=%s",
+                    _TELEMETRY_POST_MAX_FAILURES,
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            else:
+                _logger.warning(
+                    "Failed to forward Claude transcript usage; session=%s http_status=%s",
+                    session_id,
+                    _http_status_for_log(exc),
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
     status_model = concrete_reported_model(status_state.get("model")) if status_state else None
     await _post_model_change_if_new(
