@@ -84,6 +84,7 @@ from omnigent.server import (
     shutdown_state,
 )
 from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -255,6 +256,8 @@ class ServerInfoResponse(BaseModel):
     session_pull_requests: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
+    # Scheduled tasks accept ``project_id``; older servers reject it.
+    scheduled_task_projects: bool = False
     branding: BrandingInfo
 
 
@@ -1889,6 +1892,8 @@ def create_app(
                 managed_launches=app_inst.state.managed_launches,
                 startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
+                project_store=project_store,
+                single_user_owner=RESERVED_USER_LOCAL if auth_provider is not None else None,
             )
             if not automations_v2_enabled:
                 # Legacy Run now uses this fire path, including for paused tasks.
@@ -3395,6 +3400,7 @@ def create_app(
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
+                "scheduled_task_projects": project_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3691,6 +3697,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                project_store=project_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
@@ -3966,7 +3973,7 @@ def create_app(
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + HOST_OFFLINE_HOLD_S
-        host_back = False
+        host_back_deadline: float | None = None
         outcome = "cancelled"
         for conv in held:
             _logger.info(
@@ -3983,10 +3990,13 @@ def create_app(
             )
         try:
             while True:
-                remaining = deadline - loop.time()
+                now = loop.time()
+                remaining = deadline - now
                 if remaining <= 0:
-                    outcome = "host_back_without_runner" if host_back else "expired"
+                    outcome = "expired"
                     break
+                if host_back_deadline is not None:
+                    remaining = min(remaining, max(0.0, host_back_deadline - now))
                 if (
                     await tunnel_registry.wait_for_runner(
                         runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
@@ -3999,10 +4009,16 @@ def create_app(
                     outcome = "server_shutdown"
                     break
                 # An unreadable host row keeps holding; only a live one ends it early.
-                if not host_back and await _host_offline(host_id) is False:
-                    # The host is back; give its runner one more grace to follow.
-                    host_back = True
-                    deadline = min(deadline, loop.time() + RUNNER_DISCONNECT_GRACE_S)
+                if await _host_offline(host_id) is False:
+                    now = loop.time()
+                    if host_back_deadline is None:
+                        host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
+                    if now >= host_back_deadline:
+                        outcome = "host_back_without_runner"
+                        break
+                else:
+                    # A brief host return cannot end a sleeping host's absolute hold.
+                    host_back_deadline = None
         finally:
             for conv in held:
                 _logger.info(

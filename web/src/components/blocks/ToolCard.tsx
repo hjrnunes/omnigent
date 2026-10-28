@@ -206,7 +206,8 @@ type ToolBodyView = "fields" | "raw";
 /**
  * The input and result as labeled fields, or a registered view's body, with
  * the exact JSON payloads behind a Raw switch. The switch keeps its place so
- * it keeps keyboard focus.
+ * it keeps keyboard focus. The two field sections share one grid, so their
+ * values start at the same offset.
  */
 function GenericToolBody({ call, duration, view: toolView }: ToolCardBodyProps) {
   const { args, output, state } = call;
@@ -218,6 +219,7 @@ function GenericToolBody({ call, duration, view: toolView }: ToolCardBodyProps) 
   const hasResult = output !== null || state !== "output-available";
   const result = <ToolResultView output={output} state={state} duration={duration} />;
   if (ViewBody === undefined && !hasInput && output === null) return result;
+  const gridResult = <ToolResultView output={output} state={state} duration={duration} subgrid />;
   return (
     <Tabs
       value={view}
@@ -241,7 +243,12 @@ function GenericToolBody({ call, duration, view: toolView }: ToolCardBodyProps) 
           </TabsTrigger>
         </TabsList>
       </div>
-      <TabsContent value="fields" className="space-y-2">
+      <TabsContent
+        value="fields"
+        className={
+          ViewBody === undefined ? "grid grid-cols-[auto_minmax(0,1fr)] gap-y-2" : "space-y-2"
+        }
+      >
         {ViewBody !== undefined ? (
           <>
             <ViewBody call={call} duration={duration} />
@@ -250,31 +257,32 @@ function GenericToolBody({ call, duration, view: toolView }: ToolCardBodyProps) 
           </>
         ) : (
           <>
-            {hasInput ? <ToolValueView value={args} /> : result}
+            {hasInput ? <ToolValueView value={args} subgrid /> : gridResult}
             {hasInput && hasResult && (
-              <section className="space-y-1">
-                <ToolSectionLabel>Result</ToolSectionLabel>
-                {result}
+              <section className="col-span-2 grid grid-cols-subgrid gap-y-1">
+                <ToolSectionLabel className="col-span-2">Result</ToolSectionLabel>
+                {gridResult}
               </section>
             )}
           </>
         )}
       </TabsContent>
       <TabsContent value="raw" className="space-y-2">
-        <CodePanel
-          title="Parameters"
-          text={inputJson}
-          copyText={inputJson}
-          copyLabel="Copy parameters"
-        />
-        {output === null ? result : <OutputSection output={prettyPrintIfJson(output)} />}
+        <CodePanel title="Input" text={inputJson} copyText={inputJson} copyLabel="Copy input" />
+        {output === null ? (
+          result
+        ) : (
+          <OutputSection title="Result" output={prettyPrintIfJson(output)} />
+        )}
       </TabsContent>
     </Tabs>
   );
 }
 
-function ToolSectionLabel({ children }: { children: ReactNode }) {
-  return <div className="font-medium text-muted-foreground text-sm">{children}</div>;
+function ToolSectionLabel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn("font-medium text-muted-foreground text-sm", className)}>{children}</div>
+  );
 }
 
 type ResultPresentation =
@@ -328,44 +336,54 @@ function prettyJson(value: unknown): string | null {
   }
 }
 
+/** `subgrid` places the result in the fields grid shared with the input. */
 function ToolResultView({
   output,
   state,
   duration,
+  subgrid = false,
 }: {
   output: string | null;
   state: ToolState;
   duration: number | undefined;
+  subgrid?: boolean;
 }) {
   const presentation = useMemo(
     () => (output === null ? null : presentToolResult(output)),
     [output],
   );
+  // Results that are not labeled fields span both grid columns.
+  const spanned = (node: ReactNode) =>
+    subgrid ? <div className="col-span-2 min-w-0">{node}</div> : node;
   if (presentation === null) {
-    if (state === "input-available") return <ToolPendingOutput duration={duration} />;
+    if (state === "input-available") return spanned(<ToolPendingOutput duration={duration} />);
     if (state === "output-error" || state === "cancelled" || state === "no-output") {
-      return <EmptyOutputState state={state} />;
+      return spanned(<EmptyOutputState state={state} />);
     }
     return null;
   }
   switch (presentation.kind) {
     case "error":
       return (
-        <div className="space-y-2">
-          <ToolErrorBox>{presentation.message}</ToolErrorBox>
-          {presentation.fields !== null && <ToolValueView value={presentation.fields} />}
+        <div className={subgrid ? "col-span-2 grid grid-cols-subgrid gap-y-2" : "space-y-2"}>
+          <ToolErrorBox className="col-span-2">{presentation.message}</ToolErrorBox>
+          {presentation.fields !== null && (
+            <ToolValueView value={presentation.fields} subgrid={subgrid} />
+          )}
         </div>
       );
     case "fields":
-      return <ToolValueView value={presentation.value} />;
+      return <ToolValueView value={presentation.value} subgrid={subgrid} />;
     case "inline":
-      return presentation.text.length === 0 ? (
-        <p className="text-muted-foreground text-sm">No output</p>
-      ) : (
-        <p className="break-words text-sm">{presentation.text}</p>
+      return spanned(
+        presentation.text.length === 0 ? (
+          <p className="text-muted-foreground text-sm">No output</p>
+        ) : (
+          <p className="break-words text-sm">{presentation.text}</p>
+        ),
       );
     case "panel":
-      return <OutputSection output={presentation.text} language={presentation.language} />;
+      return spanned(<OutputSection output={presentation.text} language={presentation.language} />);
   }
 }
 
@@ -729,14 +747,10 @@ function ShellTerminalPanel({
       </CodeBlockContainer>
       {showRaw && (
         <>
-          <CodePanel
-            title="Parameters"
-            text={inputJson}
-            copyText={inputJson}
-            copyLabel="Copy parameters"
-          />
+          <CodePanel title="Input" text={inputJson} copyText={inputJson} copyLabel="Copy input" />
           {rawOutput !== null && (
             <OutputSection
+              title="Result"
               output={rawOutput}
               language={outputFormat === "sys-os-json" ? "json" : "text"}
             />

@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
+import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { ToolCard } from "./ToolCard";
 
 const longOutput = Array.from(
@@ -110,16 +111,20 @@ export const GenericTodoListExpanded: Story = {
 };
 
 // MCP results arrive as content blocks wrapping the server's JSON.
+// A field selector stays out of the title, and the markdown description renders as prose.
 export const McpJsonResultExpanded: Story = {
   args: {
     name: "mcp__linear__get_issue",
-    arguments: { id: "OMNI-12243", includeComments: false },
+    arguments: { id: "OMNI-12243", fields: ["id", "title", "description", "state", "labels"] },
     output: JSON.stringify([
       {
         type: "text",
         text: JSON.stringify({
           id: "OMNI-12243",
           title: "Claude mod replaces tmux paste for native turns",
+          description:
+            "Follow-up to [#11607](<https://github.com/omnigent-ai/omnigent/pull/11607>).\n\n" +
+            "1. Send turns through the **mod** channel.\n2. Keep tmux paste as the fallback.",
           state: "In Review",
           priority: "P1",
           labels: ["claude-native", "harness"],
@@ -131,6 +136,14 @@ export const McpJsonResultExpanded: Story = {
     startedAt: null,
     duration: 0.412,
   },
+  // Markdown links check workspace files through React Query, as in the app.
+  decorators: [
+    (Story) => (
+      <StoryQueryRouter>
+        <Story />
+      </StoryQueryRouter>
+    ),
+  ],
   play: async ({ canvasElement }) => expand(canvasElement),
 };
 

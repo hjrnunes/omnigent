@@ -243,6 +243,9 @@ if TYPE_CHECKING:
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
 
+# Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
+_LEGACY_SERVER_CREATE_BUDGET_S = 140.0
+
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -818,6 +821,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HOST_SANDBOX_BACKEND",
         # Executable selection must survive CLI -> daemon -> runner. The
         # passthrough list is only applied at the second boundary.
+        "OMNIGENT_CLAUDE_PATH",
         "OMNIGENT_CODEX_PATH",
         "OMNIGENT_PI_PATH",
         # Credential-env denylists must survive both daemon and runner hops.
@@ -2049,11 +2053,42 @@ class HostProcess:
             )
 
         workspace = Path(frame.workspace).expanduser()
+        workspace_recreated = False
         if not workspace.is_dir():
-            return self._launch_failed(
-                frame,
-                workspace_missing_message(workspace),
-                error_code=WORKSPACE_MISSING_ERROR_CODE,
+            # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
+            # session keeps working; a missing *parent* signals a stale path or an
+            # unmounted volume, so refuse rather than build on the wrong filesystem.
+            try:
+                await asyncio.to_thread(workspace.mkdir, exist_ok=True)
+            except OSError as exc:
+                _logger.warning(
+                    "Cannot recreate missing workspace %r for session %r: %s",
+                    str(workspace),
+                    frame.session_id or "<unknown>",
+                    exc,
+                )
+                return self._launch_failed(
+                    frame,
+                    workspace_missing_message(workspace),
+                    error_code=WORKSPACE_MISSING_ERROR_CODE,
+                )
+            workspace_recreated = True
+            _logger.warning(
+                "Recreated missing workspace %r for session %r",
+                str(workspace),
+                frame.session_id or "<unknown>",
+                extra=debug_event(
+                    "workspace_recreated",
+                    session_id=frame.session_id,
+                    host_request_id=frame.request_id,
+                    stage="runner_launch",
+                ),
+            )
+            print(
+                "  ! Recreated missing workspace\n"
+                f"    session: {frame.session_id or '<unknown>'!r}\n"
+                f"    workspace: {str(workspace)!r}",
+                flush=True,
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
@@ -2221,6 +2256,7 @@ class HostProcess:
             request_id=frame.request_id,
             status="launched",
             runner_id=runner_id,
+            workspace_recreated=workspace_recreated,
         )
 
     def _ensure_zygote_started(self) -> ZygoteManager | None:
@@ -4341,6 +4377,9 @@ class HostProcess:
         :returns: Result frame with the worktree path and branch on
             success, or ``status: "failed"`` with an error message.
         """
+        timeout_s = (
+            frame.timeout_s if frame.timeout_s is not None else _LEGACY_SERVER_CREATE_BUDGET_S
+        )
         try:
             # Pause the orphan reaper: create_worktree runs git via
             # subprocess.run, whose children are direct children of this host
@@ -4353,12 +4392,29 @@ class HostProcess:
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
+                    timeout_s=timeout_s,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=exc.message,
+            )
+        except OSError as exc:
+            # Reply so the server does not wait out its whole create bound.
+            _logger.warning("Could not create worktree from %s", frame.repo_path, exc_info=True)
+            return HostCreateWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"host filesystem error: {exc}",
+            )
+        except Exception as exc:
+            # Any other crash must still answer, or the server waits out its whole bound.
+            _logger.exception("Worktree creation crashed for %s", frame.repo_path)
+            return HostCreateWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"worktree creation crashed on the host ({type(exc).__name__})",
             )
         _logger.info(
             "Created worktree %s (branch %s) from %s",

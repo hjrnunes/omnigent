@@ -37,6 +37,9 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
+- `side-chat-settings`: before or after the first message, choose a supported model or effort
+  in the side-chat composer; selections apply to that chat's next turn independently
+  of its parent, in the desktop panel and mobile drawer.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
@@ -175,8 +178,9 @@ Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
-identify the session shown in Workspace. The grid header toggles the shared
-panel; it spans the full app height beside the grid header and cells. Its width
+identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
+next / previous cell and focus its terminal or composer. The grid header button
+or ⌘/Ctrl+Alt+] toggles the shared panel; it spans the full app height beside the grid header and cells. Its width
 is saved per grid and stays fixed when switching sessions; the header shrinks
 with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
@@ -251,8 +255,18 @@ first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
-the tooltip opens. With the flag off, the funnel sits on the Sessions header and
+the tooltip opens, and fall back to the PR the server stored for the session
+when the live lookup has none, with its age once that state is over five
+minutes old. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
+
+**Offline pull requests:** link a PR to a session, then stop its host. The
+session's Pull Requests tab still lists the PR with its title, link, and status,
+plus "Last sync time" and a note to reconnect the host (or, for a sleeping
+sandbox, to send a message). Link a PR is disabled; Unlink PR still works, and
+the server keeps the unlink. A session whose PRs the server hasn't imported yet
+says so instead. Against servers that predate stored PRs, the tab behaves as it
+did before and unlinking needs the host.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -263,6 +277,9 @@ restore the default split. Focus the session to use the full area; Escape
 restores the board. Close the session to return to the board. Opening, closing,
 or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
 restores the board without closing Workspace. Each card remembers whether Workspace is open.
+A card's PR link comes from the session list, so it stays while the host is offline; its
+tooltip gives the state's age once that's over five minutes old. Sessions the server
+hasn't imported yet fill in as it imports them.
 On mobile, the top-left hamburger opens the sidebar from the board or a selected
 session. Back to canvas returns to the selected project. A Canvas session link
 opens the same layout directly. If a session is replaced, for example after `/clear`,
@@ -376,6 +393,23 @@ session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
 and forwards slash text to the vendor TUI.
 
+**Side-chat settings:** open an unsent side chat from the Workspace menu,
+composer add tray, or Ask in side chat. Before sending, open the model pill
+beside the microphone, open its configuration row, and select a model or effort.
+Switch tabs and return to confirm the draft keeps the choice. Send the first
+question and check it uses that selection. Change it again before a follow-up;
+the parent's selection should stay unchanged. Repeat in the mobile drawer.
+Changing only the model preserves unspecified effort and compatible explicit effort;
+an incompatible explicit effort is cleared. Sending waits until a settings save
+finishes, including after reopening the pane. A failed save preserves the message
+draft and allows retrying the settings or sending with the previous selection.
+If the native session's model list is empty, the picker uses the same host
+catalog as the main composer until the session's list arrives.
+Available choices follow the harness's capabilities; viewers and closed chats
+cannot change them. A failed start keeps the draft and selections for retry
+without changing the parent's settings. Native Codex retains its existing
+side-thread flow and does not expose these controls; it is a separate follow-up.
+
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
@@ -416,6 +450,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
   per-cell terminal input, switching without reattaching, active-cell shortcuts,
+  keyboard cell cycling and workspace toggling,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
@@ -670,6 +705,18 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-settings`, desktop panel and mobile drawer:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_sends_with_stale_branch_metadata`
+  checks that a legacy harness without advertised picker capabilities hides the
+  control after slash and Workspace creation;
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks the same gate in the mobile drawer.
+  `tests/browser_ui/chat/test_model_catalog.py::test_side_chat_model_settings_before_and_after_first_message`
+  checks the add tray and Workspace entry points on desktop and mobile with mocked
+  session APIs, including fork-time draft settings and later child-only updates.
+  `web/src/components/chat/SideChatSettings.test.tsx`
+  covers explicit child targeting, compatible effort choices, rejected updates,
+  harness capabilities, and viewer/closed states.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
   checks pending/live tab reuse, interleaved comments, pasted images, and replies
@@ -909,6 +956,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.
+- A web-composer message to a native session whose host is offline waits as
+  "Waiting for host" instead of becoming a failed turn (see
+  [Composer](./composer.md)). The offline-host recipe posts through the API,
+  which still records the failed turn.
 - The desktop app's direct reconnect is not available in a browser; a browser
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit

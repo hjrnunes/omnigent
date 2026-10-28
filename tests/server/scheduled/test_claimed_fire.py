@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.dispatch_scheduler import (
@@ -36,6 +37,7 @@ from tests.server.scheduled.test_fire import (
     FakeConversationStore,
     FakeHostStore,
     FakePermissionStore,
+    FakeProjectStore,
     FakeStartupInputs,
     _drain_managed_launches,
     _FakeAgent,
@@ -126,6 +128,7 @@ def _deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
         startup_inputs=overrides.get("startup_inputs"),
+        project_store=overrides.get("project_store"),
     )
 
 
@@ -230,6 +233,26 @@ async def test_fire_runs_inside_the_owner_identity(store) -> None:
     await executor.fire(claimed.task, claimed.lease)
 
     assert events == ["enter", "dispatch", "exit"]
+    assert _runs(store, claimed.task)[0].status == "running"
+
+
+async def test_claimed_fire_files_the_session_into_the_task_project(store) -> None:
+    project_id = uuid.uuid5(uuid.NAMESPACE_DNS, "project").hex
+    claimed = _claim(store, project_id=project_id)
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            project_store=FakeProjectStore({(project_id, RESERVED_USER_LOCAL)}),
+        ),
+        launch_dispatch=AsyncMock(),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    [created] = conversations.created
+    assert created["project_id"] == project_id
     assert _runs(store, claimed.task)[0].status == "running"
 
 

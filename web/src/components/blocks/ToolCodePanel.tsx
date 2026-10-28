@@ -14,10 +14,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 
 /** A tool call's failure message. */
-export function ToolErrorBox({ children }: { children: ReactNode }) {
+export function ToolErrorBox({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div
-      className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive text-sm"
+      className={cn(
+        "max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive text-sm",
+        className,
+      )}
       data-testid="tool-error-box"
     >
       {children}
@@ -32,7 +35,7 @@ export function CodePanel({
   copyLabel,
   language = "json",
 }: {
-  title: string;
+  title?: string;
   text: string;
   copyText: string;
   copyLabel: string;
@@ -46,7 +49,7 @@ export function CodePanel({
     <CodeBlock code={text} language={language} wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
-          <span className="truncate font-medium uppercase tracking-wide">{title}</span>
+          {title !== undefined && <span className="truncate font-medium">{title}</span>}
         </CodeBlockTitle>
         <CodeBlockActions>
           <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
@@ -202,13 +205,16 @@ export function getOutputPreview(output: string, expanded = false): OutputPrevie
 
 export function OutputSection({
   output,
+  title,
   renderPanel,
   language,
 }: {
   output: string;
-  /** Renders the (possibly truncated) text; defaults to a titled Output panel. */
+  /** The default panel's title; the Fields view leaves it out, since its section label names it. */
+  title?: string;
+  /** Renders the (possibly truncated) text; defaults to a code panel. */
   renderPanel?: (text: string) => ReactNode;
-  /** Highlighting for the default Output panel; JSON unless set. */
+  /** Highlighting for the default panel; JSON unless set. */
   language?: CodeLanguage;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -232,10 +238,10 @@ export function OutputSection({
           renderPanel(preview.text)
         ) : (
           <CodePanel
-            title="Output"
+            title={title}
             text={preview.text}
             copyText={output}
-            copyLabel="Copy output"
+            copyLabel="Copy result"
             language={language}
           />
         )}

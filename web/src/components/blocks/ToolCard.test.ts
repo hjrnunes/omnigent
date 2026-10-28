@@ -178,9 +178,13 @@ describe("ToolCard rendering", () => {
     showView("Raw");
     expect(raw).toHaveAttribute("aria-selected", "true");
     expect(fields).toHaveAttribute("aria-selected", "false");
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
-    expect(screen.queryByText("Input")).toBeNull();
+    // Raw panels keep the section names from the Fields view.
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy input" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
+    expect(screen.queryByText("Output")).toBeNull();
     expect(container.textContent).toContain('"includeComments": false');
     // The switch stays put, so keyboard focus survives switching views.
     expect(screen.getByRole("tab", { name: "Raw" })).toBe(raw);
@@ -219,6 +223,24 @@ describe("ToolCard rendering", () => {
     expect(screen.queryByTestId("tool-value-view")).toBeNull();
     expect(screen.getByRole("button", { name: "Expand" })).toBeInTheDocument();
   });
+
+  it.each([{ mode: "visual" }, {}])(
+    "names a text result once in Fields and titles its panel in Raw, given input %o",
+    (args) => {
+      // WHY: the Result label already names the panel, so a title would repeat it.
+      const { container } = renderCard({
+        name: "component_audit",
+        arguments: args,
+        output: "line 1\nline 2",
+        state: "output-available",
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.getAllByText("Result")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+      showView("Raw");
+      expect(screen.getAllByText("Result")).toHaveLength(1);
+    },
+  );
 
   it.each([
     {
@@ -300,7 +322,7 @@ describe("ToolCard rendering", () => {
       });
       fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
       expect(screen.queryByTestId("tool-value-view")).toBeNull();
-      expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
     } finally {
       spy.mockRestore();
     }
@@ -399,7 +421,7 @@ describe("ToolCard rendering", () => {
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     showView("Raw");
 
-    // Both the Parameters and Output panels default to wrapping.
+    // Both the Input and Result panels default to wrapping.
     const pres = Array.from(container.querySelectorAll("pre"));
     expect(pres.length).toBeGreaterThan(1);
     for (const pre of pres) {
@@ -420,7 +442,7 @@ describe("ToolCard rendering", () => {
     showView("Raw");
 
     const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
-    expect(toggles.length).toBe(2); // Parameters + Output
+    expect(toggles.length).toBe(2); // Input + Result
     fireEvent.click(toggles[0]);
 
     // Only the toggled panel unwraps; the other keeps the default.
@@ -454,7 +476,7 @@ describe("ToolCard registered views", () => {
     expect(screen.queryByText("Input")).toBeNull();
     // The raw payload stays one switch away from a view's body.
     showView("Raw");
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
+    expect(screen.getByText("Input")).toBeInTheDocument();
   });
 
   it("shows an edit's line counts in diff colors and its diff behind a Diff | Raw switch", async () => {
@@ -482,7 +504,7 @@ describe("ToolCard registered views", () => {
     expect(container.textContent).toContain("+TIMEOUT = 60");
     expect(screen.queryByText("Input")).toBeNull();
     showView("Raw");
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
+    expect(screen.getByText("Input")).toBeInTheDocument();
     showView("Diff");
     expect(container.textContent).toContain("-RETRIES = 3");
   });
@@ -600,7 +622,6 @@ describe("ToolCard registered views", () => {
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
     expect(container.textContent).toContain("M src/file0.py");
     // Long output keeps the generic preview, with the rest behind Expand.
     expect(container.textContent).not.toContain("M src/file99.py");
@@ -730,7 +751,7 @@ describe("ToolCard shell terminal panel", () => {
     expect(terminal.textContent).toContain("pnpm install");
     expect(terminal.textContent).not.toContain("zsh -lc");
     expect(terminal.textContent).toContain("Done in 1.2s");
-    expect(screen.queryByText("Parameters")).toBeNull();
+    expect(screen.queryByText("Input")).toBeNull();
   });
 
   it("reveals the raw parameters and untouched output on demand", () => {
@@ -743,9 +764,14 @@ describe("ToolCard shell terminal panel", () => {
       state: "output-available",
     });
     expand(container);
+    // The terminal keeps its own copy control, named for the command's output.
+    expect(screen.getByRole("button", { name: "Copy output" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Raw" }));
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy input" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
     expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
   });
 
@@ -912,7 +938,7 @@ describe("ToolCard shell terminal theme", () => {
     writeTerminalThemeMode("dark");
     const terminal = renderExpandedShell();
     expect(terminal).toHaveAttribute("data-terminal-theme", "dark");
-    expect(terminal.style.getPropertyValue("--background")).toBe("#131517");
+    expect(terminal.style.getPropertyValue("--background")).toBe("#0a0a0a");
     // Selected text keeps the terminal's light text, not the light app's dark one.
     expect(terminal.style.getPropertyValue("--selection-foreground")).toBe("#e4e4e7");
 

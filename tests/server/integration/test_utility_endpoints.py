@@ -118,6 +118,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Browser-posted despite its prefix; runner-only events stay unadvertised.
     assert "external_btw_dismiss" in data["session_event_types"]
     assert "external_output_text_delta" not in data["session_event_types"]
+    # This app wires no project store, so automations cannot take a project.
+    assert data["scheduled_task_projects"] is False
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.

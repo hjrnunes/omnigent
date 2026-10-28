@@ -983,7 +983,10 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
-    return createSideChat(conversationId).then(
+    return createSideChat(
+      conversationId,
+      useChatStore.getState().sideChatComposers[pendingId]?.settings,
+    ).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
@@ -1248,7 +1251,7 @@ function WorkspacePanelImpl({
     })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
       key: `browser:${tabId}`,
-      label: `Browser ${index + 1}`,
+      label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
       select: () => {
         browsers.select(tabId);
@@ -1546,7 +1549,8 @@ function WorkspacePanelImpl({
                         type="button"
                         role="tab"
                         aria-selected={browserSelected && browsers.selected === tabId}
-                        className="flex items-center gap-1"
+                        title={browsers.labelFor(tabId, index)}
+                        className="flex min-w-0 items-center gap-1"
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -1558,12 +1562,12 @@ function WorkspacePanelImpl({
                           onRightRailTabChange("browser");
                         }}
                       >
-                        <GlobeIcon className="size-4" />
-                        Browser {index + 1}
+                        <GlobeIcon className="size-4 shrink-0" />
+                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
                       </button>
                       <button
                         type="button"
-                        aria-label={`Close Browser ${index + 1}`}
+                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
                         className="flex size-4 items-center justify-center rounded hover:bg-muted"
                         onClick={() => void closeBrowserTab(tabId)}
                       >
