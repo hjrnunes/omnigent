@@ -510,6 +510,8 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Droid — headless ACP harness; gates on the droid CLI.
+        "droid",
         # Generic ACP is config-gated; the empty fixture has no slug keys.
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
