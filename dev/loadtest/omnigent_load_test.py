@@ -30,18 +30,29 @@ Environment (set by ``run.py``):
     SESSIONS_PER_USER     Sessions each user drives, sequentially (default 2).
     TURNS_PER_SESSION     Turns per session — history grows across them (default 4).
     HOST_ONLINE_TIMEOUT_S Seconds to wait for a spawned host to come online (default 90).
+    HOLD_SESSION_STREAM   ``0`` disables holding each session's SSE stream open.
+    HOLD_STREAM_COUNT     Subscribers held per session (default 1).
+
+Each user also holds ``GET /v1/sessions/{id}/stream`` open for as long as it
+drives that session's turns, because that is what a real client does — and it is
+the only path that exercises the server's per-subscriber SSE serialization.
+``HOLD_STREAM_COUNT`` opens several subscribers per session, which multiplies
+the per-event fan-out cost without adding runner processes.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import gevent
+import requests
 from locust import HttpUser, task
 
 # Sentinel Origin the server's CSRF/CSWSH guard trusts for a non-browser client.
@@ -81,6 +92,16 @@ class HostUser(HttpUser):
         self._sessions_per_user = int(os.getenv("SESSIONS_PER_USER", "2"))
         self._turns_per_session = int(os.getenv("TURNS_PER_SESSION", "4"))
         online_timeout = float(os.getenv("HOST_ONLINE_TIMEOUT_S", "90"))
+        self._hold_session_stream = os.getenv("HOLD_SESSION_STREAM", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        self._hold_stream_count = max(int(os.getenv("HOLD_STREAM_COUNT", "1")), 1)
+        # The stream needs its own session: the locust client is shared with the
+        # task greenlet, and a streamed response is read concurrently.
+        self._stream_client = requests.Session()
+        self._stream_greenlets: set[gevent.Greenlet] = set()
 
         # Unique identity so one machine can masquerade as many hosts: the
         # server keys hosts on (owner, host_id), and host identity comes purely
@@ -103,6 +124,7 @@ class HostUser(HttpUser):
 
     def on_stop(self) -> None:
         """Terminate the host subprocess (reaping the runners it spawned)."""
+        self._stop_streams()
         self._stop_host()
 
     # ── host subprocess lifecycle ────────────────────────────────────
@@ -219,9 +241,81 @@ class HostUser(HttpUser):
             session_id = self._create_session()
             if session_id is None:
                 continue
-            for i in range(self._turns_per_session):
-                if not self._drive_turn(session_id, _PROMPTS[i % len(_PROMPTS)]):
-                    break  # a broken session won't recover — stop this convo
+            with self._hold_stream(session_id):
+                for i in range(self._turns_per_session):
+                    if not self._drive_turn(session_id, _PROMPTS[i % len(_PROMPTS)]):
+                        break  # a broken session won't recover — stop this convo
+
+    # ── SSE subscriber (the real client's view of a turn) ────────────
+
+    @contextlib.contextmanager
+    def _hold_stream(self, session_id: str) -> Iterator[None]:
+        """Hold the session's SSE stream open for the turns run inside the block.
+
+        A real client subscribes before posting a turn and keeps the stream open
+        for the whole conversation. The server serialises every published event
+        once per subscriber, so this is what exercises that path under load.
+        ``HOLD_STREAM_COUNT`` opens that many subscribers per session, which
+        multiplies the per-event fan-out cost without adding runner processes.
+        """
+        if not self._hold_session_stream:
+            yield
+            return
+        greenlets = [
+            gevent.spawn(self._read_session_stream, session_id)
+            for _ in range(self._hold_stream_count)
+        ]
+        for greenlet in greenlets:
+            self._stream_greenlets.add(greenlet)
+        try:
+            yield
+        finally:
+            for greenlet in greenlets:
+                self._stream_greenlets.discard(greenlet)
+                greenlet.kill(block=True)
+
+    def _stop_streams(self) -> None:
+        """Kill any stream greenlet still running (e.g. load stopped mid-session)."""
+        for greenlet in list(self._stream_greenlets):
+            greenlet.kill(block=True)
+        self._stream_greenlets.clear()
+        self._stream_client.close()
+
+    def _read_session_stream(self, session_id: str) -> None:
+        """Read one session's SSE stream until the greenlet is killed.
+
+        Reported as a ``sse stream hold`` sample whose response time is how long
+        the stream stayed open and whose response length is the bytes received —
+        a subscriber's lifetime, not a request latency.
+        """
+        started = time.monotonic()
+        received_bytes = 0
+        status: int | None = None
+        error: Exception | None = None
+        response: requests.Response | None = None
+        try:
+            response = self._stream_client.get(
+                f"{self._server}/v1/sessions/{session_id}/stream",
+                headers=self._headers(),
+                stream=True,
+                # No read timeout: the server sends a heartbeat every 15 s, and
+                # the hold ends when the session's turns finish.
+                timeout=(10.0, None),
+            )
+            status = response.status_code
+            if status != 200:
+                error = RuntimeError(f"stream -> {status}")
+                return
+            for line in response.iter_lines():
+                received_bytes += len(line) + 1
+        except gevent.GreenletExit:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a dropped stream is a failed sample
+            error = exc
+        finally:
+            if response is not None:
+                response.close()
+            self._fire("sse stream hold", started, exc=error, response_length=received_bytes)
 
     def _create_session(self) -> str | None:
         """Create a session bound to this user's host; return its id or None."""
@@ -303,18 +397,27 @@ class HostUser(HttpUser):
         """Headers for control-plane requests (single-user local: no token)."""
         return {"Origin": INTERNAL_ORIGIN}
 
-    def _fire(self, name: str, start: float, *, exc: Exception | None = None) -> None:
+    def _fire(
+        self,
+        name: str,
+        start: float,
+        *,
+        exc: Exception | None = None,
+        response_length: int = 0,
+    ) -> None:
         """Report one Locust sample under a dedicated request type.
 
         ``host online`` / ``turn`` are multi-step spans (subprocess registration,
         post→idle) that aren't a single HTTP call, so they're reported as manual
         events; the per-request HTTP calls are recorded under their own names.
+        ``sse stream hold`` reuses this to record how long a subscriber stream
+        stayed open (*response_length* then carries the bytes read).
         """
         self.environment.events.request.fire(
             request_type="LOADTEST",
             name=name,
             response_time=(time.monotonic() - start) * 1000,
-            response_length=0,
+            response_length=response_length,
             exception=exc,
             context={},
         )

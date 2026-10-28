@@ -7,7 +7,10 @@ the LLM is **mocked**, this test owns its target: it boots a local ``omnigent
 server`` + a zero-latency mock LLM (reusing the benchmark harness's
 ``BenchEnvironment``), registers one agent, then runs Locust where **each user
 is a real ``omnigent host``** that creates host-bound sessions and drives real
-multi-turn conversations (see ``omnigent_load_test.py``).
+multi-turn conversations (see ``omnigent_load_test.py``). Each user also holds
+its session's SSE stream open while the turns run — the only path that exercises
+per-subscriber serialization on the server (``--no-hold-session-stream`` turns
+that off).
 
 There is no ``--server`` to point at — mocking the LLM requires a stack we
 control. ``-u N`` scales the number of hosts; each host spawns real runner
@@ -134,6 +137,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Seconds between the server's relay_stats log records.",
     )
+    parser.add_argument(
+        "--hold-session-stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Hold each session's SSE stream open while its turns run, like a real "
+            "client. This is the only path that exercises per-subscriber "
+            "serialization; --no-hold-session-stream disables it."
+        ),
+    )
+    parser.add_argument(
+        "--hold-stream-count",
+        type=int,
+        default=1,
+        help=(
+            "Subscribers to hold per session (default 1). Raising it multiplies "
+            "the server's per-event fan-out without adding runner processes, "
+            "which is how the relay flame graph reaches saturation."
+        ),
+    )
     return parser
 
 
@@ -234,6 +257,8 @@ def _write_run_config(
         "turns_per_session": args.turns_per_session,
         "reply_words": args.reply_words,
         "server_ref": args.server_ref,
+        "hold_session_stream": args.hold_session_stream,
+        "hold_stream_count": args.hold_stream_count,
         "health_probe_interval_s": args.health_probe_interval,
         "policy_probe_interval_s": args.policy_probe_interval,
         "relay_stats_interval_s": args.relay_stats_interval,
@@ -332,6 +357,11 @@ def _write_summary(
     lines.append(
         "- **host online** is the cost of a host subprocess registering over the "
         "host tunnel; **session create** is the host-bound create."
+    )
+    lines.append(
+        "- **sse stream hold** is how long each user held its session's SSE stream "
+        "open (a subscriber lifetime, not a request latency); its response length "
+        "is the bytes that subscriber received."
     )
     lines.append(
         "- **Fails** — any non-zero value means operations errored; see the Failures "
@@ -439,6 +469,8 @@ async def _run_with_environment(
                 "turns_per_session": args.turns_per_session,
                 "reply_words": args.reply_words,
                 "run_time": args.run_time,
+                "hold_session_stream": args.hold_session_stream,
+                "hold_stream_count": args.hold_stream_count,
                 "health_probe_interval_s": args.health_probe_interval,
                 "policy_probe_interval_s": args.policy_probe_interval,
                 "relay_stats_interval_s": args.relay_stats_interval,
@@ -502,6 +534,8 @@ async def _run_locust(
         "LOADTEST_WORKSPACE_ROOT": str(out_dir / "host-workspaces"),
         "SESSIONS_PER_USER": str(args.sessions_per_user),
         "TURNS_PER_SESSION": str(args.turns_per_session),
+        "HOLD_SESSION_STREAM": "1" if args.hold_session_stream else "0",
+        "HOLD_STREAM_COUNT": str(args.hold_stream_count),
     }
     print(f"$ {' '.join(argv)}\n  results → {out_dir}", flush=True)
 

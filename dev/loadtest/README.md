@@ -58,6 +58,8 @@ python dev/loadtest/run.py --users 8 --sessions-per-user 2 --turns-per-session 4
 | `--health-probe-interval` | 0.25 | Seconds between `GET /health` probes. |
 | `--policy-probe-interval` | 1.0 | Seconds between `POST /v1/sessions/{id}/policies/evaluate` probes. |
 | `--relay-stats-interval` | 5.0 | Seconds between the server's `relay_stats` log records. |
+| `--hold-session-stream` | on | Hold each session's `GET /v1/sessions/{id}/stream` open while its turns run, like a real client. This is the only path that exercises per-subscriber SSE serialization; `--no-hold-session-stream` turns it off for comparison. |
+| `--hold-stream-count` | 1 | Subscribers to hold per session. Raise it to multiply the server's per-event fan-out without adding runner processes; this is how the relay profile reaches saturation on one box. |
 
 Start small to confirm the stack boots on your machine — `--users 2
 --sessions-per-user 1 --turns-per-session 2 --run-time 40s` — then ramp.
@@ -87,6 +89,10 @@ Writes a timestamped `results/` directory (git-ignored):
   so a rising p95/p99 with larger `--turns-per-session` is expected.
 - **host online** — cost of a host subprocess registering over the host tunnel.
 - **session create** — the host-bound `POST /v1/sessions`.
+- **sse stream hold** — how long a user held its session's SSE stream open
+  (a subscriber lifetime, not a request latency); the row's response length is
+  the bytes that subscriber received. With `--hold-stream-count` above 1 each
+  session contributes that many rows.
 - **Ops/s** — aggregate throughput at this concurrency.
 
 Each host's own log (useful when a host fails to register) is at

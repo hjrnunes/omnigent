@@ -48,6 +48,12 @@ def _args(**over: object) -> argparse.Namespace:
         "turns_per_session": 4,
         "reply_words": 60,
         "out_dir": None,
+        "server_ref": None,
+        "hold_session_stream": True,
+        "hold_stream_count": 1,
+        "health_probe_interval": 0.25,
+        "policy_probe_interval": 1.0,
+        "relay_stats_interval": 5.0,
     }
     base.update(over)
     return argparse.Namespace(**base)
@@ -152,3 +158,5 @@ def test_write_run_config_records_inputs(tmp_path: Path) -> None:
     assert cfg["users_hosts"] == 5
     assert cfg["exit_code"] == 0
     assert cfg["model"] == "mock (zero-latency)"
+    assert cfg["hold_session_stream"] is True
+    assert cfg["hold_stream_count"] == 1
