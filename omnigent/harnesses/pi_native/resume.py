@@ -47,6 +47,7 @@ import httpx
 
 from omnigent.host.daemon_launch import error_text
 from omnigent.native.native_terminal import url_component
+from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -440,15 +441,33 @@ def _pi_compaction_records(
             "bashExecution",
             "branchSummary",
         }:
+            restored = copy.deepcopy(message)
+            if "content" in restored:
+                restored["content"] = _pi_replayable_content(restored["content"])
             entries.append(
                 {
                     "type": "message",
                     "id": entry_id(index),
                     "timestamp": timestamp,
-                    "message": copy.deepcopy(message),
+                    "message": restored,
                 }
             )
     return checkpoint, entries
+
+
+def _pi_replayable_content(content: object) -> object:
+    """Replace snapshot images whose payload storage stripped with text placeholders.
+
+    :param content: A Pi message ``content`` value.
+    :returns: The content; usable images keep Pi's ``data``/``mimeType`` shape.
+    """
+    if not isinstance(content, list):
+        return content
+    sanitized = cast(list[object], sanitize_replayed_image_blocks(content))
+    return [
+        original if isinstance(block, dict) and block.get("type") == "image" else block
+        for original, block in zip(content, sanitized, strict=True)
+    ]
 
 
 def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:

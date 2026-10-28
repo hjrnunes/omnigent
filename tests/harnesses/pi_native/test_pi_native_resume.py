@@ -7,6 +7,7 @@ the resume-file path resolution, and the end-to-end
 
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.entities import CompactionData
 from omnigent.harnesses.pi_native.resume import (
     ensure_local_pi_resume_session,
     fetch_all_session_items_for_pi_resume,
@@ -180,6 +182,45 @@ def test_compaction_replaces_history_and_preserves_native_tail(with_tail: bool) 
     for previous, current in itertools.pairwise(records[1:]):
         assert current["parentId"] == previous["id"]
     assert records[1]["parentId"] is None
+
+
+def test_compaction_replays_stored_images_as_text_placeholders() -> None:
+    image = {
+        "type": "image",
+        "data": base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes(64)).decode(),
+        "mimeType": "image/png",
+    }
+    stored = CompactionData(
+        summary="checkpoint",
+        last_item_id="before",
+        token_count=1,
+        compacted_messages=[
+            {"role": "user", "content": [{"type": "text", "text": "see this"}, image]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "toolCall", "id": "call_img", "name": "read", "arguments": {}}
+                ],
+            },
+            {
+                "role": "toolResult",
+                "toolCallId": "call_img",
+                "toolName": "read",
+                "content": [image],
+            },
+        ],
+    )
+    records = pi_session_records_from_session_items(
+        [{"id": "compact", "type": "compaction", **stored.model_dump(exclude_none=True)}],
+        session_id="conv_images",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    user, _, result = (entry["message"] for entry in records if entry["type"] == "message")
+    placeholders = [user["content"][1], result["content"][0]]
+    assert user["content"][0] == {"type": "text", "text": "see this"}
+    assert all(block["type"] == "text" for block in placeholders)
+    assert all("image/png image omitted" in block["text"] for block in placeholders)
 
 
 def test_legacy_summary_only_compaction_does_not_restore_old_transcript() -> None:
