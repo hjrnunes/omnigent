@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 
 try:
     import celpy
@@ -84,6 +85,17 @@ from omnigent.policies.schema import (
 )
 
 _log = logging.getLogger(__name__)
+
+
+# The policy engine rebuilds factories on every evaluate request, and a CEL
+# compile costs milliseconds. Compilation depends only on the expression text,
+# so cache the immutable program. lru_cache keeps raised errors uncached.
+@lru_cache(maxsize=512)
+def _compiled_cel_program(expression: str):
+    assert celpy is not None, "celpy must be importable to compile CEL expressions"
+    env = celpy.Environment()
+    ast = env.compile(expression)
+    return env.program(ast)
 
 
 def cel_policy(
@@ -129,14 +141,11 @@ def cel_policy(
             "Install it with: pip install cel-python"
         )
 
-    env = celpy.Environment()
     try:
-        ast = env.compile(expression)
+        prog = _compiled_cel_program(expression)
     except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
-
-    prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
     _state_updates_key = celpy.celtypes.StringType("state_updates")

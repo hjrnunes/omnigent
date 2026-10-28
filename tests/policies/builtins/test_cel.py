@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 pytest.importorskip("celpy", reason="cel-python not installed")
 
+from omnigent.policies.builtins import cel as cel_module
 from omnigent.policies.builtins.cel import cel_policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.types import EvaluationContext
@@ -314,3 +317,82 @@ def test_llm_client_stripped_from_cel_event() -> None:
     # is stripped before marshalling. The expression must evaluate normally.
     result = evaluate({"type": "request", "llm_client": _FakeLLMClient()})  # type: ignore[typeddict-unknown-key]
     assert result == {"result": "DENY", "reason": "Denied by policy."}
+
+
+# ── Compile cache ───────────────────────────────────────────────
+
+
+@pytest.fixture()
+def cleared_cel_cache() -> Iterator[None]:
+    """Run each cache test with an empty compiled-program cache."""
+    cel_module._compiled_cel_program.cache_clear()
+    yield
+    cel_module._compiled_cel_program.cache_clear()
+
+
+def test_repeated_builds_compile_expression_once(cleared_cel_cache: None) -> None:
+    """The same expression compiles once; later builds hit the cache."""
+    expression = (
+        'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+        ' ? {"result": "DENY", "reason": "Shell blocked."}'
+        ' : {"result": "ALLOW"}'
+    )
+    for reason in ("first", "second", "third", "fourth"):
+        cel_policy(expression=expression, reason=reason)
+
+    info = cel_module._compiled_cel_program.cache_info()
+    assert info.misses == 1
+    assert info.hits == 3
+    assert info.currsize == 1
+    assert info.maxsize == 512
+
+
+def test_distinct_expressions_get_separate_programs(cleared_cel_cache: None) -> None:
+    """Distinct expressions compile separately and keep their own verdicts."""
+    deny_expression = (
+        'event.type == "tool_call" ? {"result": "DENY", "reason": "Blocked."}'
+        ' : {"result": "ALLOW"}'
+    )
+    allow_expression = '{"result": "ALLOW"}'
+
+    deny_policy = cel_policy(expression=deny_expression)
+    allow_policy = cel_policy(expression=allow_expression)
+
+    info = cel_module._compiled_cel_program.cache_info()
+    assert info.misses == 2
+    assert info.hits == 0
+    assert info.currsize == 2
+    assert deny_policy({"type": "tool_call", "data": {"name": "read"}}) == {
+        "result": "DENY",
+        "reason": "Blocked.",
+    }
+    assert allow_policy({"type": "tool_call", "data": {"name": "read"}}) == {
+        "result": "ALLOW",
+    }
+
+    cel_policy(expression=deny_expression)
+    assert cel_module._compiled_cel_program.cache_info().hits == 1
+
+
+def test_compile_errors_are_not_cached(cleared_cel_cache: None) -> None:
+    """A malformed expression raises ValueError on every build attempt."""
+    for _ in range(3):
+        with pytest.raises(ValueError, match="compile error"):
+            cel_policy(expression="event.type ==== bad")
+
+    info = cel_module._compiled_cel_program.cache_info()
+    assert info.misses == 3
+    assert info.hits == 0
+    assert info.currsize == 0
+
+
+def test_missing_celpy_guard_runs_before_compilation(
+    cleared_cel_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without celpy the factory raises ImportError without touching the cache."""
+    monkeypatch.setattr(cel_module, "celpy", None)
+
+    with pytest.raises(ImportError, match="cel-python is required"):
+        cel_policy(expression='{"result": "ALLOW"}')
+
+    assert cel_module._compiled_cel_program.cache_info().misses == 0
