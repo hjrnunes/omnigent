@@ -1362,17 +1362,23 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
-  // FilesPanel is the slot's default view. A file or shell tab overlays it, so
-  // it stays mounted to keep its tree expansion, listing and scroll.
-  const filesPanelMounted =
-    showFilesPanel &&
-    !pending &&
-    !(sideChatSelected && !isMobile) &&
-    !(browserSelected && showBrowserTab) &&
-    !(rightRailTab === "github" && showGithubTab) &&
-    !(rightRailTab === "subagents" && rootSessionId) &&
-    rightRailTab !== null &&
-    !(rightRailTab === "content-search" && showContentSearch);
+  // The selected tab's view, beneath any open file or shell tab.
+  const scopeView =
+    sideChatSelected && !isMobile
+      ? "sidechat"
+      : browserSelected && showBrowserTab
+        ? "browser"
+        : rightRailTab === "github" && showGithubTab
+          ? "github"
+          : rightRailTab === "subagents" && rootSessionId
+            ? "subagents"
+            : rightRailTab === null
+              ? "empty"
+              : rightRailTab === "content-search" && showContentSearch
+                ? "content-search"
+                : "files";
+  // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
+  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   const rail = (
     <aside
@@ -1708,10 +1714,7 @@ function WorkspacePanelImpl({
             </WorkspaceTabTooltip>
           </div>
         </div>
-        {/* Tab content — single slot. An open shell tab holds its xterm; a
-          file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list), kept mounted behind a file or shell;
-          Subagents lists the root's children + a "main" link back. */}
+        {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
         <div
           data-workspace-panel-content
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
@@ -1790,12 +1793,12 @@ function WorkspacePanelImpl({
                 sort={filesPanelSort}
               />
             </ResponsiveViewerSlot>
-          ) : sideChatSelected && !isMobile ? (
+          ) : scopeView === "sidechat" ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
             // in the side-chats drawer instead, so it never mounts twice.
             selectedSideChatPane
-          ) : browserSelected && showBrowserTab ? (
+          ) : scopeView === "browser" ? (
             // Browser soft tab — BrowserPane self-gates and measures this rail
             // slot to position the native view over it.
             <BrowserPane
@@ -1805,11 +1808,11 @@ function WorkspacePanelImpl({
               active={open}
               className="min-h-0 flex-1"
             />
-          ) : rightRailTab === "github" && showGithubTab ? (
+          ) : scopeView === "github" ? (
             <PullRequestPanel conversationId={conversationId} />
-          ) : rightRailTab === "subagents" && rootSessionId ? (
+          ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-          ) : rightRailTab === null ? (
+          ) : scopeView === "empty" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
               <PlusIcon className="size-6" />
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
