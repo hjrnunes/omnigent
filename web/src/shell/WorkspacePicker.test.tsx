@@ -761,6 +761,43 @@ describe("WorkspacePicker keyboard and sorting", () => {
     expect(search.value).toBe("");
   });
 
+  it("opens the exact folder over a newer one sharing its prefix", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            { ...dir("work", "/x/work"), modified_at: 100 },
+            { ...dir("work-old", "/x/work-old"), modified_at: 200 },
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+    fireEvent.click(screen.getByTestId("workspace-picker-sort"));
+    expect(rowNames()).toEqual(["work-old", "work"]);
+
+    fireEvent.change(search, { target: { value: "/x/work" } });
+    expect(screen.getByTestId("workspace-picker-entry-work")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work");
+
+    fireEvent.change(search, { target: { value: "work" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work");
+
+    // An explicit arrow-key choice still wins over the exact match.
+    fireEvent.change(search, { target: { value: "work" } });
+    fireEvent.keyDown(search, { key: "ArrowUp" });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work-old");
+  });
+
   it("lets a typed path win over a folder highlighted before typing", () => {
     const onNavigate = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);

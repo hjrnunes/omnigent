@@ -648,9 +648,11 @@ export function WorkspacePicker({
     if (navigationPending) return null;
     const active = directories.findIndex((entry) => entry.path === activePath);
     if (active !== -1) return active;
-    // A search in this folder highlights its first match so Enter opens it;
-    // a path anywhere else navigates there instead.
-    return searchFilter !== null && directories.length > 0 ? 0 : null;
+    // A search in this folder highlights its exact match, else its first match,
+    // so Enter opens it; a path anywhere else navigates there instead.
+    if (searchFilter === null || directories.length === 0) return null;
+    const exact = directories.findIndex((entry) => entry.name === searchFilter);
+    return exact !== -1 ? exact : 0;
   })();
   const highlightedEntry = highlightedIndex !== null ? directories[highlightedIndex] : null;
 
