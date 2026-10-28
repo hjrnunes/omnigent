@@ -1556,6 +1556,52 @@ def test_droid_listing_failure_is_empty_and_retryable(
     assert calls == 2
 
 
+def test_droid_empty_probe_result_is_unverified_and_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty droid probe is a soft miss, not a verified empty catalog.
+
+    The probe reports a failed handshake or a missing binary by returning an
+    empty listing rather than raising, so an empty result must not be marked
+    ``verified=True`` or cached for the TTL: the next request has to retry and
+    pick up the models once the CLI answers.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.inner import droid_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    calls = 0
+
+    def probe() -> droid_models.DroidModelListing:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return droid_models.DroidModelListing()
+        return droid_models.DroidModelListing(
+            models=(droid_models.DroidModelOption(id="auto", name="Auto Model"),),
+            current_model_id="auto",
+        )
+
+    monkeypatch.setattr(droid_models, "list_droid_cli_model_options", probe)
+
+    first = list_models_for_worker(_worker_spec("droid"), "droid")
+    second = list_models_for_worker(_worker_spec("droid"), "droid")
+
+    assert first.source == "static"
+    assert first.verified is False
+    assert first.models == ()
+    assert first.current_model_id is None
+    assert "can still run" in first.note
+    assert "cannot run here" not in first.note
+    assert second.source == "cli"
+    assert second.verified is True
+    assert [model.id for model in second.models] == ["auto"]
+    assert second.current_model_id == "auto"
+    assert calls == 2
+
+
 def test_droid_catalog_row_reports_the_current_model_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
