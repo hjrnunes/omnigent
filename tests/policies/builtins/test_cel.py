@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Iterator
 
 import pytest
 
 pytest.importorskip("celpy", reason="cel-python not installed")
 
+import celpy
+import celpy.celtypes
+from celpy.adapter import json_to_cel
+from celpy.evaluation import CELEvalError, CELFunction, Context, Evaluator
+
 from omnigent.policies.builtins import cel as cel_module
+from omnigent.policies.builtins._cel_short_circuit import ShortCircuitRunner
 from omnigent.policies.builtins.cel import cel_policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.types import EvaluationContext
@@ -396,3 +403,264 @@ def test_missing_celpy_guard_runs_before_compilation(
         cel_policy(expression='{"result": "ALLOW"}')
 
     assert cel_module._compiled_cel_program.cache_info().misses == 0
+
+
+# ── Short-circuit && and || ─────────────────────────────────────
+
+
+class _Probe:
+    """CEL function that counts its calls and returns a fixed boolean."""
+
+    def __init__(self, result: bool = True) -> None:
+        self.calls = 0
+        self._result = celpy.celtypes.BoolType(result)
+
+    def __call__(self, _value: object) -> celpy.celtypes.BoolType:
+        self.calls += 1
+        return self._result
+
+
+def _run(
+    runner_class: type[celpy.Runner],
+    expression: str,
+    activation: Context | None = None,
+    functions: dict[str, CELFunction] | None = None,
+) -> tuple[str, str]:
+    """Evaluate ``expression``; return ``("value", repr)`` or ``("error", message)``."""
+    environment = celpy.Environment(runner_class=runner_class)
+    program = environment.program(environment.compile(expression), functions=functions)
+    try:
+        return "value", repr(program.evaluate(activation or {}))
+    except CELEvalError as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+
+
+_FALSE = ("value", "BoolType(False)")
+_TRUE = ("value", "BoolType(True)")
+
+
+def test_stock_celpy_evaluates_both_operands() -> None:
+    """Canary: celpy 0.5 evaluates both sides of ``&&``.
+
+    When this fails, celpy short-circuits natively and ``ShortCircuitRunner`` can go.
+    """
+    probe = _Probe()
+
+    outcome = _run(celpy.InterpretedRunner, "false && probe(1)", functions={"probe": probe})
+
+    assert outcome == _FALSE
+    assert probe.calls == 1
+
+
+def test_and_skips_right_operand_when_left_is_false() -> None:
+    """A string never reaches the ``exists`` guarded by ``type(v) == list``."""
+    probe = _Probe()
+
+    outcome = _run(
+        ShortCircuitRunner,
+        "type(v) == list && v.exists(c, probe(c))",
+        {"v": json_to_cel("a" * 200)},
+        {"probe": probe},
+    )
+
+    assert outcome == _FALSE
+    assert probe.calls == 0
+
+
+def test_or_skips_right_operand_when_left_is_true() -> None:
+    """A string satisfies the first alternative, so the list branch is never walked."""
+    probe = _Probe()
+
+    outcome = _run(
+        ShortCircuitRunner,
+        "type(v) == string || v.exists(c, probe(c))",
+        {"v": json_to_cel("a" * 200)},
+        {"probe": probe},
+    )
+
+    assert outcome == _TRUE
+    assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("expression", "probe_result", "expected"),
+    [
+        ("(1 / 0 > 0) && probe(1)", False, _FALSE),
+        ("(1 / 0 > 0) || probe(1)", True, _TRUE),
+    ],
+)
+def test_erroring_left_operand_does_not_skip_the_right(
+    expression: str, probe_result: bool, expected: tuple[str, str]
+) -> None:
+    """``error && false`` is ``false`` and ``error || true`` is ``true``."""
+    probe = _Probe(result=probe_result)
+
+    outcome = _run(ShortCircuitRunner, expression, functions={"probe": probe})
+
+    assert outcome == expected
+    assert probe.calls == 1
+
+
+def test_macro_bodies_short_circuit_too() -> None:
+    """Macro bodies run in nested evaluators, which must short-circuit as well."""
+    probe = _Probe()
+
+    outcome = _run(
+        ShortCircuitRunner,
+        "[1, 2, 3].exists(i, false && probe(i))",
+        functions={"probe": probe},
+    )
+
+    assert outcome == _FALSE
+    assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("true || [1].exists_one(i, 1 / 0 > 0)", _TRUE),
+        ("false && [1].exists_one(i, 1 / 0 > 0)", _FALSE),
+        ("true || [1].filter(i, 1 / 0 > 0).size() > 0", _TRUE),
+        ("false && [1].map(i, 1 / 0).size() > 0", _FALSE),
+    ],
+)
+def test_error_in_a_skipped_operand_does_not_escape(
+    expression: str, expected: tuple[str, str]
+) -> None:
+    """``true || error`` is ``true`` and ``false && error`` is ``false``.
+
+    celpy raises an error from ``exists_one``, ``filter`` and ``map`` bodies instead of
+    returning it as a value, so stock celpy aborts even when the left operand decides.
+    """
+    assert _run(celpy.InterpretedRunner, expression)[0] == "error"
+
+    assert _run(ShortCircuitRunner, expression) == expected
+
+
+_EQUIVALENCE_ACTIVATION: Context = {
+    "x": celpy.celtypes.BoolType(True),
+    "n": celpy.celtypes.IntType(3),
+}
+
+_EQUIVALENCE_EXPRESSIONS = [
+    # A decisive or erroring operand on either side.
+    "false && (1 / 0 > 0)",
+    "(1 / 0 > 0) && false",
+    "true && (1 / 0 > 0)",
+    "(1 / 0 > 0) && true",
+    "true || (1 / 0 > 0)",
+    "(1 / 0 > 0) || true",
+    "false || (1 / 0 > 0)",
+    "(1 / 0 > 0) || false",
+    "(1 / 0 > 0) && (1 / 0 > 1)",
+    # Operands that are not booleans.
+    "false && 1",
+    "1 && false",
+    "true && 1",
+    "1 && 1",
+    "true || 1",
+    "1 || false",
+    "1 || 1",
+    # Chains, mixed operators and macro bodies.
+    "false && true && (1 / 0 > 0)",
+    "x && n > 0 || false",
+    "[1, 2, 3].exists(i, i / 0 > 1 || i == 2)",
+    "[1, 2, 3].all(i, i > 0 || i / 0 > 1)",
+    "[1, 2, 3].exists(i, i == 2 || [4, 5].exists(j, j > i && 1 / 0 > 0))",
+]
+
+
+@pytest.mark.parametrize("expression", _EQUIVALENCE_EXPRESSIONS)
+def test_short_circuit_runner_matches_stock_runner(expression: str) -> None:
+    """Skipping an operand never changes a value or an error."""
+    expected = _run(celpy.InterpretedRunner, expression, _EQUIVALENCE_ACTIVATION)
+
+    actual = _run(ShortCircuitRunner, expression, _EQUIVALENCE_ACTIVATION)
+
+    assert actual == expected
+
+
+def _random_expression(rng: random.Random, depth: int) -> str:
+    """Build a random CEL expression mixing booleans, errors and wrong types."""
+    atoms = ["true", "false", "x", "(n > 2)", "(1 / 0 > 0)", "(n / 0 == 1)", "1", '"s"']
+    if depth == 0 or rng.random() < 0.2:
+        return rng.choice(atoms)
+    operator = rng.choice(["&&", "||", "!", "?:"])
+    if operator == "!":
+        return f"!({_random_expression(rng, depth - 1)})"
+    if operator == "?:":
+        condition, then, otherwise = (_random_expression(rng, depth - 1) for _ in range(3))
+        return f"({condition} ? {then} : {otherwise})"
+    left, right = (_random_expression(rng, depth - 1) for _ in range(2))
+    return f"({left} {operator} {right})"
+
+
+def test_random_expressions_match_stock_runner() -> None:
+    """A seeded sweep of nested ``&&``, ``||``, ``!`` and ``?:`` agrees with the stock runner."""
+    rng = random.Random(20261028)
+    for _ in range(150):
+        expression = _random_expression(rng, 4)
+
+        expected = _run(celpy.InterpretedRunner, expression, _EQUIVALENCE_ACTIVATION)
+        actual = _run(ShortCircuitRunner, expression, _EQUIVALENCE_ACTIVATION)
+
+        assert actual == expected, expression
+
+
+# Shaped like a shipped command guard: a string command is regex-matched, an argv list
+# is searched element by element.
+_COMMAND_GUARD = (
+    'event.type == "tool_call" && type(event.data.arguments) == map'
+    ' && ["command", "cmd"].exists(k, k in event.data.arguments && ('
+    "(type(event.data.arguments[k]) == string"
+    ' && event.data.arguments[k].matches(r"(^|\\s)git\\s+push(\\s|$)"))'
+    " || (type(event.data.arguments[k]) == list"
+    ' && event.data.arguments[k].exists(c, type(c) == string && c == "push"))))'
+    ' ? {"result": "ASK"} : {}'
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "asks"),
+    [
+        ("git push origin main", True),
+        ("cd repo && git push", True),
+        (["git", "push"], True),
+        ("git status", False),
+        (["git", "status"], False),
+        ("ls -la", False),
+    ],
+)
+def test_command_guard_verdicts(command: str | list[str], asks: bool) -> None:
+    """The guard asks for a push, as a string or an argv list, and abstains otherwise."""
+    evaluate = cel_policy(expression=_COMMAND_GUARD)
+
+    result = evaluate(
+        {"type": "tool_call", "data": {"name": "Bash", "arguments": {"command": command}}}
+    )
+
+    assert result == ({"result": "ASK", "reason": "Denied by policy."} if asks else None)
+
+
+def test_string_command_is_not_walked_as_a_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string command costs a few evaluations, not one macro iteration per character."""
+    evaluations = 0
+    stock_evaluate = Evaluator.evaluate
+
+    def counting_evaluate(self: Evaluator, context: Context | None = None) -> celpy.celtypes.Value:
+        nonlocal evaluations
+        evaluations += 1
+        return stock_evaluate(self, context)
+
+    monkeypatch.setattr(Evaluator, "evaluate", counting_evaluate)
+    evaluate = cel_policy(expression=_COMMAND_GUARD)
+
+    result = evaluate(
+        {
+            "type": "tool_call",
+            "data": {"name": "Bash", "arguments": {"command": "echo " + "x" * 5000}},
+        }
+    )
+
+    assert result is None
+    assert evaluations < 20
