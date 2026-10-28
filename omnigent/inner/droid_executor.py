@@ -46,7 +46,10 @@ updates become :class:`ToolCallRequest` / :class:`ToolCallComplete` events and
 ``agent_thought_chunk`` becomes :class:`ReasoningChunk`. Because Droid executes
 those tools inside its own loop, :meth:`handles_tools_internally` returns True so
 the Session passes the events through as informational rather than re-dispatching
-them.
+them. Droid's ``Task`` tool spawns a sub-agent, which the parent stream reports
+only as that tool call plus its terminal result; the executor turns those edges
+into :class:`SubAgentStarted` / :class:`SubAgentCompleted` so the runner mints a
+child session per Task.
 
 Auth is Droid's own configuration: a ``FACTORY_API_KEY`` env var (or the
 interactive ``droid`` device-pairing login). Omnigent stores no Droid
@@ -79,6 +82,8 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -210,6 +215,16 @@ _AUTONOMY_CONFIG_ID = "autonomy_level"
 # ``session/set_config_option`` is sent at all.
 _AUTONOMY_INHERIT = "inherit"
 
+# ``tool_call`` title droid's sub-agent spawn tool reports. VERIFIED live: the
+# parent stream carries no sub-agent messages, only this call and its terminal
+# ``tool_call_update``.
+_TASK_TOOL_TITLE = "Task"
+
+# Summary recorded on a Task child that the turn ended without an outcome for.
+# Droid's ``await: false`` Tasks keep working after ``session/prompt`` resolves
+# and droid reports no later completion on the parent stream.
+_UNFINISHED_TASK_SUMMARY = "The parent turn ended before droid reported this Task's result."
+
 
 def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
     """Decode a text ``input_file`` ``file_data`` data URI into inline text.
@@ -333,6 +348,9 @@ class DroidExecutor(Executor):
         # Tool-call ids already surfaced as a ToolCallRequest, so a repeated
         # ``tool_call`` update for the same id doesn't double-emit the request.
         self._seen_tool_calls: set[str] = set()
+        # Task tool-call ids whose sub-agent has started but not reported an
+        # outcome yet, mapped to the child row's title.
+        self._open_task_children: dict[str, str] = {}
 
         # Context-window size (tokens) reported by Droid's ``usage_update``;
         # surfaced via :meth:`max_context_tokens` so the UI context meter fills.
@@ -373,6 +391,7 @@ class DroidExecutor(Executor):
         self._initialized = False
         self._image_supported = False
         self._seen_tool_calls.clear()
+        self._open_task_children.clear()
         env = os.environ.copy()
         argv = self._launch_argv()
         launch_path = self._sandbox_launch_path(tuple(env.keys()))
@@ -1066,6 +1085,108 @@ class DroidExecutor(Executor):
         )
 
     # ------------------------------------------------------------------
+    # Task sub-agent lifecycle (session/update tool_call titled "Task")
+    # ------------------------------------------------------------------
+
+    def _task_start_event(self, update: dict[str, Any]) -> SubAgentStarted | None:  # type: ignore[explicit-any]
+        """Map a ``Task`` tool-call update onto a :class:`SubAgentStarted`.
+
+        Droid reports its sub-agent spawn as an ordinary ``tool_call`` titled
+        ``Task``; ``rawInput`` carries the delegated ``prompt`` and the row
+        ``description``. Returns ``None`` for every other tool, for a Task
+        update without input, and for a repeated update for a child already
+        started.
+
+        VERIFIED live: the parent stream carries no sub-agent messages, so this
+        edge and the terminal update are the only account of the child's work.
+        """
+        if str(update.get("title") or "") != _TASK_TOOL_TITLE:
+            return None
+        raw_input = update.get("rawInput")
+        if not isinstance(raw_input, dict):
+            return None
+        call_id = update.get("toolCallId") or update.get("id")
+        key = str(call_id) if call_id is not None else ""
+        if not key or key in self._open_task_children:
+            return None
+        description = raw_input.get("description")
+        title = (
+            description
+            if isinstance(description, str) and description
+            else str(raw_input.get("subagent_type") or "") or _TASK_TOOL_TITLE
+        )
+        prompt = raw_input.get("prompt")
+        self._open_task_children[key] = title
+        return SubAgentStarted(
+            child_key=key,
+            title=title,
+            task=prompt if isinstance(prompt, str) else "",
+        )
+
+    def _task_complete_event(self, update: dict[str, Any]) -> SubAgentCompleted | None:  # type: ignore[explicit-any]
+        """Map a terminal ``Task`` ``tool_call_update`` onto a completion.
+
+        Keys off the children still open from :meth:`_task_start_event`, so a
+        terminal update for an ordinary tool call never produces a sub-agent
+        edge. ``ok`` follows droid's status: only ``completed`` is success.
+        Returns ``None`` for interim statuses and for unknown call ids.
+        """
+        status = str(update.get("status", ""))
+        if status not in ("completed", "failed", "error"):
+            return None
+        call_id = update.get("toolCallId") or update.get("id")
+        key = str(call_id) if call_id is not None else ""
+        if key not in self._open_task_children:
+            return None
+        self._open_task_children.pop(key, None)
+        return SubAgentCompleted(
+            child_key=key,
+            ok=status == "completed",
+            summary=self._raw_output_text(update.get("rawOutput")),
+        )
+
+    def _drain_open_task_children(self) -> list[SubAgentCompleted]:
+        """Complete every Task child still open when the turn ends.
+
+        Droid's ``await: false`` Tasks keep working after ``session/prompt``
+        resolves, and droid reports no later outcome on the parent stream, so an
+        unfinished child is closed as failed rather than left running.
+        """
+        completions = [
+            SubAgentCompleted(
+                child_key=key,
+                ok=False,
+                summary=_UNFINISHED_TASK_SUMMARY,
+            )
+            for key in self._open_task_children
+        ]
+        self._open_task_children.clear()
+        return completions
+
+    @staticmethod
+    def _raw_output_text(raw_output: Any) -> str:  # type: ignore[explicit-any]
+        """Flatten a terminal ``tool_call_update.rawOutput`` into summary text.
+
+        VERIFIED live: a Task result arrives as ``{"text": "..."}``. Strings and
+        ACP content-block lists are accepted too, so a droid change degrades to
+        the text it actually sent rather than an empty summary.
+        """
+        if isinstance(raw_output, str):
+            return raw_output
+        if isinstance(raw_output, dict):
+            text = raw_output.get("text")
+            if isinstance(text, str):
+                return text
+            blocks = raw_output.get("content")
+            if isinstance(blocks, list):
+                return "\n".join(
+                    block["text"]
+                    for block in blocks
+                    if isinstance(block, dict) and isinstance(block.get("text"), str)
+                )
+        return ""
+
+    # ------------------------------------------------------------------
     # Prompt building
     # ------------------------------------------------------------------
 
@@ -1212,7 +1333,9 @@ class DroidExecutor(Executor):
         ``ToolCallRequest`` / ``ToolCallComplete`` events as the agent streams,
         answering any ``session/request_permission`` mid-turn, until the final
         response (``stopReason``) arrives — then yields ``TurnComplete`` with
-        token usage.
+        token usage. A ``Task`` tool call also yields ``SubAgentStarted`` /
+        ``SubAgentCompleted``; a Task still open when the turn ends completes
+        with ``ok=False`` so its child row never stays running.
 
         A per-request model override (the web picker / ``/model``) is applied
         live via ``session/set_model`` before prompting — the ACP session
@@ -1312,6 +1435,8 @@ class DroidExecutor(Executor):
         while True:
             now = loop.time()
             if now >= idle_deadline:
+                for completion in self._drain_open_task_children():
+                    yield completion
                 yield ExecutorError(
                     message="Timeout waiting for droid response (idle "
                     f"{_PROMPT_IDLE_TIMEOUT_SECONDS:.0f}s without progress)",
@@ -1319,6 +1444,8 @@ class DroidExecutor(Executor):
                 )
                 return
             if now >= total_deadline:
+                for completion in self._drain_open_task_children():
+                    yield completion
                 yield ExecutorError(
                     message="Timeout waiting for droid response (turn exceeded "
                     f"{_PROMPT_TOTAL_TIMEOUT_SECONDS:.0f}s total)",
@@ -1335,6 +1462,8 @@ class DroidExecutor(Executor):
                 except Exception as exc:  # noqa: BLE001
                     self._session_id = None
                     self._system_prompt_sent = False
+                    for completion in self._drain_open_task_children():
+                        yield completion
                     yield ExecutorError(message=f"droid process error: {exc}", retryable=True)
                     return
                 if "error" in response:
@@ -1342,10 +1471,14 @@ class DroidExecutor(Executor):
                     if "Session not found" in error_msg:
                         self._session_id = None
                         self._system_prompt_sent = False
+                    for completion in self._drain_open_task_children():
+                        yield completion
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_from_result(result) if isinstance(result, dict) else None
+                for completion in self._drain_open_task_children():
+                    yield completion
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
@@ -1394,10 +1527,16 @@ class DroidExecutor(Executor):
                     request_event = self._tool_call_request_event(update)
                     if request_event is not None:
                         yield request_event
+                    start_event = self._task_start_event(update)
+                    if start_event is not None:
+                        yield start_event
                 elif update_type == _UPDATE_TOOL_CALL_UPDATE:
                     complete_event = self._tool_call_complete_event(update)
                     if complete_event is not None:
                         yield complete_event
+                    subagent_event = self._task_complete_event(update)
+                    if subagent_event is not None:
+                        yield subagent_event
                 elif update_type not in _BENIGN_UPDATE_TYPES:
                     # An unrecognized (non-benign) variant — log so a future
                     # droid change surfaces instead of being silently dropped.
