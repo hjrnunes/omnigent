@@ -7019,10 +7019,8 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
             {"path": "/repo/greeting.py", "kind": {"type": "add"}, "diff": "print('hi')\n"}
         ]
     }
-    # Output leads with the outcome, then summarizes each change as "<kind> <path>".
-    assert posted[1]["data"]["item_data"]["output"] == (
-        "File change applied.\nadd /repo/greeting.py"
-    )
+    # Output summarizes each change as "<kind> <path>" from real fields.
+    assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
 
 
 def test_forwarder_sends_file_change_to_observer(

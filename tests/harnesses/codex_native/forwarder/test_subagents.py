@@ -453,9 +453,7 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     json.loads(items[0]["item_data"]["arguments"]), {"changes": changes}
                 )
-                self.assertEqual(
-                    items[1]["item_data"]["output"], f"File change applied.\nadd {path}"
-                )
+                self.assertEqual(items[1]["item_data"]["output"], f"add {path}")
 
         self.assertEqual(observer.call_count, 2)
         for call, path in zip(

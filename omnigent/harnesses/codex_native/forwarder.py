@@ -27,7 +27,6 @@ from omnigent.harnesses.codex_egress import (
     certificate_failure_message,
     is_connection_retry,
 )
-from omnigent.harnesses.codex_file_change import file_change_output
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -6896,11 +6895,21 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
     if not isinstance(changes, list) or not changes:
         _logger.warning("Codex fileChange missing changes: call_id=%s", call_id)
         return None
+    summary_lines: list[str] = []
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        path = change.get("path")
+        kind = change.get("kind")
+        kind_type = kind.get("type") if isinstance(kind, dict) else None
+        label = kind_type if isinstance(kind_type, str) and kind_type else "change"
+        summary_lines.append(f"{label} {path}")
+    output_text = "\n".join(summary_lines)
     return _CodexToolCall(
         call_id=call_id,
         name="apply_patch",
         arguments={"changes": changes},
-        output=file_change_output(item),
+        output=output_text,
     )
 
 

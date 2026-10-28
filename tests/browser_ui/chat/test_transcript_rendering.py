@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
-from omnigent.harnesses.codex_file_change import file_change_output
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
@@ -629,35 +628,35 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     expect(card).not_to_contain_text("Parameters")
 
 
-_PATCH = {
-    "status": "completed",
-    "changes": [
-        {
-            "path": "/repo/src/greet.py",
-            "kind": {"type": "update"},
-            "diff": (
-                "@@ -1,3 +1,3 @@\n def greet(name):\n"
-                "-    print('Hello ' + name)\n+    print(f'Hello {name}')\n     return name\n"
-            ),
-        },
-        {
-            "path": "/repo/src/farewell.py",
-            "kind": {"type": "add"},
-            "diff": "def farewell(name):\n    print(f'Bye {name}')\n",
-        },
-        {"path": "/repo/src/legacy.py", "kind": {"type": "delete"}, "diff": "LEGACY = True\n"},
-    ],
-}
-_DECLINED_PATCH = {
-    "status": "declined",
-    "changes": [
-        {
-            "path": "/repo/src/config.py",
-            "kind": {"type": "update"},
-            "diff": "@@ -1 +1 @@\n-DEBUG = False\n+DEBUG = True\n",
-        }
-    ],
-}
+_PATCH_CHANGES = [
+    {
+        "path": "/repo/src/greet.py",
+        "kind": {"type": "update"},
+        "diff": (
+            "@@ -1,3 +1,3 @@\n def greet(name):\n"
+            "-    print('Hello ' + name)\n+    print(f'Hello {name}')\n     return name\n"
+        ),
+    },
+    {
+        "path": "/repo/src/farewell.py",
+        "kind": {"type": "add"},
+        "diff": "def farewell(name):\n    print(f'Bye {name}')\n",
+    },
+    {"path": "/repo/src/legacy.py", "kind": {"type": "delete"}, "diff": "LEGACY = True\n"},
+]
+_DECLINED_CHANGES = [
+    {
+        "path": "/repo/src/config.py",
+        "kind": {"type": "update"},
+        "diff": "@@ -1 +1 @@\n-DEBUG = False\n+DEBUG = True\n",
+    }
+]
+# How the runner stores a Codex patch's output: its outcome, then one line per file.
+_PATCH_OUTPUT = (
+    "File change applied.\nupdate /repo/src/greet.py\nadd /repo/src/farewell.py\n"
+    "delete /repo/src/legacy.py"
+)
+_DECLINED_OUTPUT = "Error: File change ended with status declined.\nupdate /repo/src/config.py"
 _EDIT_ERROR = "<tool_use_error>String to replace not found in file.</tool_use_error>"
 
 
@@ -669,8 +668,8 @@ def _seed_edit_calls(chat: ChatSessionContract) -> None:
         *tool_call_items(
             "call-patch",
             "apply_patch",
-            {"changes": _PATCH["changes"]},
-            file_change_output(_PATCH),
+            {"changes": _PATCH_CHANGES},
+            _PATCH_OUTPUT,
             response_id=response_id,
         ),
         *tool_call_items(
@@ -683,8 +682,8 @@ def _seed_edit_calls(chat: ChatSessionContract) -> None:
         *tool_call_items(
             "call-declined",
             "apply_patch",
-            {"changes": _DECLINED_PATCH["changes"]},
-            file_change_output(_DECLINED_PATCH),
+            {"changes": _DECLINED_CHANGES},
+            _DECLINED_OUTPUT,
             response_id=response_id,
         ),
         message_item(
@@ -719,9 +718,15 @@ def test_patch_row_counts_lines_across_its_files(
 
     patch.click()
     expect(page.get_by_role("tab", name="Diff")).to_have_attribute("aria-selected", "true")
-    diff = page.locator('[data-language="diff"]').first
-    for line in ("--- /repo/src/farewell.py", "+    print(f'Bye {name}')", "-LEGACY = True"):
-        expect(diff).to_contain_text(line)
+    # Each file is its own panel, named with its change kind and counts.
+    body = patch.locator("xpath=..")
+    diffs = body.locator('[data-language="diff"]')
+    expect(diffs).to_have_count(3)
+    expect(body.get_by_text("/repo/src/farewell.py (new file)")).to_be_visible()
+    expect(body.get_by_text("/repo/src/legacy.py (deleted)")).to_be_visible()
+    expect(diffs.nth(1)).to_contain_text("+    print(f'Bye {name}')")
+    expect(diffs.nth(2)).to_contain_text("-LEGACY = True")
+    expect(body).not_to_contain_text("--- /repo/src")
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
 
@@ -751,4 +756,5 @@ def test_failed_edit_rows_show_their_error(
     expect(body.get_by_test_id("tool-error-box")).to_contain_text(
         "File change ended with status declined."
     )
+    expect(body.get_by_text("Requested change, not applied:")).to_be_visible()
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")

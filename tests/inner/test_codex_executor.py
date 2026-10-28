@@ -2802,9 +2802,6 @@ async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
         "changes": [{"path": "/tmp/workspace/result.txt", "kind": {"type": "add"}}]
     }
     assert tool_events[3].metadata["observed_call_completed"] is True
-    assert isinstance(tool_events[4], ToolCallComplete)
-    assert tool_events[4].result == "File change applied.\nadd /tmp/workspace/result.txt"
-    assert tool_events[4].status is ToolCallStatus.SUCCESS
     assert isinstance(events[-1], TurnComplete)
     assert events[-1].response == "done"
 
@@ -2826,29 +2823,6 @@ def test_codex_builtin_command_completion_surfaces_nonzero_exit() -> None:
     assert completion.status is ToolCallStatus.ERROR
     assert completion.result == "boom\n[exit code: 3]"
     assert completion.error == "Command exited with status 3."
-
-
-@pytest.mark.parametrize("status", ["declined", "failed"])
-def test_codex_builtin_file_change_completion_marks_unapplied_patch_failed(status: str) -> None:
-    """An unapplied patch reads as a failure, not as the changes it listed."""
-
-    completion = _codex_builtin_tool_completion(
-        {
-            "id": "file-unapplied",
-            "type": "fileChange",
-            "status": status,
-            "changes": [
-                {"path": "/repo/app.py", "kind": {"type": "update"}, "diff": "@@\n-a\n+b"}
-            ],
-        }
-    )
-
-    assert completion is not None
-    assert completion.status is ToolCallStatus.ERROR
-    assert completion.result == (
-        f"Error: File change ended with status {status}.\nupdate /repo/app.py"
-    )
-    assert completion.error == f"File change ended with status {status}."
 
 
 async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:

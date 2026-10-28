@@ -57,7 +57,6 @@ from omnigent.harnesses.codex_egress import (
     is_connection_failure_text,
     is_connection_retry,
 )
-from omnigent.harnesses.codex_file_change import file_change_failure, file_change_output
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -2706,10 +2705,22 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
             suffix = f"[exit code: {exit_code}]"
             result = f"{result}\n{suffix}" if result else suffix
     else:
-        result = file_change_output(item)
-        error = file_change_failure(item)
-        if error is not None:
+        changes = item.get("changes")
+        assert isinstance(changes, list)
+        summaries: list[str] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            kind = change.get("kind")
+            kind_type = kind.get("type") if isinstance(kind, dict) else None
+            if isinstance(path, str):
+                label = kind_type if isinstance(kind_type, str) and kind_type else "change"
+                summaries.append(f"{label} {path}")
+        result = "\n".join(summaries)
+        if item.get("status") in {"failed", "declined"}:
             status = ToolCallStatus.ERROR
+            error = f"File change ended with status {item['status']}."
     duration = item.get("durationMs")
     return ToolCallComplete(
         name=request.name,

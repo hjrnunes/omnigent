@@ -107,7 +107,6 @@ from .executor import (
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
-    ToolCallMetadata,
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
@@ -1476,21 +1475,6 @@ class PiSubprocessConfig:
     env: dict[str, str]
     tmp_dir: str
     extra_args: list[str]
-
-
-_ERROR_LEAD_RE = re.compile(r"^error\s*:", re.IGNORECASE)
-
-
-def _failed_tool_output(result: JsonValue) -> str:
-    """Return the transcript output for a failed Pi tool result.
-
-    The transcript does not carry Pi's error flag, so an object result keeps its
-    fields with ``isError`` set, and any other result is text led by ``Error:``.
-    """
-    if isinstance(result, dict):
-        return json.dumps({**result, "isError": True})
-    text = result if isinstance(result, str) else json.dumps(result)
-    return text if _ERROR_LEAD_RE.match(text) else f"Error: {text}"
 
 
 def _extract_text(msg: Message) -> str:
@@ -3142,15 +3126,12 @@ class PiExecutor(Executor):
                 else:
                     status = ToolCallStatus.SUCCESS
 
-                completion_metadata: ToolCallMetadata = {"call_id": call_id}
-                if is_error and not is_blocked and result is not None:
-                    completion_metadata["transcript_output"] = _failed_tool_output(result)
                 yield ToolCallComplete(
                     name=tool_name,
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
-                    metadata=completion_metadata,
+                    metadata={"call_id": call_id},
                 )
                 continue
 
