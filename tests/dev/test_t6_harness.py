@@ -187,6 +187,8 @@ def test_server_payload_reports_guardrail_counters_without_log_lines() -> None:
     """The real recorder payload alone supplies the fuse and overflow counters."""
     stats = relay_stats.RelayStats(warn_threshold_bytes=10, fuse_threshold_bytes=10)
     stats.record_body_queue_enqueue("req-guarded", 32)
+    stats.record_body_queue_warned("req-guarded")
+    stats.record_body_queue_fuse_trip()
     stats.record_outbound_queue_depth("runner-1", 2)
     stats.record_subscriber_overflow()
     payload = relay_stats.build_relay_stats_log_payload(stats.snapshot())
