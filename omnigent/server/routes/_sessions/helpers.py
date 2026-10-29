@@ -110,7 +110,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, shutdown_state
+from omnigent.server import presence, relay_stats, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -8550,6 +8550,7 @@ async def _relay_persist(
             [item],
         )
     except Exception:  # noqa: BLE001
+        relay_stats.record_relay_persist_failure(session_id)
         _logger.exception(
             "Relay persist failed for session=%s",
             session_id,
@@ -9729,9 +9730,15 @@ async def _stream_live_events(
                     raise ValueError(
                         f"session stream event missing string ``type`` field: {event!r}",
                     )
+                serialize_started_at = time.perf_counter()
                 validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-                yield _format_sse(event_type, validated.model_dump())
+                frame = _format_sse(event_type, validated.model_dump())
+                relay_stats.record_subscriber_serialization(
+                    session_id, time.perf_counter() - serialize_started_at
+                )
+                yield frame
     except session_stream.SubscriberOverflowError:
+        relay_stats.record_subscriber_overflow()
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
             session_id,

@@ -124,7 +124,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import relay_stats, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -8989,6 +8989,7 @@ async def _relay_runner_stream_once(
     # default (5s); ``write``/``pool`` are not rate-limiting here.
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     heartbeat_seen = False
+    stretch: relay_stats.RelayStretchTimer | None = None
     try:
         async with runner_client.stream(
             "GET",
@@ -9007,7 +9008,12 @@ async def _relay_runner_stream_once(
                 ),
             )
             buffer = ""
+            stretch = relay_stats.RelayStretchTimer(
+                session_id,
+                body_wait_probe=relay_stats.body_wait_probe_for_response(resp),
+            )
             async for chunk in resp.aiter_text():
+                stretch.chunk_received()
                 buffer += chunk
                 while "\n\n" in buffer:
                     frame, _, buffer = buffer.partition("\n\n")
@@ -9025,6 +9031,12 @@ async def _relay_runner_stream_once(
                     except json.JSONDecodeError:
                         continue
                     evt_type = event.get("type", "")
+                    if isinstance(evt_type, str) and evt_type:
+                        relay_stats.record_event(
+                            session_id,
+                            evt_type,
+                            source=relay_stats.SOURCE_RELAY_SSE,
+                        )
                     # The runner emits session.status events
                     # directly.
                     # Re-publish via _publish_status so the event
@@ -9079,15 +9091,19 @@ async def _relay_runner_stream_once(
                     if evt_type == "session.created":
                         child_id = event.get("child_session_id")
                         if isinstance(child_id, str) and child_id:
-                            await _flush_relay_text(
-                                conversation_store,
-                                session_id,
-                                text_acc,
-                                current_response_id,
-                                current_model,
+                            await stretch.bound(
+                                _flush_relay_text(
+                                    conversation_store,
+                                    session_id,
+                                    text_acc,
+                                    current_response_id,
+                                    current_model,
+                                )
                             )
-                            await record_subagent_activity(
-                                child_id, "delegated", conversation_store, parent_id=session_id
+                            await stretch.bound(
+                                record_subagent_activity(
+                                    child_id, "delegated", conversation_store, parent_id=session_id
+                                )
                             )
 
                     # Stopped turn: drop its trailing response.* output (no
@@ -9109,17 +9125,19 @@ async def _relay_runner_stream_once(
                     if evt_type == "session.status":
                         status = event.get("status", "")
                         if status in {"idle", "failed"} and pending_subagent_return_id is not None:
-                            await record_subagent_activity(
-                                session_id,
-                                "returned",
-                                conversation_store,
-                                turn_id=pending_subagent_return_id,
-                                status=(
-                                    "failed"
-                                    if status == "failed"
-                                    else pending_subagent_return_status
-                                ),
-                                from_runner=True,
+                            await stretch.bound(
+                                record_subagent_activity(
+                                    session_id,
+                                    "returned",
+                                    conversation_store,
+                                    turn_id=pending_subagent_return_id,
+                                    status=(
+                                        "failed"
+                                        if status == "failed"
+                                        else pending_subagent_return_status
+                                    ),
+                                    from_runner=True,
+                                )
                             )
                             pending_subagent_return_id = None
                         if status:
@@ -9135,19 +9153,23 @@ async def _relay_runner_stream_once(
                                 else None
                             )
                             if status == "failed" and status_error is not None:
-                                await _persist_session_status_error_labels(
-                                    session_id,
-                                    status_error,
-                                    conversation_store,
-                                    owner_runner_id=runner_id,
-                                    agent_name=failure_agent_name,
+                                await stretch.bound(
+                                    _persist_session_status_error_labels(
+                                        session_id,
+                                        status_error,
+                                        conversation_store,
+                                        owner_runner_id=runner_id,
+                                        agent_name=failure_agent_name,
+                                    )
                                 )
                             elif status == "running":
                                 failure_agent_name = None
-                                await _persist_session_status_error_labels(
-                                    session_id,
-                                    None,
-                                    conversation_store,
+                                await stretch.bound(
+                                    _persist_session_status_error_labels(
+                                        session_id,
+                                        None,
+                                        conversation_store,
+                                    )
                                 )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
@@ -9166,10 +9188,12 @@ async def _relay_runner_stream_once(
                                 and _session_status_cache.get(session_id) == "failed"
                             ):
                                 try:
-                                    await _publish_runner_recovered_status(
-                                        session_id,
-                                        conversation_store,
-                                        require_disconnect_code=True,
+                                    await stretch.bound(
+                                        _publish_runner_recovered_status(
+                                            session_id,
+                                            conversation_store,
+                                            require_disconnect_code=True,
+                                        )
                                     )
                                 except Exception:  # noqa: BLE001 — a read error must not kill the relay
                                     # Fail soft: the session keeps its existing
@@ -9300,21 +9324,23 @@ async def _relay_runner_stream_once(
                         # as denied content; consume it the same way the
                         # terminal flush does.
                         _boundary_deny = _llm_response_denied_turns.pop(session_id, None)
-                        await _flush_relay_text(
-                            conversation_store,
-                            session_id,
-                            text_acc,
-                            current_response_id,
-                            current_model,
-                            deny_reason=_boundary_deny,
-                            # Gate each segment as it becomes durable: without
-                            # this a RESPONSE-phase policy is bypassed whenever
-                            # the model emits the offending text before a tool
-                            # call (the segment persists here, ahead of the
-                            # terminal-flush evaluation).
-                            evaluate_response_phase=_boundary_deny is None,
-                            # Progress text precedes more tool calls.
-                            turn_final=False,
+                        await stretch.bound(
+                            _flush_relay_text(
+                                conversation_store,
+                                session_id,
+                                text_acc,
+                                current_response_id,
+                                current_model,
+                                deny_reason=_boundary_deny,
+                                # Gate each segment as it becomes durable: without
+                                # this a RESPONSE-phase policy is bypassed whenever
+                                # the model emits the offending text before a tool
+                                # call (the segment persists here, ahead of the
+                                # terminal-flush evaluation).
+                                evaluate_response_phase=_boundary_deny is None,
+                                # Progress text precedes more tool calls.
+                                turn_final=False,
+                            )
                         )
                         # A failed append leaves text_acc for retry — re-arm
                         # the marker so the retry persists the sentinel.
@@ -9326,10 +9352,12 @@ async def _relay_runner_stream_once(
                         response_id=_persist_rid,
                     )
                     if conv_item is not None:
-                        await _relay_persist(
-                            conversation_store,
-                            session_id,
-                            conv_item,
+                        await stretch.bound(
+                            _relay_persist(
+                                conversation_store,
+                                session_id,
+                                conv_item,
+                            )
                         )
 
                     # On ANY terminal event (not just completed), persist the
@@ -9364,17 +9392,19 @@ async def _relay_runner_stream_once(
                         # durable gating is the RESPONSE phase's job — the
                         # boundary flush above evaluates it for every segment.
                         _deny_reason = _llm_response_denied_turns.pop(session_id, None)
-                        await _flush_relay_text(
-                            conversation_store,
-                            session_id,
-                            text_acc,
-                            current_response_id,
-                            _final_model,
-                            deny_reason=_deny_reason,
-                            # Gate any remaining text before persistence.
-                            evaluate_response_phase=_deny_reason is None,
-                            # Only successful completion triggers final-response actions.
-                            turn_final=evt_type == "response.completed",
+                        await stretch.bound(
+                            _flush_relay_text(
+                                conversation_store,
+                                session_id,
+                                text_acc,
+                                current_response_id,
+                                _final_model,
+                                deny_reason=_deny_reason,
+                                # Gate any remaining text before persistence.
+                                evaluate_response_phase=_deny_reason is None,
+                                # Only successful completion triggers final-response actions.
+                                turn_final=evt_type == "response.completed",
+                            )
                         )
                         # A failed append leaves text_acc intact for a retry
                         # at a later flush — re-arm the marker so the retry
@@ -9392,27 +9422,31 @@ async def _relay_runner_stream_once(
                         # harness, so the web message it carried was never
                         # mirrored back: commit it ahead of the error item.
                         raw_input_stable_id = event.get("input_stable_id")
-                        await _settle_undelivered_native_input(
-                            conversation_store,
-                            session_id,
-                            current_response_id,
-                            (
-                                raw_input_stable_id
-                                if isinstance(raw_input_stable_id, str)
-                                and _failed_event_undelivered(event)
-                                else None
-                            ),
-                            reason_code=_native_input_reason_code(event),
+                        await stretch.bound(
+                            _settle_undelivered_native_input(
+                                conversation_store,
+                                session_id,
+                                current_response_id,
+                                (
+                                    raw_input_stable_id
+                                    if isinstance(raw_input_stable_id, str)
+                                    and _failed_event_undelivered(event)
+                                    else None
+                                ),
+                                reason_code=_native_input_reason_code(event),
+                            )
                         )
                     error_item = _error_item_from_sse(
                         event,
                         response_id=current_response_id,
                     )
                     if error_item is not None:
-                        await _relay_persist_error_once(
-                            conversation_store,
-                            session_id,
-                            error_item,
+                        await stretch.bound(
+                            _relay_persist_error_once(
+                                conversation_store,
+                                session_id,
+                                error_item,
+                            )
                         )
 
                     # Persist resource lifecycle events
@@ -9427,10 +9461,12 @@ async def _relay_runner_stream_once(
                         and event.get("persist_resource_event") is not False
                     ):
                         resource_data = resource_item.data
-                        await _relay_persist(
-                            conversation_store,
-                            session_id,
-                            resource_item,
+                        await stretch.bound(
+                            _relay_persist(
+                                conversation_store,
+                                session_id,
+                                resource_item,
+                            )
                         )
                         # Self-heal the spin-up flag: a created terminal is
                         # authoritative proof the session is no longer
@@ -9463,8 +9499,10 @@ async def _relay_runner_stream_once(
                         # snapshot can't dedup it, but a missing reload chip
                         # beats no chip at all.
                         try:
-                            persisted = await asyncio.to_thread(
-                                conversation_store.append, session_id, [routing_item]
+                            persisted = await stretch.bound(
+                                asyncio.to_thread(
+                                    conversation_store.append, session_id, [routing_item]
+                                )
                             )
                             _persisted_id: str | None = persisted[0].id if persisted else None
                         except Exception:  # noqa: BLE001
@@ -9490,10 +9528,12 @@ async def _relay_runner_stream_once(
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                         _terminal_response = event.get("response")
                         if isinstance(_terminal_response, dict):
-                            await _persist_relay_reported_model(
-                                _terminal_response,
-                                session_id,
-                                conversation_store,
+                            await stretch.bound(
+                                _persist_relay_reported_model(
+                                    _terminal_response,
+                                    session_id,
+                                    conversation_store,
+                                )
                             )
                     if evt_type == "response.completed":
                         # Persist the turn's usage (cost + token buckets) so
@@ -9556,14 +9596,16 @@ async def _relay_runner_stream_once(
                             # catalog fetch — offload it off the shared relay
                             # loop, like the snapshot path does) and the DB
                             # label write below.
-                            _context_labels = await asyncio.to_thread(
-                                _context_labels_from_turn_usage, _resp_usage
+                            _context_labels = await stretch.bound(
+                                asyncio.to_thread(_context_labels_from_turn_usage, _resp_usage)
                             )
                             if _context_labels:
-                                await asyncio.to_thread(
-                                    conversation_store.set_labels,
-                                    session_id,
-                                    _context_labels,
+                                await stretch.bound(
+                                    asyncio.to_thread(
+                                        conversation_store.set_labels,
+                                        session_id,
+                                        _context_labels,
+                                    )
                                 )
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
@@ -9584,19 +9626,23 @@ async def _relay_runner_stream_once(
                             # One row read serves both the subtree sum and
                             # the ancestor publish below (each would
                             # otherwise re-derive the tree root itself).
-                            _usage_conv = await asyncio.to_thread(
-                                conversation_store.get_conversation,
-                                session_id,
+                            _usage_conv = await stretch.bound(
+                                asyncio.to_thread(
+                                    conversation_store.get_conversation,
+                                    session_id,
+                                )
                             )
-                            _subtree_usage = await asyncio.to_thread(
-                                load_session_usage,
-                                session_id,
-                                conversation_store,
-                                root_conversation_id=(
-                                    _usage_conv.root_conversation_id
-                                    if _usage_conv is not None
-                                    else None
-                                ),
+                            _subtree_usage = await stretch.bound(
+                                asyncio.to_thread(
+                                    load_session_usage,
+                                    session_id,
+                                    conversation_store,
+                                    root_conversation_id=(
+                                        _usage_conv.root_conversation_id
+                                        if _usage_conv is not None
+                                        else None
+                                    ),
+                                )
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -9632,11 +9678,13 @@ async def _relay_runner_stream_once(
                                 # Ancestors' badges only move on cost/usage, not a
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:
-                                    await asyncio.to_thread(
-                                        _publish_subtree_cost_to_ancestors,
-                                        conversation_store,
-                                        session_id,
-                                        _usage_conv,
+                                    await stretch.bound(
+                                        asyncio.to_thread(
+                                            _publish_subtree_cost_to_ancestors,
+                                            conversation_store,
+                                            session_id,
+                                            _usage_conv,
+                                        )
                                     )
 
                     failed_response = event.get("response")
@@ -9675,27 +9723,32 @@ async def _relay_runner_stream_once(
                             }
                     if evt_type == "response.elicitation_request":
                         session_stream.publish(session_id, event)
-                        await asyncio.to_thread(
-                            _publish_elicitation_request_to_ancestors,
-                            conversation_store,
-                            session_id,
-                            event,
+                        await stretch.bound(
+                            asyncio.to_thread(
+                                _publish_elicitation_request_to_ancestors,
+                                conversation_store,
+                                session_id,
+                                event,
+                            )
                         )
                         continue
                     if evt_type == "response.elicitation_resolved":
                         session_stream.publish(session_id, event)
                         elicitation_id = event.get("elicitation_id")
                         if isinstance(elicitation_id, str) and elicitation_id:
-                            await asyncio.to_thread(
-                                _publish_elicitation_resolved_to_ancestors,
-                                conversation_store,
-                                session_id,
-                                elicitation_id,
-                                event.get("action"),
-                                reason=event.get("reason"),
+                            await stretch.bound(
+                                asyncio.to_thread(
+                                    _publish_elicitation_resolved_to_ancestors,
+                                    conversation_store,
+                                    session_id,
+                                    elicitation_id,
+                                    event.get("action"),
+                                    reason=event.get("reason"),
+                                )
                             )
                         continue
                     session_stream.publish(session_id, event)
+                stretch.chunk_processed()
 
             # Treat a bare EOF without ``[DONE]`` as a tunnel drop.
             # Route it through the existing bounded recovery path.
@@ -9732,6 +9785,8 @@ async def _relay_runner_stream_once(
     except asyncio.CancelledError:
         raise
     finally:
+        if stretch is not None:
+            stretch.finish()
         _logger.info(
             "Relay: task exiting for session=%s",
             session_id,

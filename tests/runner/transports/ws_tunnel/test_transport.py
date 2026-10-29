@@ -22,6 +22,7 @@ from omnigent.runner.transports.ws_tunnel.transport import (
     WSTunnelTransport,
     _TunneledByteStream,
 )
+from omnigent.server import relay_stats
 
 
 class _NoopWS:
@@ -240,6 +241,55 @@ async def test_tunneled_byte_stream_aclose_cleans_up() -> None:
     await stream.aclose()
 
     assert "req1" not in session.in_flight
+
+
+@pytest.mark.asyncio
+async def test_tunneled_byte_stream_probe_counts_only_real_body_waits() -> None:
+    """The probe counts a body read only when it suspends on an empty queue."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    state = reg.open_request("r1", "req1")
+    reg.route_response_frame("r1", ResponseHeadFrame(id="req1", status=200))
+    reg.route_response_frame("r1", ResponseBodyFrame(id="req1", body="a", encoding="utf-8"))
+
+    stream = _TunneledByteStream(reg, "r1", "req1", state)
+    chunk_iter = stream.__aiter__()
+
+    assert await chunk_iter.__anext__() == b"a"
+    # The chunk was already queued, so the read did not suspend.
+    assert stream.body_wait_probe.wait_count == 0
+
+    pending = asyncio.create_task(chunk_iter.__anext__())
+    await asyncio.sleep(0.01)
+    # The queue was empty, so this read had to suspend.
+    assert stream.body_wait_probe.wait_count == 1
+
+    reg.route_response_frame("r1", ResponseEndFrame(id="req1"))
+    with pytest.raises(StopAsyncIteration):
+        await pending
+
+
+@pytest.mark.asyncio
+async def test_handle_async_request_response_carries_the_body_wait_probe() -> None:
+    """The tunneled response exposes its stream's body-wait probe to the relay."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_request()))
+    await asyncio.sleep(0.01)
+
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200))
+    reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+    response = await task
+
+    probe = relay_stats.body_wait_probe_for_response(response)
+    assert probe is not None
+    assert isinstance(response.stream, _TunneledByteStream)
+    assert probe is response.stream.body_wait_probe
 
 
 # ── WSTunnelTransport.aclose ────────────────────────────

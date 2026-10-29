@@ -52,7 +52,7 @@ from omnigent.runner.transports.ws_tunnel.registry import (
     TunnelEnd,
     TunnelRegistry,
 )
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, relay_stats, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -774,6 +774,7 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
         frame = await session.outbound_queue.get()
         if frame is None:
             return
+        relay_stats.record_outbound_queue_depth(session.runner_id, session.outbound_queue.qsize())
         session.diagnostics.dequeued(frame)
         try:
             await session.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)

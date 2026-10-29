@@ -54,9 +54,22 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     WSCloseFrame,
     WSFrame,
 )
+from omnigent.server import relay_stats
 
 _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
+
+
+class BodyQueueFuseExceeded(httpx.RemoteProtocolError):
+    """One request's queued body exceeded the memory fuse.
+
+    Subclassing ``httpx.RemoteProtocolError`` keeps the abort on the existing
+    transport-failure path, so only the offending relay retries and the runner
+    socket keeps serving its other requests.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, request=None)  # type: ignore[arg-type]
 
 
 class WebSocketLike(Protocol):
@@ -173,6 +186,8 @@ class RequestState:
     :param end_event: Event set when the response end frame arrives.
     :param aborted_with: Error to raise from the body iterator after
         a tunnel disconnect or registry abort.
+    :param req_id: Tunnel request id, used as the relay body-queue
+        counter key.
     """
 
     loop: asyncio.AbstractEventLoop
@@ -181,6 +196,7 @@ class RequestState:
     body_queue: asyncio.Queue[ResponseBodyFrame | None]
     end_event: asyncio.Event = field(default_factory=asyncio.Event)
     aborted_with: BaseException | None = None
+    req_id: str = ""
 
 
 # Inbound channel-queue item shape:
@@ -326,6 +342,7 @@ class TunnelRegistry:
         with self._lock:
             old = self._sessions.pop(runner_id, None)
             if old is not None:
+                relay_stats.record_outbound_queue_released(runner_id)
                 self.record_close(old, code=4000, reason="tunnel replaced")
                 self._abort_session_inflight(
                     old,
@@ -378,6 +395,7 @@ class TunnelRegistry:
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
+            relay_stats.record_outbound_queue_released(runner_id)
             self.record_close(removed, code=1001, reason="tunnel retired by server; reconnect")
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
@@ -629,6 +647,7 @@ class TunnelRegistry:
                 session=session,
                 head_future=loop.create_future(),
                 body_queue=asyncio.Queue(),
+                req_id=req_id,
             )
             session.in_flight[req_id] = state
             return state
@@ -655,6 +674,7 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
+            relay_stats.record_body_queue_released(req_id)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -802,6 +822,10 @@ class TunnelRegistry:
                     session.outbound_queue.put_nowait(frame)
                     # Recording or logging failures cannot undo an accepted frame.
                     with contextlib.suppress(Exception):
+                        relay_stats.record_outbound_queue_depth(
+                            session.runner_id, session.outbound_queue.qsize()
+                        )
+                    with contextlib.suppress(Exception):
                         try:
                             session.diagnostics.enqueued(
                                 frame, session.outbound_queue.qsize(), requested_at
@@ -929,6 +953,7 @@ def _abort_request_state(state: RequestState, error: BaseException) -> None:
     state.end_event.set()
     # Sentinel-push to unblock any pending get().
     state.body_queue.put_nowait(None)
+    relay_stats.record_body_queue_released(state.req_id)
 
 
 def _set_response_head(state: RequestState, frame: ResponseHeadFrame) -> None:
@@ -983,12 +1008,49 @@ def _resolve_connect_waiter(
 def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> None:
     """Append one body frame to the request's body queue.
 
+    Applies this request's queue guardrails: the first frame past the warn
+    threshold logs once, and the first frame past the fuse aborts only this
+    request. Other requests on the same runner socket keep streaming.
+
     :param state: Request state whose body queue receives the
         frame.
     :param frame: Response body frame, e.g. a
         ``ResponseBodyFrame(encoding="utf-8", ...)``.
     :returns: None.
     """
+    if state.aborted_with is not None:
+        # A late frame for an aborted request must not queue behind the
+        # sentinel: the consumer already raised and closed its stream.
+        return
+    guard = relay_stats.record_body_queue_enqueue(
+        state.req_id, relay_stats.body_byte_length(frame.body)
+    )
+    if guard.fuse_tripped:
+        fuse_error = BodyQueueFuseExceeded(
+            f"request {state.req_id} queued {guard.request_bytes} body bytes, "
+            f"past the {guard.fuse_bytes}-byte fuse"
+        )
+        _logger.error(
+            "Relay body-queue fuse tripped for request %s on runner %s "
+            "(%d queued bytes > %d-byte fuse); aborting that request",
+            state.req_id,
+            state.session.runner_id,
+            guard.request_bytes,
+            guard.fuse_bytes,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        _abort_request_state(state, fuse_error)
+        return
+    if guard.warn:
+        _logger.warning(
+            "Relay body queue for request %s on runner %s passed the %d-byte "
+            "warn threshold (%d queued); still streaming",
+            state.req_id,
+            state.session.runner_id,
+            guard.warn_bytes,
+            guard.request_bytes,
+            extra={"session_id": runner_primary_session_id()},
+        )
     state.body_queue.put_nowait(frame)
 
 
