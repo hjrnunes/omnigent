@@ -60,8 +60,10 @@ neither counted nor guarded, so its memory is untracked rather than misreported.
 `OMNIGENT_RELAY_STATS_INTERVAL_S=0` disables the record. Read the counters
 in-process with `omnigent.server.relay_stats.snapshot()`.
 
-The `dev/loadtest/` T6 harness reads the fuse and overflow counts from the
-`relay_stats` payload and reports them with `source = "counter"`. It falls back
+The `dev/loadtest/` T6 harness reads `body_queue.fuse.trips` and
+`session_stream.subscriber_overflows` from the `relay_stats` payload and
+reports them with `source = "counter"`. It reads only those paths, so a request
+id that contains `fuse` or `overflow` cannot inflate the counts. It falls back
 to matching server log lines only for older builds that lack the fields.
 
 ## Verification

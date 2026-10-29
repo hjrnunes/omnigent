@@ -208,6 +208,26 @@ def test_server_payload_reports_guardrail_counters_without_log_lines() -> None:
     assert summary["body_queue"]["fuse_threshold_bytes"] == 10
 
 
+def test_collector_ignores_fuse_and_overflow_words_in_request_ids() -> None:
+    """Per-request gauges never count as fuse trips or subscriber overflows."""
+    payload = _relay_stats_payload()
+    payload["body_queue"]["fuse"] = {"trips": 2, "limit_bytes": 268435456}
+    payload["body_queue"]["requests"] = {
+        "req-fuse": {"depth": 7, "bytes": 4096, "warned": False},
+        "req-overflow": {"depth": 9, "bytes": 8192, "warned": False},
+    }
+    payload["session_stream"] = {"subscriber_overflows": 3}
+    collector = t6_stats.RelayStatsCollector()
+
+    collector.observe(payload)
+    summary = collector.summary(window_seconds=2.0)
+
+    assert summary["fuse_trips"] == 2
+    assert summary["fuse_trips_source"] == "counter"
+    assert summary["subscriber_overflows"] == 3
+    assert summary["subscriber_overflows_source"] == "counter"
+
+
 # ── server log observation ─────────────────────────────────
 
 
