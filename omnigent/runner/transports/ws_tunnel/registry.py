@@ -997,7 +997,7 @@ def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> Non
     :returns: None.
     """
     state.body_queue.put_nowait(frame)
-    relay_stats.record_body_queue_enqueue(state.req_id, len(frame.body))
+    relay_stats.record_body_queue_enqueue(state.req_id, relay_stats.body_byte_length(frame.body))
 
 
 def _end_response_body(state: RequestState) -> None:

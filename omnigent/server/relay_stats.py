@@ -387,6 +387,28 @@ def reset_for_tests() -> None:
     _default_stats = RelayStats()
 
 
+def body_byte_length(body: str) -> int:
+    """Return the UTF-8 byte length of a frame body string.
+
+    ``ResponseBodyFrame.body`` carries the payload as a ``utf-8`` string or as
+    ASCII ``base64``, so this one measure counts a queued body's real bytes.
+    """
+    return len(body.encode("utf-8"))
+
+
+def dequeued_body_byte_length(body: str, encoding: str, decoded: bytes) -> int:
+    """Return a consumed frame's byte count without re-encoding its body.
+
+    :param body: The frame's body string.
+    :param encoding: The frame's declared encoding.
+    :param decoded: The body returned by ``decode_body``, reused when the
+        encoding already produced the byte count.
+    """
+    if encoding == "utf-8":
+        return len(decoded)
+    return len(body)
+
+
 def record_body_queue_enqueue(request_id: str, byte_count: int) -> None:
     """Record a queued tunnel body frame for ``request_id``."""
     _default_stats.record_body_queue_enqueue(request_id, byte_count)

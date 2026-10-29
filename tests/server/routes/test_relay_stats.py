@@ -18,8 +18,10 @@ import pytest
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseBodyFrame,
+    decode_body,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import _TunneledByteStream
 from omnigent.runtime import session_stream
 from omnigent.server import presence, relay_stats, shutdown_state
 from omnigent.server.relay_stats import (
@@ -454,3 +456,43 @@ def test_interval_env_var_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv(RELAY_STATS_INTERVAL_ENV_VAR, "not-a-number")
     assert relay_stats.relay_stats_interval_seconds() == DEFAULT_RELAY_STATS_INTERVAL_S
+
+
+def test_body_byte_length_counts_utf8_bytes_not_characters() -> None:
+    """Body-queue bytes are the body's UTF-8 size, not its character count."""
+    assert relay_stats.body_byte_length("") == 0
+    assert relay_stats.body_byte_length("abc") == 3
+    assert relay_stats.body_byte_length("é") == 2
+    assert relay_stats.body_byte_length("😀") == 4
+
+
+def test_dequeued_body_byte_length_matches_the_enqueue_count() -> None:
+    """A body's dequeue count equals its enqueue count for every encoding."""
+    for body, encoding in (("😀", "utf-8"), ("héllo", "utf-8"), ("YWJj", "base64")):
+        decoded = decode_body(body, encoding)
+        assert relay_stats.dequeued_body_byte_length(body, encoding, decoded) == (
+            relay_stats.body_byte_length(body)
+        )
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_body_counts_utf8_bytes_on_enqueue_and_dequeue() -> None:
+    """An emoji body adds four bytes and gives exactly those bytes back."""
+    registry = TunnelRegistry()
+    registry.register("runner-stats", _NoopWS(), _hello())
+    state = registry.open_request("runner-stats", "req-emoji")
+
+    registry.route_response_frame("runner-stats", ResponseBodyFrame(id="req-emoji", body="😀"))
+
+    queued = relay_stats.snapshot().body_queue
+    assert queued.bytes == 4
+    assert queued.requests["req-emoji"].bytes == 4
+
+    state.body_queue.put_nowait(None)
+    stream = _TunneledByteStream(registry, "runner-stats", "req-emoji", state)
+    assert [chunk async for chunk in stream] == ["😀".encode()]
+
+    drained = relay_stats.snapshot().body_queue
+    assert drained.depth == 0
+    assert drained.bytes == 0
+    assert "req-emoji" not in drained.requests
