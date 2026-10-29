@@ -31,6 +31,7 @@ from omnigent.server.relay_stats import (
     SOURCE_EVENT_BATCH,
     SOURCE_HTTP_POST,
     SOURCE_RELAY_SSE,
+    BodyQueueSnapshot,
     RelayStats,
 )
 from omnigent.server.routes._sessions.helpers import _relay_persist
@@ -138,6 +139,52 @@ def test_body_queue_map_is_bounded() -> None:
     assert set(snapshot.body_queue.requests) == {"req-1", "req-2"}
     assert snapshot.body_queue.dropped_requests == 1
     assert snapshot.body_queue.depth == 2
+
+
+def _assert_aggregate_is_the_tracked_sum(snapshot: BodyQueueSnapshot) -> None:
+    """The aggregate gauges must equal the sum over the tracked requests."""
+    assert snapshot.depth == sum(request.depth for request in snapshot.requests.values())
+    assert snapshot.bytes == sum(request.bytes for request in snapshot.requests.values())
+    assert snapshot.depth >= 0
+    assert snapshot.bytes >= 0
+
+
+def test_saturated_request_map_keeps_aggregates_equal_to_tracked_requests() -> None:
+    """A request admitted after saturation cannot subtract older uncounted frames."""
+    stats = RelayStats()
+    for index in range(512):
+        stats.record_body_queue_enqueue(f"req-{index}", byte_count=100)
+
+    # Past the bound the new request is untracked, so its frames count nowhere.
+    stats.record_body_queue_enqueue("req-late", byte_count=100)
+    stats.record_body_queue_enqueue("req-late", byte_count=100)
+    saturated = stats.snapshot().body_queue
+    assert saturated.depth == 512
+    assert saturated.bytes == 51200
+    assert "req-late" not in saturated.requests
+    _assert_aggregate_is_the_tracked_sum(saturated)
+
+    # A slot frees and the request is admitted with one small counted frame
+    # while its two older uncounted frames are still ahead in its queue.
+    stats.record_body_queue_released("req-0")
+    stats.record_body_queue_enqueue("req-late", byte_count=10)
+    admitted = stats.snapshot().body_queue
+    assert admitted.requests["req-late"].bytes == 10
+    _assert_aggregate_is_the_tracked_sum(admitted)
+
+    # Draining the uncounted frames may exhaust its own gauge, never others'.
+    stats.record_body_queue_dequeue("req-late", byte_count=100)
+    after_first = stats.snapshot().body_queue
+    _assert_aggregate_is_the_tracked_sum(after_first)
+    assert after_first.requests["req-1"].bytes == 100
+
+    stats.record_body_queue_dequeue("req-late", byte_count=100)
+    drained = stats.snapshot().body_queue
+    _assert_aggregate_is_the_tracked_sum(drained)
+    assert drained.requests["req-late"].bytes == 0
+    assert drained.requests["req-1"].bytes == 100
+    assert drained.bytes == 511 * 100
+    assert drained.depth == 511
 
 
 def test_events_counted_by_source_type_and_session() -> None:

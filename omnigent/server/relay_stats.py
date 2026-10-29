@@ -202,16 +202,24 @@ class RelayStats:
         self._body_queue_max_bytes = max(self._body_queue_max_bytes, self._body_queue_bytes)
 
     def record_body_queue_dequeue(self, request_id: str, byte_count: int) -> None:
-        """Record one body frame consumed from ``request_id``'s queue."""
+        """Record one body frame consumed from ``request_id``'s queue.
+
+        The aggregate gauges move by the request's own applied delta, never by
+        the frame's size. A request admitted after the map bound was reached
+        still has uncounted frames ahead of its counted ones, so subtracting
+        them from the aggregate would hide other requests' queued work.
+        """
         existing = self._body_queue_requests.get(request_id)
         if existing is None:
             return
+        depth = max(existing.depth - 1, 0)
+        byte_total = max(existing.bytes - byte_count, 0)
         self._body_queue_requests[request_id] = BodyQueueRequestSnapshot(
-            depth=max(existing.depth - 1, 0),
-            bytes=max(existing.bytes - byte_count, 0),
+            depth=depth,
+            bytes=byte_total,
         )
-        self._body_queue_depth = max(self._body_queue_depth - 1, 0)
-        self._body_queue_bytes = max(self._body_queue_bytes - byte_count, 0)
+        self._body_queue_depth -= existing.depth - depth
+        self._body_queue_bytes -= existing.bytes - byte_total
 
     def record_body_queue_released(self, request_id: str) -> None:
         """Drop ``request_id``'s gauge when its stream closes or aborts."""
