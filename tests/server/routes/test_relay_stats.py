@@ -149,8 +149,8 @@ def _assert_aggregate_is_the_tracked_sum(snapshot: BodyQueueSnapshot) -> None:
     assert snapshot.bytes >= 0
 
 
-def test_saturated_request_map_keeps_aggregates_equal_to_tracked_requests() -> None:
-    """A request admitted after saturation cannot subtract older uncounted frames."""
+def test_saturated_request_map_keeps_rejected_requests_untracked() -> None:
+    """A request rejected at the bound stays untracked until its stream closes."""
     stats = RelayStats()
     for index in range(512):
         stats.record_body_queue_enqueue(f"req-{index}", byte_count=100)
@@ -162,29 +162,40 @@ def test_saturated_request_map_keeps_aggregates_equal_to_tracked_requests() -> N
     assert saturated.depth == 512
     assert saturated.bytes == 51200
     assert "req-late" not in saturated.requests
+    assert saturated.dropped_requests == 2
     _assert_aggregate_is_the_tracked_sum(saturated)
 
-    # A slot frees and the request is admitted with one small counted frame
-    # while its two older uncounted frames are still ahead in its queue.
+    # A slot frees, yet the rejected request is not re-admitted: its two older
+    # uncounted frames may still be queued ahead of any new counted frame.
     stats.record_body_queue_released("req-0")
     stats.record_body_queue_enqueue("req-late", byte_count=10)
-    admitted = stats.snapshot().body_queue
-    assert admitted.requests["req-late"].bytes == 10
-    _assert_aggregate_is_the_tracked_sum(admitted)
+    after_slot = stats.snapshot().body_queue
+    assert "req-late" not in after_slot.requests
+    assert after_slot.depth == 511
+    assert after_slot.bytes == 51100
+    assert after_slot.dropped_requests == 3
+    _assert_aggregate_is_the_tracked_sum(after_slot)
 
-    # Draining the uncounted frames may exhaust its own gauge, never others'.
+    # Draining the older uncounted frames cannot touch any counted gauge.
     stats.record_body_queue_dequeue("req-late", byte_count=100)
-    after_first = stats.snapshot().body_queue
-    _assert_aggregate_is_the_tracked_sum(after_first)
-    assert after_first.requests["req-1"].bytes == 100
-
     stats.record_body_queue_dequeue("req-late", byte_count=100)
     drained = stats.snapshot().body_queue
-    _assert_aggregate_is_the_tracked_sum(drained)
-    assert drained.requests["req-late"].bytes == 0
+    assert "req-late" not in drained.requests
     assert drained.requests["req-1"].bytes == 100
-    assert drained.bytes == 511 * 100
     assert drained.depth == 511
+    assert drained.bytes == 51100
+    _assert_aggregate_is_the_tracked_sum(drained)
+
+    # Only after the request closes (its queue has drained) is a new frame
+    # counted, and then the gauge equals exactly that counted frame.
+    stats.record_body_queue_released("req-late")
+    stats.record_body_queue_enqueue("req-late", byte_count=10)
+    readmitted = stats.snapshot().body_queue
+    assert readmitted.requests["req-late"].depth == 1
+    assert readmitted.requests["req-late"].bytes == 10
+    assert readmitted.depth == 512
+    assert readmitted.bytes == 51110
+    _assert_aggregate_is_the_tracked_sum(readmitted)
 
 
 def test_events_counted_by_source_type_and_session() -> None:
@@ -592,6 +603,22 @@ def test_relay_stretch_timer_ends_the_stretch_where_the_body_wait_started() -> N
     timer.finish()
 
     assert records == [pytest.approx(0.005), pytest.approx(0.002)]
+
+
+def test_relay_stretch_timer_ends_a_terminal_body_wait_where_it_started() -> None:
+    """A body wait that ends the stream is a suspension, not relay time."""
+    clock = _FakeClock()
+    records: list[float] = []
+    probe = relay_stats.BodyWaitProbe()
+    timer = _stretch_timer(clock, records, probe)
+
+    clock.now += 0.005
+    probe.note_wait_started(clock.now)
+    # The pending read ends with EOF, cancellation, timeout, or disconnect.
+    clock.now += 0.100
+    timer.finish()
+
+    assert records == [pytest.approx(0.005)]
 
 
 def test_relay_stretch_timer_treats_chunks_as_suspensions_without_a_probe() -> None:

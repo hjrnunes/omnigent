@@ -171,6 +171,9 @@ class RelayStats:
         self._body_queue_max_depth = 0
         self._body_queue_max_bytes = 0
         self._body_queue_requests: dict[str, BodyQueueRequestSnapshot] = {}
+        # Rejected request ids stay here until their stream closes, so their
+        # older uncounted frames can never consume a later counted frame.
+        self._body_queue_rejected: dict[str, None] = {}
         self._body_queue_dropped_requests = 0
 
         self._dropped_sessions = 0
@@ -184,11 +187,20 @@ class RelayStats:
     # -- body queue -----------------------------------------------------
 
     def record_body_queue_enqueue(self, request_id: str, byte_count: int) -> None:
-        """Record one body frame queued for ``request_id``."""
+        """Record one body frame queued for ``request_id``.
+
+        A request rejected at the tracking bound stays untracked until its
+        stream closes, so frames queued before its rejection are never
+        counted and can never consume a later counted frame's gauge.
+        """
         existing = self._body_queue_requests.get(request_id)
         if existing is None:
+            if request_id in self._body_queue_rejected:
+                self._body_queue_dropped_requests += 1
+                return
             if len(self._body_queue_requests) >= self._max_tracked_requests:
                 self._body_queue_dropped_requests += 1
+                self._remember_rejected_request(request_id)
                 return
             existing = BodyQueueRequestSnapshot(depth=0, bytes=0)
         updated = BodyQueueRequestSnapshot(
@@ -201,13 +213,22 @@ class RelayStats:
         self._body_queue_max_depth = max(self._body_queue_max_depth, self._body_queue_depth)
         self._body_queue_max_bytes = max(self._body_queue_max_bytes, self._body_queue_bytes)
 
+    def _remember_rejected_request(self, request_id: str) -> None:
+        """Keep a rejected request untracked until its stream closes.
+
+        The map holds one id per live rejected request, capped like the
+        tracked map. Past the cap a rejection is still counted in
+        ``dropped_requests`` but not remembered, so the gauge then only
+        undercounts.
+        """
+        if len(self._body_queue_rejected) < self._max_tracked_requests:
+            self._body_queue_rejected[request_id] = None
+
     def record_body_queue_dequeue(self, request_id: str, byte_count: int) -> None:
         """Record one body frame consumed from ``request_id``'s queue.
 
-        The aggregate gauges move by the request's own applied delta, never by
-        the frame's size. A request admitted after the map bound was reached
-        still has uncounted frames ahead of its counted ones, so subtracting
-        them from the aggregate would hide other requests' queued work.
+        A request rejected at the bound has no gauge, so its dequeues never
+        move the aggregate: every frame in the tracked map is counted.
         """
         existing = self._body_queue_requests.get(request_id)
         if existing is None:
@@ -222,7 +243,12 @@ class RelayStats:
         self._body_queue_bytes -= existing.bytes - byte_total
 
     def record_body_queue_released(self, request_id: str) -> None:
-        """Drop ``request_id``'s gauge when its stream closes or aborts."""
+        """Drop ``request_id``'s gauge when its stream closes or aborts.
+
+        This also forgets a rejected id, so a request is only counted again
+        after its stream closes, when its queue has drained.
+        """
+        self._body_queue_rejected.pop(request_id, None)
         existing = self._body_queue_requests.pop(request_id, None)
         if existing is None:
             return
@@ -388,7 +414,8 @@ class RelayStretchTimer:
     """Times relay loop stretches between real suspensions of one reader.
 
     With a probe, a stretch spans chunks that were already queued and ends
-    where a body-queue wait started. Without one, each chunk is its own stretch.
+    where a body-queue wait started, including a wait that ends the stream.
+    Without one, each chunk is its own stretch.
     """
 
     def __init__(
@@ -430,7 +457,14 @@ class RelayStretchTimer:
             self._started_at = self._clock()
 
     def finish(self) -> None:
-        """Record the open stretch, if any."""
+        """Record the open stretch, honoring a body wait that ended the stream."""
+        probe = self._probe
+        if probe is not None and probe.wait_count != self._seen_wait_count:
+            # The read never resumed: EOF, cancellation, timeout, or a
+            # disconnect ended a suspended body wait.
+            self._seen_wait_count = probe.wait_count
+            self._end(probe.wait_started_at)
+            return
         self._end(self._clock())
 
     def _end(self, ended_at: float) -> None:

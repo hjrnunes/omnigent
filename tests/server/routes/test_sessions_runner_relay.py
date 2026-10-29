@@ -197,6 +197,7 @@ class _ScriptedStreamResponse:
         *,
         wait_before: frozenset[int] = frozenset(),
         wait_seconds: float = 0.0,
+        terminal_wait_seconds: float = 0.0,
     ) -> None:
         """
         Initialize the scripted streaming response.
@@ -207,11 +208,15 @@ class _ScriptedStreamResponse:
             indexed from the heartbeat chunk.
         :param wait_seconds: How long a body read marked in ``wait_before``
             stays suspended.
+        :param terminal_wait_seconds: When positive, the stream suspends on
+            a body read and then ends without another chunk, the way EOF,
+            cancellation, timeout, or a disconnect does.
         """
         self._release = release
         self._events = events
         self._wait_before = wait_before
         self._wait_seconds = wait_seconds
+        self._terminal_wait_seconds = terminal_wait_seconds
         self.probe = relay_stats.BodyWaitProbe()
         self.extensions: dict[str, Any] = {relay_stats.BODY_WAIT_PROBE_EXTENSION_KEY: self.probe}
 
@@ -259,6 +264,12 @@ class _ScriptedStreamResponse:
             yield chunk
             if index == 0:
                 await self._release.wait()
+        if self._terminal_wait_seconds > 0.0:
+            # Mirror a body read that suspends and then ends with no chunk:
+            # EOF, cancellation, timeout, or a client disconnect.
+            self.probe.note_wait_started(time.perf_counter())
+            await asyncio.sleep(self._terminal_wait_seconds)
+            return
         yield "data: [DONE]\n\n"
 
 
@@ -280,6 +291,7 @@ class _ScriptedRunnerClient:
         *,
         wait_before: frozenset[int] = frozenset(),
         wait_seconds: float = 0.0,
+        terminal_wait_seconds: float = 0.0,
     ) -> None:
         """
         Initialize the fake runner client.
@@ -288,11 +300,14 @@ class _ScriptedRunnerClient:
         :param events: Event payload dicts to emit after release.
         :param wait_before: Yield indices forwarded to the scripted stream.
         :param wait_seconds: Suspension length forwarded to the scripted stream.
+        :param terminal_wait_seconds: Final suspension forwarded to the
+            scripted stream.
         """
         self._release = release
         self._events = events
         self._wait_before = wait_before
         self._wait_seconds = wait_seconds
+        self._terminal_wait_seconds = terminal_wait_seconds
 
     def stream(
         self,
@@ -316,6 +331,7 @@ class _ScriptedRunnerClient:
             self._events,
             wait_before=self._wait_before,
             wait_seconds=self._wait_seconds,
+            terminal_wait_seconds=self._terminal_wait_seconds,
         )
 
 
@@ -4110,3 +4126,27 @@ async def test_relay_stretch_records_the_stretch_that_ends_the_stream(db_uri: st
     # One stretch ends where the body wait began; the stream end records the other.
     assert snapshot.relay_stretch_count == 2
     assert snapshot.relay_stretch_by_session[conversation.id].count == 2
+
+
+@pytest.mark.asyncio
+async def test_relay_stretch_ends_a_terminal_body_wait_where_it_started(db_uri: str) -> None:
+    """A stream that ends during a body wait does not count the suspended time."""
+    from omnigent.server.routes._sessions import orchestration
+
+    relay_stats.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    terminal_wait_seconds = 0.2
+    runner = _ScriptedRunnerClient(release, [], terminal_wait_seconds=terminal_wait_seconds)
+
+    with pytest.raises(orchestration._RelayTransportLost):
+        await orchestration._relay_runner_stream_once(  # type: ignore[arg-type]
+            conversation.id, runner, store
+        )
+
+    snapshot = relay_stats.snapshot()
+    # The only stretch ends where the terminal body wait started, not at EOF.
+    assert snapshot.relay_stretch_count == 1
+    assert snapshot.relay_stretch_seconds_max < terminal_wait_seconds / 2
