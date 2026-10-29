@@ -25,7 +25,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -365,6 +365,90 @@ class RelayStats:
             dropped_sessions=self._dropped_sessions,
             dropped_event_types=self._dropped_event_types,
         )
+
+
+BODY_WAIT_PROBE_EXTENSION_KEY = "omnigent.body_wait_probe"
+"""``httpx.Response.extensions`` key carrying a tunneled body's wait probe."""
+
+
+@dataclass
+class BodyWaitProbe:
+    """Marks each time a tunneled body read suspends on an empty queue."""
+
+    wait_count: int = 0
+    wait_started_at: float = 0.0
+
+    def note_wait_started(self, timestamp: float) -> None:
+        """Record a body-queue wait starting at ``timestamp``."""
+        self.wait_count += 1
+        self.wait_started_at = timestamp
+
+
+class RelayStretchTimer:
+    """Times relay loop stretches between real suspensions of one reader.
+
+    With a probe, a stretch spans chunks that were already queued and ends
+    where a body-queue wait started. Without one, each chunk is its own stretch.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        body_wait_probe: BodyWaitProbe | None = None,
+        clock: Callable[[], float] = time.perf_counter,
+        record: Callable[[str, float], None] | None = None,
+    ) -> None:
+        self._session_id = session_id
+        self._probe = body_wait_probe
+        self._clock = clock
+        # Resolved lazily because the module recorder is defined below.
+        self._record = record_relay_stretch if record is None else record
+        self._seen_wait_count = 0 if body_wait_probe is None else body_wait_probe.wait_count
+        self._started_at: float | None = None if body_wait_probe is None else clock()
+
+    def chunk_received(self) -> None:
+        """Note that the reader resumed with a chunk."""
+        probe = self._probe
+        if probe is not None and probe.wait_count != self._seen_wait_count:
+            self._seen_wait_count = probe.wait_count
+            self._end(probe.wait_started_at)
+        if probe is None or self._started_at is None:
+            self._started_at = self._clock()
+
+    def chunk_processed(self) -> None:
+        """Note that the reader finished a chunk and is about to read again."""
+        if self._probe is None:
+            self._end(self._clock())
+
+    async def bound(self, awaitable: Awaitable[_T]) -> _T:
+        """Await ``awaitable`` outside of any stretch."""
+        self._end(self._clock())
+        try:
+            return await awaitable
+        finally:
+            self._started_at = self._clock()
+
+    def finish(self) -> None:
+        """Record the open stretch, if any."""
+        self._end(self._clock())
+
+    def _end(self, ended_at: float) -> None:
+        """Record the open stretch as ending at ``ended_at``."""
+        started_at = self._started_at
+        if started_at is None:
+            return
+        self._started_at = None
+        self._record(self._session_id, max(ended_at - started_at, 0.0))
+
+
+def body_wait_probe_for_response(response: object) -> BodyWaitProbe | None:
+    """Return the body-wait probe a response carries, or ``None``."""
+    extensions = getattr(response, "extensions", None)
+    if not isinstance(extensions, dict):
+        return None
+    probe = extensions.get(BODY_WAIT_PROBE_EXTENSION_KEY)
+    return probe if isinstance(probe, BodyWaitProbe) else None
 
 
 def _add_duration(

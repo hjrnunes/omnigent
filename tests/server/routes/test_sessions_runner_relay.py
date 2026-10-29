@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
@@ -16,6 +17,7 @@ import httpx
 import pytest
 
 from omnigent.entities import Conversation
+from omnigent.server import relay_stats
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -188,15 +190,30 @@ class _ScriptedStreamResponse:
         order, e.g. ``[{"type": "response.in_progress", ...}]``.
     """
 
-    def __init__(self, release: asyncio.Event, events: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        release: asyncio.Event,
+        events: list[dict[str, Any]],
+        *,
+        wait_before: frozenset[int] = frozenset(),
+        wait_seconds: float = 0.0,
+    ) -> None:
         """
         Initialize the scripted streaming response.
 
         :param release: Event used to gate the scripted turn.
         :param events: Event payload dicts to emit after release.
+        :param wait_before: Yield indices whose body read suspends first,
+            indexed from the heartbeat chunk.
+        :param wait_seconds: How long a body read marked in ``wait_before``
+            stays suspended.
         """
         self._release = release
         self._events = events
+        self._wait_before = wait_before
+        self._wait_seconds = wait_seconds
+        self.probe = relay_stats.BodyWaitProbe()
+        self.extensions: dict[str, Any] = {relay_stats.BODY_WAIT_PROBE_EXTENSION_KEY: self.probe}
 
     async def __aenter__(self) -> _ScriptedStreamResponse:
         """
@@ -233,10 +250,15 @@ class _ScriptedStreamResponse:
         :yields: SSE text chunks in the same data-line shape the runner
             emits over HTTP.
         """
-        yield 'data: {"type": "session.heartbeat"}\n\n'
-        await self._release.wait()
-        for event in self._events:
-            yield f"data: {json.dumps(event)}\n\n"
+        chunks = [f"data: {json.dumps(event)}\n\n" for event in self._events]
+        for index, chunk in enumerate(['data: {"type": "session.heartbeat"}\n\n', *chunks]):
+            if index in self._wait_before:
+                # Mirror the tunnel's body read suspending on an empty queue.
+                self.probe.note_wait_started(time.perf_counter())
+                await asyncio.sleep(self._wait_seconds)
+            yield chunk
+            if index == 0:
+                await self._release.wait()
         yield "data: [DONE]\n\n"
 
 
@@ -247,17 +269,30 @@ class _ScriptedRunnerClient:
     :param release: Event that gates the scripted turn (set by the
         test once its collector is subscribed).
     :param events: SSE event payload dicts to emit after release.
+    :param wait_before: Yield indices whose body read suspends first.
+    :param wait_seconds: How long each marked body read stays suspended.
     """
 
-    def __init__(self, release: asyncio.Event, events: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        release: asyncio.Event,
+        events: list[dict[str, Any]],
+        *,
+        wait_before: frozenset[int] = frozenset(),
+        wait_seconds: float = 0.0,
+    ) -> None:
         """
         Initialize the fake runner client.
 
         :param release: Event used to gate the scripted turn.
         :param events: Event payload dicts to emit after release.
+        :param wait_before: Yield indices forwarded to the scripted stream.
+        :param wait_seconds: Suspension length forwarded to the scripted stream.
         """
         self._release = release
         self._events = events
+        self._wait_before = wait_before
+        self._wait_seconds = wait_seconds
 
     def stream(
         self,
@@ -276,7 +311,12 @@ class _ScriptedRunnerClient:
         :returns: Fake streaming response.
         """
         del method, path, timeout
-        return _ScriptedStreamResponse(self._release, self._events)
+        return _ScriptedStreamResponse(
+            self._release,
+            self._events,
+            wait_before=self._wait_before,
+            wait_seconds=self._wait_seconds,
+        )
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
@@ -3987,3 +4027,86 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_stretch_covers_a_queued_backlog_drain(db_uri: str) -> None:
+    """Chunks already queued in the tunnel are one uninterrupted relay stretch."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    relay_stats.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    events = [{"type": "response.output_text.delta", "delta": text} for text in ("a", "b", "c")]
+    runner = _ScriptedRunnerClient(release, events, wait_before=frozenset({0}), wait_seconds=0.2)
+
+    await _relay_runner_stream_once(conversation.id, runner, store)  # type: ignore[arg-type]
+
+    snapshot = relay_stats.snapshot()
+    # One stretch ends where the body wait began; the queued drain is the second.
+    assert snapshot.relay_stretch_count == 2
+    assert snapshot.relay_stretch_seconds_max < 0.1
+
+
+@pytest.mark.asyncio
+async def test_relay_stretch_excludes_an_awaited_persist(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chunk that offloads a persist does not count the suspended time."""
+    from omnigent.server.routes._sessions import orchestration
+
+    relay_stats.reset_for_tests()
+    thread_wait_seconds = 0.2
+
+    async def slow_persist(store: Any, session_id: str, item: Any) -> None:
+        del store, session_id, item
+        await asyncio.to_thread(time.sleep, thread_wait_seconds)
+
+    monkeypatch.setattr(orchestration, "_relay_persist", slow_persist)
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    function_call = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "fc_1",
+            "type": "function_call",
+            "agent": "test",
+            "status": "completed",
+            "name": "shell",
+            "arguments": "{}",
+            "call_id": "call_1",
+        },
+    }
+    events = [function_call, {"type": "response.output_text.delta", "delta": "done"}]
+    runner = _ScriptedRunnerClient(release, events)
+
+    await orchestration._relay_runner_stream_once(conversation.id, runner, store)  # type: ignore[arg-type]
+
+    snapshot = relay_stats.snapshot()
+    # The awaited persist ends one stretch and the stream end records the next.
+    assert snapshot.relay_stretch_count == 2
+    assert snapshot.relay_stretch_seconds_max < thread_wait_seconds / 2
+
+
+@pytest.mark.asyncio
+async def test_relay_stretch_records_the_stretch_that_ends_the_stream(db_uri: str) -> None:
+    """The relay records the final stretch when the stream ends in DONE."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    relay_stats.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    runner = _ScriptedRunnerClient(release, [], wait_before=frozenset({0}))
+
+    await _relay_runner_stream_once(conversation.id, runner, store)  # type: ignore[arg-type]
+
+    snapshot = relay_stats.snapshot()
+    # One stretch ends where the body wait began; the stream end records the other.
+    assert snapshot.relay_stretch_count == 2
+    assert snapshot.relay_stretch_by_session[conversation.id].count == 2

@@ -543,3 +543,101 @@ async def test_non_ascii_body_counts_utf8_bytes_on_enqueue_and_dequeue() -> None
     assert drained.depth == 0
     assert drained.bytes == 0
     assert "req-emoji" not in drained.requests
+
+
+def _stretch_timer(
+    clock: _FakeClock,
+    records: list[float],
+    probe: relay_stats.BodyWaitProbe | None = None,
+) -> relay_stats.RelayStretchTimer:
+    """Build a stretch timer whose samples land in ``records``."""
+
+    def record(session_id: str, seconds: float) -> None:
+        del session_id
+        records.append(seconds)
+
+    return relay_stats.RelayStretchTimer(
+        SESSION_ID, body_wait_probe=probe, clock=clock, record=record
+    )
+
+
+def test_relay_stretch_timer_reports_one_stretch_for_a_queued_drain() -> None:
+    """Chunks served without a body wait are one uninterrupted loop stretch."""
+    clock = _FakeClock()
+    records: list[float] = []
+    timer = _stretch_timer(clock, records, relay_stats.BodyWaitProbe())
+
+    for _ in range(3):
+        timer.chunk_received()
+        timer.chunk_processed()
+        clock.now += 0.010
+
+    assert records == []
+    timer.finish()
+    assert records == [pytest.approx(0.030)]
+
+
+def test_relay_stretch_timer_ends_the_stretch_where_the_body_wait_started() -> None:
+    """A body-queue wait ends the stretch at the suspension, not the arrival."""
+    clock = _FakeClock()
+    records: list[float] = []
+    probe = relay_stats.BodyWaitProbe()
+    timer = _stretch_timer(clock, records, probe)
+
+    clock.now += 0.005
+    probe.note_wait_started(clock.now)
+    clock.now += 0.095  # suspended until the frame arrived
+    timer.chunk_received()
+    clock.now += 0.002
+    timer.finish()
+
+    assert records == [pytest.approx(0.005), pytest.approx(0.002)]
+
+
+def test_relay_stretch_timer_treats_chunks_as_suspensions_without_a_probe() -> None:
+    """A plain HTTP runner stream suspends for every chunk it yields."""
+    clock = _FakeClock()
+    records: list[float] = []
+    timer = _stretch_timer(clock, records)
+
+    timer.chunk_received()
+    clock.now += 0.010
+    timer.chunk_processed()
+    timer.chunk_received()
+    clock.now += 0.020
+    timer.chunk_processed()
+    timer.chunk_received()
+    timer.finish()
+
+    assert records == [pytest.approx(0.010), pytest.approx(0.020), pytest.approx(0.0)]
+
+
+@pytest.mark.asyncio
+async def test_relay_stretch_timer_excludes_an_awaited_operation() -> None:
+    """An awaited off-loop operation is a suspension boundary, not loop time."""
+    clock = _FakeClock()
+    records: list[float] = []
+    timer = _stretch_timer(clock, records, relay_stats.BodyWaitProbe())
+
+    clock.now += 0.003
+
+    async def offload() -> str:
+        clock.now += 5.0
+        return "persisted"
+
+    assert await timer.bound(offload()) == "persisted"
+    assert records == [pytest.approx(0.003)]
+
+    clock.now += 0.004
+    timer.finish()
+    assert records == [pytest.approx(0.003), pytest.approx(0.004)]
+
+
+def test_body_wait_probe_is_read_from_the_response_extensions() -> None:
+    """The relay picks up the tunnel's probe and ignores responses without one."""
+    probe = relay_stats.BodyWaitProbe()
+    response = MagicMock()
+    response.extensions = {relay_stats.BODY_WAIT_PROBE_EXTENSION_KEY: probe}
+
+    assert relay_stats.body_wait_probe_for_response(response) is probe
+    assert relay_stats.body_wait_probe_for_response(MagicMock(extensions={})) is None

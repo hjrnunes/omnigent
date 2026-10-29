@@ -22,6 +22,7 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import AsyncIterator
 
@@ -53,11 +54,14 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         self._runner_id = runner_id
         self._req_id = req_id
         self._state = state
+        self.body_wait_probe = relay_stats.BodyWaitProbe()
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         state = self._state
         try:
             while True:
+                if state.body_queue.empty():
+                    self.body_wait_probe.note_wait_started(time.perf_counter())
                 item = await state.body_queue.get()
                 if state.aborted_with is not None:
                     raise state.aborted_with
@@ -197,6 +201,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             headers=[(k, v) for k, v in head.headers],
             stream=stream,
             request=request,
+            extensions={relay_stats.BODY_WAIT_PROBE_EXTENSION_KEY: stream.body_wait_probe},
         )
 
     async def aclose(self) -> None:
