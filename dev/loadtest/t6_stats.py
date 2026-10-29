@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,13 +32,11 @@ RELAY_PERSIST_FAILURE_PATTERN = re.compile(
     r"relay persist\w* fail|failed to persist relay", re.IGNORECASE
 )
 
-# Relay counters arrive as flat scalars or nested dicts. Match by key path so a
-# later phase can add, for example, ``body_queue.fuse.trips`` or
-# ``session_stream.subscriber_overflows`` without changing the harness.
-_FUSE_KEY = "fuse"
-_FUSE_EXCLUDED_KEY_PARTS = ("byte", "threshold", "limit", "max", "size", "config")
-_OVERFLOW_KEY = "overflow"
-_OVERFLOW_EXCLUDED_KEY_PARTS = ("max", "queue", "limit", "threshold", "events")
+# Relay counters live at fixed payload paths. Read those paths only: a relay
+# request id can contain "fuse" or "overflow", so matching on key text would
+# count that request's depth as a guardrail trip.
+_FUSE_TRIPS_PATH = ("body_queue", "fuse", "trips")
+_SUBSCRIBER_OVERFLOWS_PATH = ("session_stream", "subscriber_overflows")
 
 
 # ── relay_stats records ────────────────────────────────────
@@ -70,9 +68,9 @@ def parse_relay_stats_line(line: str) -> dict[str, Any] | None:
 class LogCounters:
     """Counters derived from whole server-log lines.
 
-    These cover signals that the Phase 0 ``relay_stats`` payload does not carry
-    yet: event-loop watchdog reports, body-queue fuse trips, and subscriber
-    stream overflows.
+    The watchdog reports only appear as log lines. Fuse trips and subscriber
+    overflows are the fallback for payloads that predate their counter fields,
+    such as baseline v0.20.0 runs.
     """
 
     watchdog_stalls: int = 0
@@ -131,11 +129,11 @@ class RelayStatsCollector:
         self._peak["relay_persist_failures"] = max(
             self._peak["relay_persist_failures"], _as_int(persist)
         )
-        fuse = _sum_matching_keys(payload, _FUSE_KEY, _FUSE_EXCLUDED_KEY_PARTS)
+        fuse = _counter_at_path(payload, _FUSE_TRIPS_PATH)
         if fuse is not None:
             self._seen["fuse_trips"] = True
             self._peak["fuse_trips"] = max(self._peak["fuse_trips"], fuse)
-        overflow = _sum_matching_keys(payload, _OVERFLOW_KEY, _OVERFLOW_EXCLUDED_KEY_PARTS)
+        overflow = _counter_at_path(payload, _SUBSCRIBER_OVERFLOWS_PATH)
         if overflow is not None:
             self._seen["subscriber_overflows"] = True
             self._peak["subscriber_overflows"] = max(self._peak["subscriber_overflows"], overflow)
@@ -378,32 +376,17 @@ def _rate(count: int, window_seconds: float | None) -> float | None:
     return round(count / window_seconds, 2)
 
 
-def _sum_matching_keys(
-    payload: Mapping[str, Any], keyword: str, excluded_parts: Iterable[str]
-) -> int | None:
-    """Sum scalar counters whose key path names *keyword*.
+def _counter_at_path(payload: Mapping[str, Any], path: tuple[str, ...]) -> int | None:
+    """Return the numeric counter at exactly *path*, or ``None`` when absent.
 
-    Returns ``None`` when the payload has no such counter, so callers can tell
-    "reported zero" apart from "not reported by this build".
+    ``None`` tells the caller the build does not report that counter, so a
+    reported zero stays distinct from a missing field.
     """
-    excluded = tuple(part.lower() for part in excluded_parts)
-    found = False
-    total = 0
-    stack: list[tuple[str, Mapping[str, Any]]] = [("", payload)]
-    while stack:
-        prefix, node = stack.pop()
-        for key, value in node.items():
-            key_text = str(key)
-            path = f"{prefix}.{key_text}" if prefix else key_text
-            if isinstance(value, Mapping):
-                stack.append((path, value))
-                continue
-            if keyword not in path.lower():
-                continue
-            if any(part in path.lower() for part in excluded):
-                continue
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            found = True
-            total += int(value)
-    return total if found else None
+    node: object = payload
+    for key in path:
+        if not isinstance(node, Mapping) or key not in node:
+            return None
+        node = node[key]
+    if isinstance(node, bool) or not isinstance(node, (int, float)):
+        return None
+    return int(node)
