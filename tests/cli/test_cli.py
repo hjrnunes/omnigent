@@ -54,6 +54,7 @@ from omnigent.cli import (
     _save_global_config,
     _save_local_config,
     _server_uvicorn_log_config,
+    _spec_target_declares_executor,
     _start_cli_runner_process,
     _wrapper_guard_error,
     cli,
@@ -6395,6 +6396,218 @@ def _capture_run_dispatch(
         lambda _: SimpleNamespace(picker=False, conversation_id=None),
     )
     return dispatched
+
+
+def _write_run_spec(path: Path, executor: dict[str, object] | None) -> Path:
+    """
+    Write a single-file omnigent spec, optionally with an ``executor`` block.
+
+    :param path: Destination YAML path, e.g. ``tmp_path / "agent.yaml"``.
+    :param executor: The ``executor:`` mapping to declare, or ``None`` to
+        leave the spec with no executor block.
+    :returns: *path*, for use in a ``run`` argv.
+    """
+    raw: dict[str, object] = {"name": "config-default-agent", "prompt": "Reply with ok.\n"}
+    if executor is not None:
+        raw["executor"] = executor
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+def test_run_spec_harness_and_model_beat_config_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A spec named on the command line keeps its declared harness and model.
+
+    ``config.yaml`` ``harness.default`` / ``model`` must not be folded into
+    the overrides, otherwise ``run_chat`` rewrites the spec's ``executor``
+    block and the session loses both values.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+    _save_global_config({"harness": {"default": "claude"}, "model": "config-default-model"})
+    spec = _write_run_spec(
+        tmp_path / "droid_agent.yaml",
+        {"harness": "droid", "model": "custom:spec-model"},
+    )
+
+    result = CliRunner().invoke(cli, ["run", str(spec), "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    # No override reaches the spec rewrite, so the spec's values survive.
+    assert dispatched["harness"] is None
+    assert dispatched["model"] is None
+
+
+def test_run_spec_harness_alone_keeps_the_spec_model_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A spec that names a harness resolves its own model, not the config model.
+
+    ``omnigent run <spec>`` leaves a spec-declared ``executor.harness`` to
+    pick its model (the same rule the default-model fallback already
+    follows), so the config-wide ``model`` must not follow a droid or codex
+    spec onto a model the harness rejects.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+    _save_global_config({"harness": {"default": "claude"}, "model": "config-default-model"})
+    spec = _write_run_spec(tmp_path / "droid_agent.yaml", {"harness": "droid"})
+
+    result = CliRunner().invoke(cli, ["run", str(spec), "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    assert dispatched["harness"] is None
+    assert dispatched["model"] is None
+
+
+def test_run_explicit_harness_and_model_flags_beat_spec_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Explicit ``--harness`` / ``--model`` still win over the spec and config.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+    _save_global_config({"harness": {"default": "claude"}, "model": "config-default-model"})
+    spec = _write_run_spec(
+        tmp_path / "droid_agent.yaml",
+        {"harness": "droid", "model": "custom:spec-model"},
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", str(spec), "--harness", "codex", "--model", "flag-model", "-p", "hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert dispatched["harness"] == "codex"
+    assert dispatched["model"] == "flag-model"
+
+
+def test_run_spec_without_harness_or_model_takes_config_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A spec that declares neither value still receives the config defaults.
+
+    ``examples/hello_world.yaml``-shaped specs have no executor harness or
+    model, so ``harness.default`` and ``model`` reach ``run_chat``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+    _save_global_config({"harness": {"default": "claude"}, "model": "config-default-model"})
+    spec = _write_run_spec(tmp_path / "bare_agent.yaml", None)
+
+    result = CliRunner().invoke(cli, ["run", str(spec), "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    assert dispatched["harness"] == "claude"
+    assert dispatched["model"] == "config-default-model"
+
+
+def test_run_configured_default_agent_keeps_config_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A bare ``run`` still applies config defaults to the configured default agent.
+
+    The spec beats the defaults only when the user names it on the command
+    line; ``default_agent`` is itself config, so the configured ``model``
+    keeps selecting the model for the configured agent.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory standing in for ~/.omnigent.
+    """
+    dispatched = _capture_run_dispatch(monkeypatch, tmp_path)
+    spec = _write_run_spec(
+        tmp_path / "droid_agent.yaml",
+        {"harness": "droid", "model": "custom:spec-model"},
+    )
+    _save_global_config(
+        {
+            "default_agent": str(spec),
+            "harness": {"default": "claude"},
+            "model": "config-default-model",
+        }
+    )
+
+    result = CliRunner().invoke(cli, ["run", "-p", "hi"])
+
+    assert result.exit_code == 0, result.output
+    assert dispatched["target"] == str(spec)
+    assert dispatched["harness"] == "claude"
+    assert dispatched["model"] == "config-default-model"
+
+
+@pytest.mark.parametrize(
+    ("executor", "expected"),
+    [
+        ({"harness": "droid", "model": "custom:spec-model"}, True),
+        ({"harness": "droid"}, True),
+        ({"model": "custom:spec-model"}, True),
+        (None, False),
+        ({}, False),
+        ({"type": "omnigent", "config": {"harness": "droid"}}, True),
+        ({"type": "omnigent", "model": "databricks-gpt-5-4", "config": {}}, True),
+        ({"type": "omnigent", "config": {"model": "databricks-gpt-5-4"}}, True),
+        ({"type": "omnigent", "config": {}}, False),
+        ({"type": "databricks"}, True),
+    ],
+)
+def test_spec_target_declares_executor_reads_flat_and_bundle_shapes(
+    tmp_path: Path,
+    executor: dict[str, object] | None,
+    expected: bool,
+) -> None:
+    """
+    ``_spec_target_declares_executor`` recognizes every executor shape.
+
+    :param tmp_path: Temporary directory holding the fixture specs.
+    :param executor: The ``executor:`` mapping to declare (``None`` omits it).
+    :param expected: Whether the helper must report a declaration.
+    """
+    spec = _write_run_spec(tmp_path / "agent.yaml", executor)
+
+    assert _spec_target_declares_executor(str(spec)) is expected
+
+
+def test_spec_target_declares_executor_reads_bundle_config_yaml(tmp_path: Path) -> None:
+    """
+    A ``spec_version`` bundle directory declares through ``config.yaml``.
+
+    :param tmp_path: Temporary directory holding the bundle.
+    """
+    bundle = tmp_path / "agent"
+    bundle.mkdir()
+    _write_run_spec(bundle / "config.yaml", {"type": "omnigent", "config": {"harness": "droid"}})
+
+    assert _spec_target_declares_executor(str(bundle)) is True
+
+
+@pytest.mark.parametrize("target", [None, "", "https://example.com/agent.yaml", "missing.yaml"])
+def test_spec_target_declares_executor_ignores_non_spec_targets(target: str | None) -> None:
+    """
+    Non-spec targets (URLs, absent paths) never suppress the config defaults.
+
+    :param target: The AGENT argument value to inspect.
+    """
+    assert _spec_target_declares_executor(target) is False
 
 
 def test_run_interactive_defaults_browser_open_on(
