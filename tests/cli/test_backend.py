@@ -3063,13 +3063,14 @@ def _capture_run_chat(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     return captured
 
 
-def test_run_reads_server_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``run`` uses ``server`` from config when ``--server`` is omitted.
+def test_run_reads_server_from_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``run`` uses ``server`` / ``model`` from config when the spec declares neither.
 
     Regression: ``run`` previously read only ``auto_open_conversation``
     from config and dropped ``server`` / ``model``, so a configured
     default server was silently ignored (unlike ``run``). The value must
-    reach ``run_chat`` as ``server_url``.
+    reach ``run_chat`` as ``server_url``, and a spec with no executor
+    harness or model takes the config ``model``.
     """
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",
@@ -3079,12 +3080,32 @@ def test_run_reads_server_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     )
     captured = _capture_run_chat(monkeypatch)
+    spec = tmp_path / "bare_agent.yaml"
+    spec.write_text("name: bare_agent\nprompt: Say hello.\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli_group, ["run", str(spec)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["server_url"] == "https://config-default.example.com"
+    assert captured["model"] == "databricks-claude-sonnet-4-6"
+
+
+def test_run_spec_model_beats_config_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spec that declares ``executor.model`` keeps it over the config model."""
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {
+            "server": "https://config-default.example.com",
+            "model": "config-default-model",
+        },
+    )
+    captured = _capture_run_chat(monkeypatch)
 
     result = CliRunner().invoke(cli_group, ["run", "tests/resources/examples/hello_world.yaml"])
 
     assert result.exit_code == 0, result.output
     assert captured["server_url"] == "https://config-default.example.com"
-    assert captured["model"] == "databricks-claude-sonnet-4-6"
+    assert captured["model"] is None
 
 
 def test_run_explicit_server_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:

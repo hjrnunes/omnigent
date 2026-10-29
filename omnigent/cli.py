@@ -881,6 +881,50 @@ def _peek_default_agent_harness(target: str) -> str | None:
     return canonicalize_harness(declared) or declared
 
 
+def _spec_target_declares_executor(target: str | None) -> bool:
+    """
+    Return ``True`` when a local spec target picks its own harness or model.
+
+    ``run`` only applies the ``config.yaml`` ``harness.default`` / ``model``
+    defaults when the named spec declares neither, so a spec's own executor
+    choices reach the server instead of being rewritten by the override
+    materializer. Reads the flat ``executor.harness`` / ``executor.model``
+    keys and the ``spec_version`` bundle's ``executor.config`` block. A
+    non-omnigent ``executor.type`` counts as a harness declaration because
+    that executor *is* the harness.
+
+    :param target: The ``run`` AGENT argument, e.g. ``"agent.yaml"`` or
+        ``"examples/polly"``; URLs and paths that do not exist declare
+        nothing.
+    :returns: True when the spec declares a harness or a model.
+    """
+    if not target or "://" in target:
+        return False
+    path = Path(target).expanduser()
+    if path.is_dir():
+        path = path / "config.yaml"
+    if not path.is_file():
+        return False
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    executor = raw.get("executor")
+    if not isinstance(executor, dict):
+        return False
+    if executor.get("harness") or executor.get("model"):
+        return True
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    executor_type = executor.get("type")
+    if isinstance(executor_type, str) and executor_type not in ("", OMNIGENT_EXECUTOR_TYPE):
+        return True
+    config = executor.get("config")
+    return isinstance(config, dict) and bool(config.get("harness") or config.get("model"))
+
+
 @dataclass(frozen=True)
 class _FirstRunPlan:
     """The harness + optional default agent a bare ``run`` should launch.
@@ -9048,6 +9092,10 @@ def run(
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
+    target_from_cli = (
+        click.get_current_context().get_parameter_source("target")
+        is click.core.ParameterSource.COMMANDLINE
+    )
 
     acp_agent: AcpAgentEntry | None = None
     if from_openclaw is not None:
@@ -9100,9 +9148,13 @@ def run(
         target = _resolve_default_agent_target(_global_cfg.get("default_agent"), harness)
     if server is None and not local_server_requested:
         server = _global_cfg.get("server")
-    if model is None and not direct_server_cli:
+    # A spec named on the command line owns its executor: config defaults
+    # only fill in when it declares neither a harness nor a model. The
+    # configured default agent stays config, so it keeps them.
+    config_defaults_apply = not (target_from_cli and _spec_target_declares_executor(target))
+    if model is None and not direct_server_cli and config_defaults_apply:
         model = _global_cfg.get("model")
-    if harness is None and not direct_server_cli:
+    if harness is None and not direct_server_cli and config_defaults_apply:
         from omnigent.harness_startup_config import resolve_harness_config
 
         harness_default, _ = resolve_harness_config(_global_cfg)
