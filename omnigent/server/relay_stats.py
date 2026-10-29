@@ -14,6 +14,8 @@ Design constraints (see ``library/relay.md``):
 - Every map is bounded, so a long soak cannot grow memory without limit. At a
   bound, the counter either evicts the oldest key or stops tracking the new
   key, and ``dropped_*`` fields make the tradeoff visible.
+- The body-queue guardrails are not counters: :class:`BodyQueueSafety` lives on
+  the request's own state, so the telemetry bounds never weaken them.
 - Read through :func:`snapshot` in-process (unit tests, an in-process server), or
   read the periodic ``relay_stats`` log record from the server process log.
 """
@@ -43,6 +45,9 @@ RELAY_STATS_INTERVAL_ENV_VAR = "OMNIGENT_RELAY_STATS_INTERVAL_S"
 DEFAULT_RELAY_STATS_INTERVAL_S = 10.0
 """Default periodic log interval when the environment variable is unset."""
 
+BODY_QUEUE_WARN_ENV_VAR = "OMNIGENT_RELAY_BODY_QUEUE_WARN_BYTES"
+"""Environment variable holding the per-request body-queue warning in bytes."""
+
 BODY_QUEUE_FUSE_ENV_VAR = "OMNIGENT_RELAY_BODY_QUEUE_FUSE_BYTES"
 """Environment variable holding the per-request body-queue fuse in bytes."""
 
@@ -53,22 +58,32 @@ DEFAULT_BODY_QUEUE_FUSE_BYTES = 256 * 1024 * 1024
 """Per-request queued body bytes that abort that request by default."""
 
 
-def body_queue_fuse_bytes() -> int:
-    """Return the per-request body-queue fuse from the environment.
+def _positive_byte_threshold(env_var: str, default: int) -> int:
+    """Read a byte threshold from the environment, falling back on bad input.
 
-    Unset, non-numeric, and non-positive values fall back to
-    :data:`DEFAULT_BODY_QUEUE_FUSE_BYTES`, so a typo cannot disable the fuse.
+    Unset, non-numeric, and non-positive values fall back to ``default``, so a
+    typo cannot disable a guardrail.
     """
-    raw = os.environ.get(BODY_QUEUE_FUSE_ENV_VAR)
+    raw = os.environ.get(env_var)
     if raw is None:
-        return DEFAULT_BODY_QUEUE_FUSE_BYTES
+        return default
     try:
-        fuse_bytes = int(raw)
+        threshold = int(raw)
     except ValueError:
-        return DEFAULT_BODY_QUEUE_FUSE_BYTES
-    if fuse_bytes <= 0:
-        return DEFAULT_BODY_QUEUE_FUSE_BYTES
-    return fuse_bytes
+        return default
+    if threshold <= 0:
+        return default
+    return threshold
+
+
+def body_queue_warn_bytes() -> int:
+    """Return the per-request body-queue warning from the environment."""
+    return _positive_byte_threshold(BODY_QUEUE_WARN_ENV_VAR, DEFAULT_BODY_QUEUE_WARN_BYTES)
+
+
+def body_queue_fuse_bytes() -> int:
+    """Return the per-request body-queue fuse from the environment."""
+    return _positive_byte_threshold(BODY_QUEUE_FUSE_ENV_VAR, DEFAULT_BODY_QUEUE_FUSE_BYTES)
 
 
 SOURCE_RELAY_SSE = "relay_sse"
@@ -132,6 +147,42 @@ class BodyQueueGuard:
     fuse_bytes: int = 0
     warn: bool = False
     fuse_tripped: bool = False
+
+
+@dataclass
+class BodyQueueSafety:
+    """Per-request body-queue guardrails, independent of the telemetry bound.
+
+    Lives on the request's own state so it dies with the request and needs no
+    global bound. The byte total covers frames queued and not yet consumed,
+    so a stream that keeps draining stays below the thresholds. Every request
+    gets the warning and the fuse, even when the bounded telemetry map stops
+    tracking new requests. Enqueue and dequeue can run on different loops; a
+    lost update shifts a threshold by at most one frame.
+    """
+
+    warn_bytes: int = field(default_factory=body_queue_warn_bytes)
+    fuse_bytes: int = field(default_factory=body_queue_fuse_bytes)
+    queued_bytes: int = 0
+    warned: bool = False
+
+    def record_enqueue(self, byte_count: int) -> BodyQueueGuard:
+        """Account one queued frame and report its guardrail outcome."""
+        self.queued_bytes += byte_count
+        warn = self.queued_bytes > self.warn_bytes and not self.warned
+        if warn:
+            self.warned = True
+        return BodyQueueGuard(
+            request_bytes=self.queued_bytes,
+            warn_bytes=self.warn_bytes,
+            fuse_bytes=self.fuse_bytes,
+            warn=warn,
+            fuse_tripped=self.queued_bytes > self.fuse_bytes,
+        )
+
+    def record_dequeue(self, byte_count: int) -> None:
+        """Account one consumed frame so a draining stream stays below the fuse."""
+        self.queued_bytes = max(self.queued_bytes - byte_count, 0)
 
 
 @dataclass(frozen=True)
@@ -221,7 +272,7 @@ class RelayStats:
         self._max_event_types_per_session = max_event_types_per_session
         self._max_tracked_requests = max_tracked_requests
         self._warn_threshold_bytes = (
-            DEFAULT_BODY_QUEUE_WARN_BYTES if warn_threshold_bytes is None else warn_threshold_bytes
+            body_queue_warn_bytes() if warn_threshold_bytes is None else warn_threshold_bytes
         )
         self._fuse_threshold_bytes = (
             body_queue_fuse_bytes() if fuse_threshold_bytes is None else fuse_threshold_bytes
@@ -268,58 +319,57 @@ class RelayStats:
 
     # -- body queue -----------------------------------------------------
 
-    def record_body_queue_enqueue(self, request_id: str, byte_count: int) -> BodyQueueGuard:
-        """Record one body frame queued for ``request_id``.
+    def record_body_queue_enqueue(self, request_id: str, byte_count: int) -> None:
+        """Record one body frame actually queued for ``request_id``.
 
-        A request rejected at the tracking bound stays untracked until its
-        stream closes, so frames queued before its rejection are never
-        counted and can never consume a later counted frame's gauge. Such a
-        request is also never guarded, matching its untracked byte total.
-
-        :returns: The guardrail outcome for the frame. ``warn`` is ``True``
-            for the single frame that first crosses the warn threshold, and
-            ``fuse_tripped`` is ``True`` from the frame that crosses the fuse
-            onward.
+        This map is telemetry only: the guardrails live on the request's own
+        :class:`BodyQueueSafety`. A request rejected at the tracking bound
+        stays untracked until its stream closes, so frames queued before its
+        rejection are never counted and can never consume a later counted
+        frame's gauge, but the request is still warned and fused.
         """
-        limit_bytes = self._fuse_threshold_bytes
         existing = self._body_queue_requests.get(request_id)
         if existing is None:
             if request_id in self._body_queue_rejected:
                 self._body_queue_dropped_requests += 1
-                return BodyQueueGuard(
-                    warn_bytes=self._warn_threshold_bytes, fuse_bytes=limit_bytes
-                )
+                return
             if len(self._body_queue_requests) >= self._max_tracked_requests:
                 self._body_queue_dropped_requests += 1
                 self._remember_rejected_request(request_id)
-                return BodyQueueGuard(
-                    warn_bytes=self._warn_threshold_bytes, fuse_bytes=limit_bytes
-                )
+                return
             existing = BodyQueueRequestSnapshot(depth=0, bytes=0)
-        request_bytes = existing.bytes + byte_count
-        warn = request_bytes > self._warn_threshold_bytes and not existing.warned
-        if warn:
-            self._body_queue_warned_requests += 1
-        fuse_tripped = request_bytes > limit_bytes
-        if fuse_tripped:
-            self._body_queue_fuse_trips += 1
         updated = BodyQueueRequestSnapshot(
             depth=existing.depth + 1,
-            bytes=request_bytes,
-            warned=existing.warned or warn,
+            bytes=existing.bytes + byte_count,
+            warned=existing.warned,
         )
         self._body_queue_requests[request_id] = updated
         self._body_queue_depth += 1
         self._body_queue_bytes += byte_count
         self._body_queue_max_depth = max(self._body_queue_max_depth, self._body_queue_depth)
         self._body_queue_max_bytes = max(self._body_queue_max_bytes, self._body_queue_bytes)
-        return BodyQueueGuard(
-            request_bytes=request_bytes,
-            warn_bytes=self._warn_threshold_bytes,
-            fuse_bytes=limit_bytes,
-            warn=warn,
-            fuse_tripped=fuse_tripped,
-        )
+
+    def record_body_queue_warned(self, request_id: str) -> None:
+        """Count one request's single pressure warning and flag its gauge.
+
+        Called for every warned request, including one the telemetry map does
+        not track, so the counter never hides a warning that was logged.
+        """
+        self._body_queue_warned_requests += 1
+        existing = self._body_queue_requests.get(request_id)
+        if existing is not None:
+            self._body_queue_requests[request_id] = BodyQueueRequestSnapshot(
+                depth=existing.depth,
+                bytes=existing.bytes,
+                warned=True,
+            )
+
+    def record_body_queue_fuse_trip(self) -> None:
+        """Count one request aborted by the fuse.
+
+        The tripping frame is never queued, so it moves no body-queue gauge.
+        """
+        self._body_queue_fuse_trips += 1
 
     def _remember_rejected_request(self, request_id: str) -> None:
         """Keep a rejected request untracked until its stream closes.
@@ -682,9 +732,19 @@ def dequeued_body_byte_length(body: str, encoding: str, decoded: bytes) -> int:
     return len(body)
 
 
-def record_body_queue_enqueue(request_id: str, byte_count: int) -> BodyQueueGuard:
-    """Record a queued tunnel body frame and return its guardrail outcome."""
-    return _default_stats.record_body_queue_enqueue(request_id, byte_count)
+def record_body_queue_enqueue(request_id: str, byte_count: int) -> None:
+    """Record a queued tunnel body frame in the telemetry map."""
+    _default_stats.record_body_queue_enqueue(request_id, byte_count)
+
+
+def record_body_queue_warned(request_id: str) -> None:
+    """Count one request's pressure warning."""
+    _default_stats.record_body_queue_warned(request_id)
+
+
+def record_body_queue_fuse_trip() -> None:
+    """Count one request aborted by the fuse."""
+    _default_stats.record_body_queue_fuse_trip()
 
 
 def record_body_queue_dequeue(request_id: str, byte_count: int) -> None:

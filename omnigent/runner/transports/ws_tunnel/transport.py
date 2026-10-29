@@ -71,10 +71,11 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                 # Mypy/runtime: item must be a ResponseBodyFrame here.
                 if isinstance(item, ResponseBodyFrame):
                     chunk = decode_body(item.body, item.encoding)
-                    relay_stats.record_body_queue_dequeue(
-                        state.req_id,
-                        relay_stats.dequeued_body_byte_length(item.body, item.encoding, chunk),
+                    dequeued_bytes = relay_stats.dequeued_body_byte_length(
+                        item.body, item.encoding, chunk
                     )
+                    state.body_safety.record_dequeue(dequeued_bytes)
+                    relay_stats.record_body_queue_dequeue(state.req_id, dequeued_bytes)
                     yield chunk
         finally:
             self._registry.close_request(

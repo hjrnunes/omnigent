@@ -19,18 +19,26 @@ dropped below the fuse.
   so only the offending relay retries. Other requests on the same runner socket
   keep streaming and the socket stays registered.
 
-Bytes are counted as UTF-8 body bytes, matching what the queue holds.
+Both guardrails apply to every request. Their byte totals live on the request's
+own state, which dies with the request, so the 512-request bound on the
+telemetry map never limits them: the 513th concurrent request still warns and
+still fuses. A single frame that crosses both thresholds logs its `WARNING`
+before the fuse `ERROR`, so `body_queue.warned_requests` and
+`body_queue.fuse.trips` agree with the log. A fused frame is never queued, so it
+moves no body-queue gauge.
+
+Bytes are counted as UTF-8 body bytes, matching what the queue holds. Consuming
+a frame lowers the request's queued total, so a stream that keeps draining stays
+below the thresholds.
 
 ## Configuration
 
-`OMNIGENT_RELAY_BODY_QUEUE_FUSE_BYTES` sets the per-request fuse in bytes. It
-defaults to 268435456 (256 MiB). An unset, non-numeric, or non-positive value
-falls back to the default, so a typo cannot disable the fuse. The variable is
-read when the counter module builds its recorder, which happens at server
-import, so set it in the server process environment.
-
-The warning threshold is not configurable; tests override both thresholds
-through `RelayStats(warn_threshold_bytes=..., fuse_threshold_bytes=...)`.
+`OMNIGENT_RELAY_BODY_QUEUE_WARN_BYTES` sets the per-request warning threshold in
+bytes. It defaults to 8388608 (8 MiB). `OMNIGENT_RELAY_BODY_QUEUE_FUSE_BYTES`
+sets the per-request fuse in bytes. It defaults to 268435456 (256 MiB). An
+unset, non-numeric, or non-positive value falls back to the default, so a typo
+cannot disable a guardrail. The server reads both when it creates a request's
+guard state, so set them in the server process environment.
 
 ## Observing guardrails
 
@@ -43,9 +51,9 @@ guardrail fields:
 | --- | --- |
 | `body_queue.depth`, `body_queue.bytes` | Frames and UTF-8 bytes queued across all requests now. |
 | `body_queue.max_depth`, `body_queue.max_bytes` | Peaks since the server started. |
-| `body_queue.warned_requests` | Requests that logged their one pressure warning. |
+| `body_queue.warned_requests` | Requests that logged their one pressure warning, including requests the map does not track. |
 | `body_queue.warn_bytes` | Active warn threshold in bytes. |
-| `body_queue.fuse.trips` | Requests aborted by the fuse. |
+| `body_queue.fuse.trips` | Requests aborted by the fuse, including requests the map does not track. |
 | `body_queue.fuse.limit_bytes` | Active fuse threshold in bytes. |
 | `body_queue.requests[id]` | Per-request `depth`, `bytes`, and `warned` for the busiest ten requests. |
 | `outbound_queue.depth`, `outbound_queue.max_depth` | Frames waiting behind the server's outbound sender, summed per runner, plus its peak. |
@@ -54,8 +62,10 @@ guardrail fields:
 | `session_stream.subscriber_overflows` | Session outcome streams closed because their subscriber queue passed 1024 pending events. |
 
 The per-request map is bounded at 512 tracked requests; `body_queue.dropped_requests`
-counts frames from requests past that bound. A request rejected at the bound is
-neither counted nor guarded, so its memory is untracked rather than misreported.
+counts frames from requests past that bound. The bound is telemetry only: a
+request rejected at the bound is still warned and still fused, but its frames
+move no gauge, so the aggregate depth and bytes stay the sum over tracked
+requests.
 
 `OMNIGENT_RELAY_STATS_INTERVAL_S=0` disables the record. Read the counters
 in-process with `omnigent.server.relay_stats.snapshot()`.

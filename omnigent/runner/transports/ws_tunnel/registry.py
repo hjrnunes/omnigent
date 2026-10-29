@@ -188,6 +188,9 @@ class RequestState:
         a tunnel disconnect or registry abort.
     :param req_id: Tunnel request id, used as the relay body-queue
         counter key.
+    :param body_safety: Per-request warn/fuse accounting. It lives here
+        rather than in the bounded telemetry map so every request is
+        guarded.
     """
 
     loop: asyncio.AbstractEventLoop
@@ -197,6 +200,7 @@ class RequestState:
     end_event: asyncio.Event = field(default_factory=asyncio.Event)
     aborted_with: BaseException | None = None
     req_id: str = ""
+    body_safety: relay_stats.BodyQueueSafety = field(default_factory=relay_stats.BodyQueueSafety)
 
 
 # Inbound channel-queue item shape:
@@ -1008,9 +1012,12 @@ def _resolve_connect_waiter(
 def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> None:
     """Append one body frame to the request's body queue.
 
-    Applies this request's queue guardrails: the first frame past the warn
-    threshold logs once, and the first frame past the fuse aborts only this
-    request. Other requests on the same runner socket keep streaming.
+    Applies this request's queue guardrails from its own state, so they hold
+    even when the bounded telemetry map does not track the request: the first
+    frame past the warn threshold logs once, and the first frame past the fuse
+    aborts only this request. A frame crossing both thresholds logs its
+    warning before the fuse error. Other requests on the same runner socket
+    keep streaming.
 
     :param state: Request state whose body queue receives the
         frame.
@@ -1022,9 +1029,19 @@ def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> Non
         # A late frame for an aborted request must not queue behind the
         # sentinel: the consumer already raised and closed its stream.
         return
-    guard = relay_stats.record_body_queue_enqueue(
-        state.req_id, relay_stats.body_byte_length(frame.body)
-    )
+    byte_count = relay_stats.body_byte_length(frame.body)
+    guard = state.body_safety.record_enqueue(byte_count)
+    if guard.warn:
+        _logger.warning(
+            "Relay body queue for request %s on runner %s passed the %d-byte "
+            "warn threshold (%d queued); still streaming",
+            state.req_id,
+            state.session.runner_id,
+            guard.warn_bytes,
+            guard.request_bytes,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        relay_stats.record_body_queue_warned(state.req_id)
     if guard.fuse_tripped:
         fuse_error = BodyQueueFuseExceeded(
             f"request {state.req_id} queued {guard.request_bytes} body bytes, "
@@ -1039,18 +1056,10 @@ def _enqueue_response_body(state: RequestState, frame: ResponseBodyFrame) -> Non
             guard.fuse_bytes,
             extra={"session_id": runner_primary_session_id()},
         )
+        relay_stats.record_body_queue_fuse_trip()
         _abort_request_state(state, fuse_error)
         return
-    if guard.warn:
-        _logger.warning(
-            "Relay body queue for request %s on runner %s passed the %d-byte "
-            "warn threshold (%d queued); still streaming",
-            state.req_id,
-            state.session.runner_id,
-            guard.warn_bytes,
-            guard.request_bytes,
-            extra={"session_id": runner_primary_session_id()},
-        )
+    relay_stats.record_body_queue_enqueue(state.req_id, byte_count)
     state.body_queue.put_nowait(frame)
 
 
