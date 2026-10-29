@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from dev.loadtest import t6, t6_stats
+from omnigent.server import relay_stats
 
 # ── fixtures ────────────────────────────────────────────────
 
@@ -180,6 +181,31 @@ def test_collector_reports_unreported_counters_as_zero() -> None:
     assert summary["fuse_trips_source"] == "unreported"
     assert summary["subscriber_overflows"] == 0
     assert summary["subscriber_overflows_source"] == "unreported"
+
+
+def test_server_payload_reports_guardrail_counters_without_log_lines() -> None:
+    """The real recorder payload alone supplies the fuse and overflow counters."""
+    stats = relay_stats.RelayStats(warn_threshold_bytes=10, fuse_threshold_bytes=10)
+    stats.record_body_queue_enqueue("req-guarded", 32)
+    stats.record_outbound_queue_depth("runner-1", 2)
+    stats.record_subscriber_overflow()
+    payload = relay_stats.build_relay_stats_log_payload(stats.snapshot())
+    parsed = t6_stats.parse_relay_stats_line(_log_line(payload))
+    assert parsed == payload
+
+    collector = t6_stats.RelayStatsCollector()
+    collector.observe(parsed)
+    summary = collector.summary(
+        window_seconds=2.0,
+        log_counters=t6_stats.LogCounters(fuse_log_trips=9, subscriber_overflow_logs=9),
+    )
+
+    assert summary["fuse_trips"] == 1
+    assert summary["fuse_trips_source"] == "counter"
+    assert summary["subscriber_overflows"] == 1
+    assert summary["subscriber_overflows_source"] == "counter"
+    assert summary["outbound_queue"]["max_depth"] == 2
+    assert summary["body_queue"]["fuse_threshold_bytes"] == 10
 
 
 # ── server log observation ─────────────────────────────────

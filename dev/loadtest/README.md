@@ -135,7 +135,10 @@ harness probes the server and reads its Phase 0 relay counters:
 - **Health signals:** event-loop watchdog stall reports (`Server event loop has
   not advanced for …`), body-queue fuse trips, and subscriber-stream overflow
   closes. Fuse and overflow counts come from the `relay_stats` payload when the
-  build reports them, and from matching server-log lines otherwise.
+  build reports them, and from matching server-log lines otherwise. The
+  payload also carries the body-queue warn and fuse thresholds, the warned
+  request count, and the outbound-queue peak; see
+  [`docs/relay-queue-guardrails.md`](../../docs/relay-queue-guardrails.md).
 - **CPU:** `psutil` samples the server PID; the report normalises measured CPU
   time to `cpu_seconds_per_1k_events`, the comparable figure across load levels
   and refs.

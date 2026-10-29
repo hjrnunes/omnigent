@@ -106,6 +106,7 @@ class RelayStatsCollector:
             "relay_persist_failures": 0,
             "fuse_trips": 0,
             "subscriber_overflows": 0,
+            "outbound_max_depth": 0,
         }
         self._seen: dict[str, bool] = {
             "fuse_trips": False,
@@ -138,6 +139,10 @@ class RelayStatsCollector:
         if overflow is not None:
             self._seen["subscriber_overflows"] = True
             self._peak["subscriber_overflows"] = max(self._peak["subscriber_overflows"], overflow)
+        outbound = _as_mapping(payload.get("outbound_queue"))
+        self._peak["outbound_max_depth"] = max(
+            self._peak["outbound_max_depth"], _as_int(outbound.get("max_depth"))
+        )
 
     def summary(
         self,
@@ -153,6 +158,7 @@ class RelayStatsCollector:
         latest = self._latest or {}
         events = _as_mapping(latest.get("events"))
         body_queue = _as_mapping(latest.get("body_queue"))
+        outbound_queue = _as_mapping(latest.get("outbound_queue"))
         serialization = _as_mapping(latest.get("subscriber_serialization"))
         stretch = _as_mapping(latest.get("relay_stretch"))
 
@@ -206,6 +212,15 @@ class RelayStatsCollector:
                 "max_bytes": _as_int(body_queue.get("max_bytes")),
                 "requests_tracked": _as_int(body_queue.get("requests_tracked")),
                 "dropped_requests": _as_int(body_queue.get("dropped_requests")),
+                "warned_requests": _as_int(body_queue.get("warned_requests")),
+                "fuse_threshold_bytes": _as_int(
+                    _as_mapping(body_queue.get("fuse")).get("limit_bytes")
+                ),
+            },
+            "outbound_queue": {
+                "max_depth": self._peak["outbound_max_depth"],
+                "runners_tracked": _as_int(outbound_queue.get("runners_tracked")),
+                "dropped_samples": _as_int(outbound_queue.get("dropped_samples")),
             },
             "subscriber_serialization": {
                 "count": _as_int(serialization.get("count")),

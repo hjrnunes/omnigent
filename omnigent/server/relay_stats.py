@@ -1,7 +1,8 @@
-"""Bounded, loop-confined counters for the Phase 0 relay measurement.
+"""Bounded, loop-confined counters for the relay measurement.
 
 The counters answer one question: where does relay throughput go? They keep
-per-request body-queue gauges, per-session event rates by event type, the cost
+per-request body-queue gauges and guardrails, per-runner outbound-queue gauges,
+subscriber-overflow counts, per-session event rates by event type, the cost
 of each subscriber's SSE serialization, the time the relay spends between
 reader suspensions, the ingest mix, and silent ``_relay_persist`` failures.
 
@@ -42,6 +43,34 @@ RELAY_STATS_INTERVAL_ENV_VAR = "OMNIGENT_RELAY_STATS_INTERVAL_S"
 DEFAULT_RELAY_STATS_INTERVAL_S = 10.0
 """Default periodic log interval when the environment variable is unset."""
 
+BODY_QUEUE_FUSE_ENV_VAR = "OMNIGENT_RELAY_BODY_QUEUE_FUSE_BYTES"
+"""Environment variable holding the per-request body-queue fuse in bytes."""
+
+DEFAULT_BODY_QUEUE_WARN_BYTES = 8 * 1024 * 1024
+"""Per-request queued body bytes that log the first pressure warning."""
+
+DEFAULT_BODY_QUEUE_FUSE_BYTES = 256 * 1024 * 1024
+"""Per-request queued body bytes that abort that request by default."""
+
+
+def body_queue_fuse_bytes() -> int:
+    """Return the per-request body-queue fuse from the environment.
+
+    Unset, non-numeric, and non-positive values fall back to
+    :data:`DEFAULT_BODY_QUEUE_FUSE_BYTES`, so a typo cannot disable the fuse.
+    """
+    raw = os.environ.get(BODY_QUEUE_FUSE_ENV_VAR)
+    if raw is None:
+        return DEFAULT_BODY_QUEUE_FUSE_BYTES
+    try:
+        fuse_bytes = int(raw)
+    except ValueError:
+        return DEFAULT_BODY_QUEUE_FUSE_BYTES
+    if fuse_bytes <= 0:
+        return DEFAULT_BODY_QUEUE_FUSE_BYTES
+    return fuse_bytes
+
+
 SOURCE_RELAY_SSE = "relay_sse"
 """Events parsed from the runner's relay SSE stream."""
 
@@ -74,6 +103,10 @@ class BodyQueueSnapshot:
     requests: dict[str, BodyQueueRequestSnapshot] = field(default_factory=dict)
     requests_tracked: int = 0
     dropped_requests: int = 0
+    warned_requests: int = 0
+    warn_bytes: int = 0
+    fuse_trips: int = 0
+    fuse_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,6 +115,38 @@ class BodyQueueRequestSnapshot:
 
     depth: int
     bytes: int
+    warned: bool = False
+
+
+@dataclass(frozen=True)
+class BodyQueueGuard:
+    """Guardrail outcome for one queued body frame.
+
+    ``warn`` marks the single frame that crosses the warn threshold for its
+    request. ``fuse_tripped`` marks every frame from the one that crosses the
+    fuse, so the caller aborts the request exactly once.
+    """
+
+    request_bytes: int = 0
+    warn_bytes: int = 0
+    fuse_bytes: int = 0
+    warn: bool = False
+    fuse_tripped: bool = False
+
+
+@dataclass(frozen=True)
+class OutboundQueueSnapshot:
+    """Current outbound WebSocket queue depth per runner and its peak."""
+
+    depth: int = 0
+    max_depth: int = 0
+    runners: dict[str, int] = field(default_factory=dict)
+    dropped_samples: int = 0
+
+    @property
+    def runners_tracked(self) -> int:
+        """Number of runner queues the gauge currently tracks."""
+        return len(self.runners)
 
 
 @dataclass(frozen=True)
@@ -127,6 +192,8 @@ class RelayStatsSnapshot:
     relay_stretch_by_session: dict[str, DurationSnapshot]
     relay_persist_failures: int
     relay_persist_failures_by_session: dict[str, int]
+    outbound_queue: OutboundQueueSnapshot
+    subscriber_overflows: int = 0
     dropped_sessions: int = 0
     dropped_event_types: int = 0
 
@@ -145,12 +212,20 @@ class RelayStats:
         max_event_types: int = _MAX_EVENT_TYPES,
         max_event_types_per_session: int = _MAX_EVENT_TYPES_PER_SESSION,
         max_tracked_requests: int = _MAX_TRACKED_REQUESTS,
+        warn_threshold_bytes: int | None = None,
+        fuse_threshold_bytes: int | None = None,
     ) -> None:
         self._clock = clock
         self._max_sessions = max_sessions
         self._max_event_types = max_event_types
         self._max_event_types_per_session = max_event_types_per_session
         self._max_tracked_requests = max_tracked_requests
+        self._warn_threshold_bytes = (
+            DEFAULT_BODY_QUEUE_WARN_BYTES if warn_threshold_bytes is None else warn_threshold_bytes
+        )
+        self._fuse_threshold_bytes = (
+            body_queue_fuse_bytes() if fuse_threshold_bytes is None else fuse_threshold_bytes
+        )
 
         self._events_by_source: dict[str, int] = {}
         self._events_by_type: dict[str, int] = {}
@@ -175,6 +250,13 @@ class RelayStats:
         # older uncounted frames can never consume a later counted frame.
         self._body_queue_rejected: dict[str, None] = {}
         self._body_queue_dropped_requests = 0
+        self._body_queue_warned_requests = 0
+        self._body_queue_fuse_trips = 0
+
+        self._outbound_depths: dict[str, int] = {}
+        self._outbound_max_depth = 0
+        self._outbound_dropped_samples = 0
+        self._subscriber_overflows = 0
 
         self._dropped_sessions = 0
         self._dropped_event_types = 0
@@ -186,32 +268,58 @@ class RelayStats:
 
     # -- body queue -----------------------------------------------------
 
-    def record_body_queue_enqueue(self, request_id: str, byte_count: int) -> None:
+    def record_body_queue_enqueue(self, request_id: str, byte_count: int) -> BodyQueueGuard:
         """Record one body frame queued for ``request_id``.
 
         A request rejected at the tracking bound stays untracked until its
         stream closes, so frames queued before its rejection are never
-        counted and can never consume a later counted frame's gauge.
+        counted and can never consume a later counted frame's gauge. Such a
+        request is also never guarded, matching its untracked byte total.
+
+        :returns: The guardrail outcome for the frame. ``warn`` is ``True``
+            for the single frame that first crosses the warn threshold, and
+            ``fuse_tripped`` is ``True`` from the frame that crosses the fuse
+            onward.
         """
+        limit_bytes = self._fuse_threshold_bytes
         existing = self._body_queue_requests.get(request_id)
         if existing is None:
             if request_id in self._body_queue_rejected:
                 self._body_queue_dropped_requests += 1
-                return
+                return BodyQueueGuard(
+                    warn_bytes=self._warn_threshold_bytes, fuse_bytes=limit_bytes
+                )
             if len(self._body_queue_requests) >= self._max_tracked_requests:
                 self._body_queue_dropped_requests += 1
                 self._remember_rejected_request(request_id)
-                return
+                return BodyQueueGuard(
+                    warn_bytes=self._warn_threshold_bytes, fuse_bytes=limit_bytes
+                )
             existing = BodyQueueRequestSnapshot(depth=0, bytes=0)
+        request_bytes = existing.bytes + byte_count
+        warn = request_bytes > self._warn_threshold_bytes and not existing.warned
+        if warn:
+            self._body_queue_warned_requests += 1
+        fuse_tripped = request_bytes > limit_bytes
+        if fuse_tripped:
+            self._body_queue_fuse_trips += 1
         updated = BodyQueueRequestSnapshot(
             depth=existing.depth + 1,
-            bytes=existing.bytes + byte_count,
+            bytes=request_bytes,
+            warned=existing.warned or warn,
         )
         self._body_queue_requests[request_id] = updated
         self._body_queue_depth += 1
         self._body_queue_bytes += byte_count
         self._body_queue_max_depth = max(self._body_queue_max_depth, self._body_queue_depth)
         self._body_queue_max_bytes = max(self._body_queue_max_bytes, self._body_queue_bytes)
+        return BodyQueueGuard(
+            request_bytes=request_bytes,
+            warn_bytes=self._warn_threshold_bytes,
+            fuse_bytes=limit_bytes,
+            warn=warn,
+            fuse_tripped=fuse_tripped,
+        )
 
     def _remember_rejected_request(self, request_id: str) -> None:
         """Keep a rejected request untracked until its stream closes.
@@ -238,6 +346,7 @@ class RelayStats:
         self._body_queue_requests[request_id] = BodyQueueRequestSnapshot(
             depth=depth,
             bytes=byte_total,
+            warned=existing.warned,
         )
         self._body_queue_depth -= existing.depth - depth
         self._body_queue_bytes -= existing.bytes - byte_total
@@ -255,8 +364,35 @@ class RelayStats:
         self._body_queue_depth = max(self._body_queue_depth - existing.depth, 0)
         self._body_queue_bytes = max(self._body_queue_bytes - existing.bytes, 0)
 
-    # -- events ---------------------------------------------------------
+    # -- outbound queue -------------------------------------------------
 
+    def record_outbound_queue_depth(self, runner_id: str, depth: int) -> bool:
+        """Record one runner's outbound WebSocket queue depth.
+
+        The runner map is bounded. A sample for a runner that does not fit is
+        dropped and counted instead of evicting a live runner, so the peak
+        keeps describing the runners already recorded.
+
+        :returns: ``True`` when the sample was kept.
+        """
+        if runner_id not in self._outbound_depths:
+            if len(self._outbound_depths) >= self._max_sessions:
+                self._outbound_dropped_samples += 1
+                return False
+        depth = max(depth, 0)
+        self._outbound_depths[runner_id] = depth
+        self._outbound_max_depth = max(self._outbound_max_depth, depth)
+        return True
+
+    def record_outbound_queue_released(self, runner_id: str) -> None:
+        """Drop a runner's outbound depth when its tunnel is replaced or closed."""
+        self._outbound_depths.pop(runner_id, None)
+
+    def record_subscriber_overflow(self) -> None:
+        """Record one SSE subscriber the session stream dropped as too slow."""
+        self._subscriber_overflows += 1
+
+    # -- events ---------------------------------------------------------
     def record_event(self, session_id: str, event_type: str, *, source: str) -> None:
         """Record one event ingested from ``source`` for ``session_id``."""
         self._events_by_source[source] = self._events_by_source.get(source, 0) + 1
@@ -364,6 +500,10 @@ class RelayStats:
                 requests=dict(self._body_queue_requests),
                 requests_tracked=len(self._body_queue_requests),
                 dropped_requests=self._body_queue_dropped_requests,
+                warned_requests=self._body_queue_warned_requests,
+                warn_bytes=self._warn_threshold_bytes,
+                fuse_trips=self._body_queue_fuse_trips,
+                fuse_bytes=self._fuse_threshold_bytes,
             ),
             events_by_source=events_by_source,
             events_by_source_per_second={
@@ -388,6 +528,13 @@ class RelayStats:
             relay_stretch_by_session=dict(self._relay_stretch),
             relay_persist_failures=self._relay_persist_failures,
             relay_persist_failures_by_session=dict(self._relay_persist_failures_by_session),
+            outbound_queue=OutboundQueueSnapshot(
+                depth=sum(self._outbound_depths.values()),
+                max_depth=self._outbound_max_depth,
+                runners=dict(self._outbound_depths),
+                dropped_samples=self._outbound_dropped_samples,
+            ),
+            subscriber_overflows=self._subscriber_overflows,
             dropped_sessions=self._dropped_sessions,
             dropped_event_types=self._dropped_event_types,
         )
@@ -535,9 +682,9 @@ def dequeued_body_byte_length(body: str, encoding: str, decoded: bytes) -> int:
     return len(body)
 
 
-def record_body_queue_enqueue(request_id: str, byte_count: int) -> None:
-    """Record a queued tunnel body frame for ``request_id``."""
-    _default_stats.record_body_queue_enqueue(request_id, byte_count)
+def record_body_queue_enqueue(request_id: str, byte_count: int) -> BodyQueueGuard:
+    """Record a queued tunnel body frame and return its guardrail outcome."""
+    return _default_stats.record_body_queue_enqueue(request_id, byte_count)
 
 
 def record_body_queue_dequeue(request_id: str, byte_count: int) -> None:
@@ -548,6 +695,21 @@ def record_body_queue_dequeue(request_id: str, byte_count: int) -> None:
 def record_body_queue_released(request_id: str) -> None:
     """Drop the gauge for a tunneled request that closed."""
     _default_stats.record_body_queue_released(request_id)
+
+
+def record_outbound_queue_depth(runner_id: str, depth: int) -> bool:
+    """Record one runner's outbound queue depth; ``False`` when not kept."""
+    return _default_stats.record_outbound_queue_depth(runner_id, depth)
+
+
+def record_outbound_queue_released(runner_id: str) -> None:
+    """Drop a runner's outbound queue depth when its tunnel closes."""
+    _default_stats.record_outbound_queue_released(runner_id)
+
+
+def record_subscriber_overflow() -> None:
+    """Record one SSE subscriber dropped as too slow."""
+    _default_stats.record_subscriber_overflow()
 
 
 def record_event(session_id: str, event_type: str, *, source: str) -> None:
@@ -600,14 +762,38 @@ def build_relay_stats_log_payload(
             "max_bytes": body_queue.max_bytes,
             "requests_tracked": body_queue.requests_tracked,
             "dropped_requests": body_queue.dropped_requests,
+            "warned_requests": body_queue.warned_requests,
+            "warn_bytes": body_queue.warn_bytes,
+            "fuse": {
+                "trips": body_queue.fuse_trips,
+                "limit_bytes": body_queue.fuse_bytes,
+            },
             "requests": {
-                request_id: {"depth": request.depth, "bytes": request.bytes}
+                request_id: {
+                    "depth": request.depth,
+                    "bytes": request.bytes,
+                    "warned": request.warned,
+                }
                 for request_id, request in _busiest(
                     body_queue.requests,
                     key=lambda request: request.depth,
                     limit=max_requests,
                 ).items()
             },
+        },
+        "outbound_queue": {
+            "depth": stats_snapshot.outbound_queue.depth,
+            "max_depth": stats_snapshot.outbound_queue.max_depth,
+            "runners_tracked": stats_snapshot.outbound_queue.runners_tracked,
+            "dropped_samples": stats_snapshot.outbound_queue.dropped_samples,
+            "runners": _busiest(
+                stats_snapshot.outbound_queue.runners,
+                key=float,
+                limit=max_requests,
+            ),
+        },
+        "session_stream": {
+            "subscriber_overflows": stats_snapshot.subscriber_overflows,
         },
         "events": {
             "by_source": dict(stats_snapshot.events_by_source),
@@ -717,6 +903,10 @@ def log_relay_stats_snapshot(stats_snapshot: RelayStatsSnapshot | None = None) -
             window_seconds=current.window_seconds,
             body_queue_depth=current.body_queue.depth,
             body_queue_bytes=current.body_queue.bytes,
+            body_queue_warned_requests=current.body_queue.warned_requests,
+            body_queue_fuse_trips=current.body_queue.fuse_trips,
+            outbound_queue_max_depth=current.outbound_queue.max_depth,
+            subscriber_overflows=current.subscriber_overflows,
             events_relay_sse=current.events_by_source.get(SOURCE_RELAY_SSE, 0),
             events_event_batch=current.events_by_source.get(SOURCE_EVENT_BATCH, 0),
             events_http_post=current.events_by_source.get(SOURCE_HTTP_POST, 0),

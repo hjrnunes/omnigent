@@ -633,6 +633,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"- relay_stats samples: {relay.get('samples', 0)}",
             f"- Body queue peaks: depth {body_queue.get('max_depth', '-')}, "
             f"bytes {body_queue.get('max_bytes', '-')}",
+            f"- Body queue guardrails: {body_queue.get('warned_requests', '-')} warned "
+            f"request(s), fuse at {body_queue.get('fuse_threshold_bytes', '-')} bytes",
+            f"- Outbound queue peak: "
+            f"{_mapping(relay.get('outbound_queue')).get('max_depth', '-')} frame(s) across "
+            f"{_mapping(relay.get('outbound_queue')).get('runners_tracked', '-')} runner(s)",
             f"- Subscriber serializations: "
             f"{_mapping(relay.get('subscriber_serialization')).get('count', '-')} "
             f"(max {_mapping(relay.get('subscriber_serialization')).get('seconds_max', '-')} s)",

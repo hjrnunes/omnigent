@@ -1,7 +1,7 @@
-"""Unit tests for the Phase 0 relay counters.
+"""Unit tests for the relay counters and queue guardrails.
 
-Each test pins one observable counter, its bound, or the structured
-``relay_stats`` log record that the load harness reads.
+Each test pins one observable counter, its bound, a guardrail threshold, or
+the structured ``relay_stats`` log record that the load harness reads.
 """
 
 from __future__ import annotations
@@ -18,9 +18,14 @@ import pytest
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseBodyFrame,
+    ResponseEndFrame,
+    ResponseHeadFrame,
     decode_body,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import (
+    BodyQueueFuseExceeded,
+    TunnelRegistry,
+)
 from omnigent.runner.transports.ws_tunnel.transport import _TunneledByteStream
 from omnigent.runtime import session_stream
 from omnigent.server import presence, relay_stats, shutdown_state
@@ -35,6 +40,7 @@ from omnigent.server.relay_stats import (
     RelayStats,
 )
 from omnigent.server.routes._sessions.helpers import _relay_persist
+from omnigent.server.routes.runner_tunnel import _sender_loop
 from omnigent.server.routes.sessions import _stream_live_events
 
 SESSION_ID = "conv_relay_stats"
@@ -668,3 +674,293 @@ def test_body_wait_probe_is_read_from_the_response_extensions() -> None:
 
     assert relay_stats.body_wait_probe_for_response(response) is probe
     assert relay_stats.body_wait_probe_for_response(MagicMock(extensions={})) is None
+
+
+# ── Phase 2: body-queue guardrails ──────────────────────────────────
+
+
+def test_body_queue_warn_guard_fires_once_per_request() -> None:
+    """Crossing the warn threshold reports the request once, never again."""
+    stats = RelayStats(warn_threshold_bytes=100, fuse_threshold_bytes=10_000)
+
+    assert stats.record_body_queue_enqueue("req-warn", 60).warn is False
+    assert stats.record_body_queue_enqueue("req-warn", 60).warn is True
+    assert stats.record_body_queue_enqueue("req-warn", 60).warn is False
+
+    snapshot = stats.snapshot()
+    assert snapshot.body_queue.warned_requests == 1
+    assert snapshot.body_queue.warn_bytes == 100
+    assert snapshot.body_queue.requests["req-warn"].warned is True
+
+
+def test_body_queue_fuse_guard_trips_only_the_request_over_the_limit() -> None:
+    """A request past the fuse reports a trip; its neighbour stays below it."""
+    stats = RelayStats(warn_threshold_bytes=100, fuse_threshold_bytes=150)
+
+    assert stats.record_body_queue_enqueue("req-fuse", 60).fuse_tripped is False
+    assert stats.record_body_queue_enqueue("req-fuse", 60).fuse_tripped is False
+    tripped = stats.record_body_queue_enqueue("req-fuse", 60)
+    assert tripped.fuse_tripped is True
+    assert tripped.request_bytes == 180
+    assert stats.record_body_queue_enqueue("req-other", 60).fuse_tripped is False
+
+    snapshot = stats.snapshot()
+    assert snapshot.body_queue.fuse_trips == 1
+    assert snapshot.body_queue.fuse_bytes == 150
+
+
+def test_body_queue_fuse_env_var_overrides_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fuse threshold comes from the environment, defaulting to 256 MiB."""
+    monkeypatch.delenv(relay_stats.BODY_QUEUE_FUSE_ENV_VAR, raising=False)
+    assert relay_stats.body_queue_fuse_bytes() == relay_stats.DEFAULT_BODY_QUEUE_FUSE_BYTES
+    assert relay_stats.DEFAULT_BODY_QUEUE_FUSE_BYTES == 256 * 1024 * 1024
+
+    monkeypatch.setenv(relay_stats.BODY_QUEUE_FUSE_ENV_VAR, "1048576")
+    assert relay_stats.body_queue_fuse_bytes() == 1048576
+
+    for invalid in ("0", "-1", "junk", "inf"):
+        monkeypatch.setenv(relay_stats.BODY_QUEUE_FUSE_ENV_VAR, invalid)
+        assert relay_stats.body_queue_fuse_bytes() == relay_stats.DEFAULT_BODY_QUEUE_FUSE_BYTES
+
+
+def test_outbound_queue_gauge_tracks_depth_and_release() -> None:
+    """The outbound gauge follows the queue depth and forgets closed tunnels."""
+    stats = RelayStats()
+    stats.record_outbound_queue_depth("runner-out", 1)
+    stats.record_outbound_queue_depth("runner-out", 3)
+    stats.record_outbound_queue_depth("runner-out", 2)
+
+    snapshot = stats.snapshot()
+    assert snapshot.outbound_queue.depth == 2
+    assert snapshot.outbound_queue.max_depth == 3
+    assert snapshot.outbound_queue.runners == {"runner-out": 2}
+
+    stats.record_outbound_queue_released("runner-out")
+    released = stats.snapshot()
+    assert released.outbound_queue.depth == 0
+    assert released.outbound_queue.runners == {}
+
+
+@pytest.mark.asyncio
+async def test_registry_outbound_queue_gauge_tracks_the_sender_drain() -> None:
+    """A frame queued for the sender raises the gauge; the sender lowers it."""
+    registry = TunnelRegistry()
+    session = registry.register("runner-out", _NoopWS(), _hello())
+
+    await registry.send_text(session, "{}")
+
+    queued = relay_stats.snapshot()
+    assert queued.outbound_queue.depth == 1
+    assert queued.outbound_queue.max_depth == 1
+    assert queued.outbound_queue.runners == {"runner-out": 1}
+
+    sender = asyncio.create_task(_sender_loop(session.ws, session))
+    try:
+        await asyncio.sleep(0.01)
+        drained = relay_stats.snapshot()
+        assert drained.outbound_queue.depth == 0
+        assert drained.outbound_queue.max_depth == 1
+    finally:
+        sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender
+
+    registry.deregister("runner-out")
+    assert relay_stats.snapshot().outbound_queue.runners == {}
+
+
+@pytest.mark.asyncio
+async def test_registry_warns_once_per_request_above_eight_mib(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Crossing 8 MiB warns once for that request and leaves neighbours alone."""
+    registry = TunnelRegistry()
+    registry.register("runner-warn", _NoopWS(), _hello())
+    registry.open_request("runner-warn", "req-big")
+    registry.open_request("runner-warn", "req-small")
+    chunk = "x" * (512 * 1024)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.transports.ws_tunnel.registry"):
+        for _ in range(17):  # 8.5 MiB
+            registry.route_response_frame(
+                "runner-warn", ResponseBodyFrame(id="req-big", body=chunk)
+            )
+        for _ in range(4):  # 2 MiB stays quiet
+            registry.route_response_frame(
+                "runner-warn", ResponseBodyFrame(id="req-small", body=chunk)
+            )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "req-big" in record.getMessage()
+    ]
+    assert len(warnings) == 1, "the warn threshold fires once per request"
+    snapshot = relay_stats.snapshot()
+    assert snapshot.body_queue.warned_requests == 1
+    assert snapshot.body_queue.requests["req-small"].warned is False
+
+
+@pytest.mark.asyncio
+async def test_body_queue_fuse_aborts_only_the_offending_request(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One runaway request aborts while its neighbour keeps streaming."""
+    monkeypatch.setenv(relay_stats.BODY_QUEUE_FUSE_ENV_VAR, "2048")
+    relay_stats.reset_for_tests()
+
+    registry = TunnelRegistry()
+    registry.register("runner-fuse", _NoopWS(), _hello())
+    victim_state = registry.open_request("runner-fuse", "req-victim")
+    other_state = registry.open_request("runner-fuse", "req-other")
+    for request_id in ("req-victim", "req-other"):
+        registry.route_response_frame("runner-fuse", ResponseHeadFrame(id=request_id, status=200))
+    victim = _TunneledByteStream(registry, "runner-fuse", "req-victim", victim_state)
+    other = _TunneledByteStream(registry, "runner-fuse", "req-other", other_state)
+    other_chunks: list[bytes] = []
+
+    async def drain_other() -> None:
+        async for chunk in other:
+            other_chunks.append(chunk)
+
+    other_task = asyncio.create_task(drain_other())
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.transports.ws_tunnel.registry"):
+        for _ in range(3):  # 3048 bytes > 2048 byte fuse on the third frame
+            registry.route_response_frame(
+                "runner-fuse", ResponseBodyFrame(id="req-victim", body="v" * 1024)
+            )
+
+    assert victim_state.aborted_with is not None
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR and "fuse" in record.getMessage().lower()
+    ]
+    assert len(errors) == 1
+    assert "req-victim" in errors[0].getMessage()
+
+    async def drain_victim() -> None:
+        async for _ in victim:
+            pass
+
+    with pytest.raises(BodyQueueFuseExceeded):
+        await asyncio.wait_for(drain_victim(), timeout=2.0)
+
+    registry.route_response_frame(
+        "runner-fuse", ResponseBodyFrame(id="req-other", body="still streaming")
+    )
+    assert list(registry.get("runner-fuse").in_flight) == ["req-other"], (
+        "the neighbour request stays in flight while the victim aborted"
+    )
+    registry.route_response_frame("runner-fuse", ResponseEndFrame(id="req-other"))
+    await asyncio.wait_for(other_task, timeout=2.0)
+
+    assert other_chunks == [b"still streaming"]
+    assert registry.get("runner-fuse") is not None, "the runner socket stays up"
+    snapshot = relay_stats.snapshot()
+    assert snapshot.body_queue.fuse_trips == 1
+    assert "req-other" not in snapshot.body_queue.requests
+
+
+@pytest.mark.asyncio
+async def test_body_queue_keeps_every_frame_queued_below_the_fuse() -> None:
+    """The queue is unbounded by count and drops nothing under the fuse."""
+    relay_stats.reset_for_tests()
+    registry = TunnelRegistry()
+    registry.register("runner-many", _NoopWS(), _hello())
+    state = registry.open_request("runner-many", "req-many")
+    registry.route_response_frame("runner-many", ResponseHeadFrame(id="req-many", status=200))
+    stream = _TunneledByteStream(registry, "runner-many", "req-many", state)
+
+    received: list[bytes] = []
+
+    async def drain() -> None:
+        async for chunk in stream:
+            received.append(chunk)
+
+    task = asyncio.create_task(drain())
+    frame_count = 4096
+    for _ in range(frame_count):  # No awaits, so every frame is queued first.
+        registry.route_response_frame("runner-many", ResponseBodyFrame(id="req-many", body="y"))
+
+    queued = relay_stats.snapshot().body_queue.requests["req-many"]
+    assert queued.depth == frame_count, "the queue keeps every frame below the fuse"
+
+    registry.route_response_frame("runner-many", ResponseEndFrame(id="req-many"))
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert received == [b"y"] * frame_count
+    snapshot = relay_stats.snapshot()
+    assert snapshot.body_queue.fuse_trips == 0
+    assert snapshot.body_queue.warned_requests == 0
+
+
+def test_outbound_queue_gauge_is_bounded_and_releases_replaced_tunnels() -> None:
+    """The gauge keeps a bounded runner map and forgets replaced generations."""
+    stats = RelayStats()
+    stats.record_outbound_queue_depth("runner-1", 2)
+    for index in range(300):
+        stats.record_outbound_queue_depth(f"runner-bulk-{index}", 1)
+
+    snapshot = stats.snapshot()
+    assert snapshot.outbound_queue.runners_tracked <= 256
+    assert snapshot.outbound_queue.dropped_samples > 0
+    assert stats.record_outbound_queue_depth("runner-new", 1) is False
+
+    stats.record_outbound_queue_released("runner-1")
+    assert "runner-1" not in stats.snapshot().outbound_queue.runners
+
+
+@pytest.mark.asyncio
+async def test_stream_live_events_counts_subscriber_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnected slow subscriber increments the overflow counter."""
+    monkeypatch.setattr(session_stream, "_SUBSCRIBER_QUEUE_MAX_EVENTS", 2)
+    generator = _stream_live_events(
+        _ConnectedRequest(),  # type: ignore[arg-type]
+        SESSION_ID,
+    )
+
+    first = await asyncio.wait_for(generator.__anext__(), timeout=2.0)
+    assert "session.heartbeat" in first
+
+    for index in range(4):
+        session_stream.publish(
+            SESSION_ID, {"type": "response.output_text.delta", "delta": str(index)}
+        )
+
+    async def drain() -> None:
+        async for _ in generator:
+            pass
+
+    # The overflow closes the stream instead of yielding more frames.
+    await asyncio.wait_for(drain(), timeout=2.0)
+
+    assert relay_stats.snapshot().subscriber_overflows == 1
+
+
+def test_log_payload_exposes_the_phase_two_gauges_and_counters() -> None:
+    """The structured record carries the guardrail gauges and their counters."""
+    stats = RelayStats(warn_threshold_bytes=100, fuse_threshold_bytes=150)
+    stats.record_body_queue_enqueue("req-guarded", 180)
+    stats.record_outbound_queue_depth("runner-1", 2)
+    stats.record_subscriber_overflow()
+    stats.snapshot()  # reset the rate window so the record is deterministic
+
+    payload = relay_stats.build_relay_stats_log_payload(stats.snapshot())
+
+    assert payload["body_queue"]["warned_requests"] == 1
+    assert payload["body_queue"]["warn_bytes"] == 100
+    assert payload["body_queue"]["fuse"] == {"trips": 1, "limit_bytes": 150}
+    assert payload["body_queue"]["requests"] == {
+        "req-guarded": {"depth": 1, "bytes": 180, "warned": True}
+    }
+    assert payload["outbound_queue"]["depth"] == 2
+    assert payload["outbound_queue"]["max_depth"] == 2
+    assert payload["outbound_queue"]["runners"] == {"runner-1": 2}
+    assert payload["session_stream"] == {"subscriber_overflows": 1}

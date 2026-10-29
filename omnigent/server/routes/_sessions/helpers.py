@@ -9738,6 +9738,7 @@ async def _stream_live_events(
                 )
                 yield frame
     except session_stream.SubscriberOverflowError:
+        relay_stats.record_subscriber_overflow()
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
             session_id,
